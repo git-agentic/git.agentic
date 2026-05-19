@@ -1,0 +1,22 @@
+[package]
+name = "agentic-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Memory-backend adapters and segment writer for git.agentic"
+
+[dependencies]
+agentic-core.workspace = true
+
+tokio.workspace = true
+sqlx.workspace = true
+pgvector.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
