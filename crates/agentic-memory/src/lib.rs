@@ -12,6 +12,8 @@ pub mod adapter;
 pub mod postgres;
 pub mod restore;
 pub mod segment;
+pub mod streamer;
+pub mod triggers;
 
 pub use adapter::{MemoryAdapter, SnapshotHandle};
 pub use segment::{Embedding, Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
