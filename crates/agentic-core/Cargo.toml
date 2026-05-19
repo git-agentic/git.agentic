@@ -1,0 +1,23 @@
+[package]
+name = "agentic-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-addressed object store and snapshot engine for git.agentic"
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.10"

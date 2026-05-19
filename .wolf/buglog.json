@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-05-19T14:07:01.700Z",
+      "error_message": "Significant refactor of ",
+      "file": "crates/agentic-core/src/object.rs",
+      "root_cause": "5 lines replaced/restructured",
+      "fix": "Rewrote 30→61 lines (5 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "rs"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-19T14:07:01.700Z"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-05-19T14:07:27.533Z",
+      "error_message": "Significant refactor of ",
+      "file": "crates/agentic-core/src/lib.rs",
+      "root_cause": "2 lines replaced/restructured",
+      "fix": "Rewrote 7→10 lines (2 removed) | Also: pub model: String,; /// Used in week 1–2 before the memory snapshotter",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "rs"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-19T14:11:26.690Z"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-05-19T14:14:56.279Z",
+      "error_message": "Missing await",
+      "file": "crates/agenticd/src/main.rs",
+      "root_cause": "Async call without await — returned Promise instead of value",
+      "fix": "Added await to async call",
+      "tags": [
+        "auto-detected",
+        "async-fix",
+        "rs"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-19T14:14:56.279Z"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-05-19T14:26:00.035Z",
+      "error_message": "Wrong reference: commit should be Box",
+      "file": "crates/agentic-core/src/commit.rs",
+      "root_cause": "Used \"commit\" instead of \"Box\"",
+      "fix": "Changed commit → Box",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "rs"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-19T14:26:00.035Z"
+    },
+    {
+      "id": "bug-005",
+      "timestamp": "2026-05-19T14:30:00.000Z",
+      "error_message": "Error: daemon closed connection without reply (on `agentic log`)",
+      "file": "crates/agentic-proto/src/lib.rs",
+      "root_cause": "serde internally-tagged enum (`#[serde(tag = \"kind\")]`) cannot serialize a tuple variant whose inner type is a `Vec`. `Response::Log(Vec<LogEntry>)` produced a serializer error inside `write_frame`, which dropped the connection before any bytes were written. From the client side this looked like a clean EOF.",
+      "fix": "Changed `Response::Log(Vec<LogEntry>)` to a struct variant: `Response::Log { entries: Vec<LogEntry> }`. Updated server.rs construction and CLI main.rs match arms accordingly.",
+      "tags": [
+        "serde",
+        "internally-tagged-enum",
+        "wire-protocol",
+        "rs"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-19T14:30:00.000Z"
+    }
+  ]
+}
