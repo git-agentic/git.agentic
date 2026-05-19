@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
+use agentic_core::diff as diff_mod;
 use agentic_core::refs::{HeadRef, Refs};
 use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
@@ -19,9 +20,11 @@ use agentic_proto::framing::{read_frame, write_frame};
 use agentic_proto::{
     CommitInput, CommitOutput, DiffOutput, Envelope, LogEntry, Request, Response, RollbackOutput,
 };
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
+
+use crate::mcp::{fingerprint_all, McpServerSpec};
 
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
@@ -36,6 +39,11 @@ pub struct DaemonState {
     /// snapshot under the commit lock and threads its manifest hash into
     /// the Commit's `memory_snapshot` dimension.
     pub memory: Option<Mutex<PostgresAdapter>>,
+    /// MCP servers to fingerprint on each commit.
+    pub mcp_servers: Vec<McpServerSpec>,
+    /// Shared HTTP client for MCP calls. Reusing one client lets the
+    /// connection pool stay warm across many commits.
+    pub http: reqwest::Client,
 }
 
 impl DaemonState {
@@ -43,6 +51,7 @@ impl DaemonState {
         agentic_dir: PathBuf,
         postgres_url: Option<&str>,
         tables: Vec<TrackedTable>,
+        mcp_servers: Vec<McpServerSpec>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&agentic_dir).context("creating .agentic directory")?;
         let store = Arc::new(
@@ -69,11 +78,22 @@ impl DaemonState {
             }
         };
 
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("agenticd/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building HTTP client")?;
+
+        if !mcp_servers.is_empty() {
+            tracing::info!(count = mcp_servers.len(), "MCP fingerprinting attached");
+        }
+
         Ok(Self {
             store,
             refs,
             commit_lock: Mutex::new(()),
             memory,
+            mcp_servers,
+            http,
         })
     }
 }
@@ -145,15 +165,7 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
             Ok(Response::Log { entries })
         }
 
-        Request::Diff { from, to } => Ok(Response::Diff(DiffOutput {
-            from,
-            to,
-            prompts: vec!["(not yet implemented — Chunk C)".into()],
-            tools: Vec::new(),
-            model_changed: false,
-            memory_summary: String::new(),
-            schema_summary: String::new(),
-        })),
+        Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state, &from, &to)?)),
 
         Request::Rollback {
             target, dry_run: _, ..
@@ -163,6 +175,61 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
             new_head_hash: None,
         })),
     }
+}
+
+fn handle_diff(state: &DaemonState, from: &str, to: &str) -> anyhow::Result<DiffOutput> {
+    let from_hash = state
+        .refs
+        .resolve(from)?
+        .ok_or_else(|| anyhow!("ref not found: {from}"))?;
+    let to_hash = state
+        .refs
+        .resolve(to)?
+        .ok_or_else(|| anyhow!("ref not found: {to}"))?;
+    let d = diff_mod::diff(state.store.as_ref(), from_hash, to_hash)?;
+
+    let render_tree = |td: &Option<diff_mod::TreeDiff>| -> Vec<String> {
+        let Some(td) = td else { return Vec::new() };
+        let mut lines = Vec::new();
+        for e in &td.added {
+            lines.push(format!("+ {}", e.name));
+        }
+        for e in &td.removed {
+            lines.push(format!("- {}", e.name));
+        }
+        for m in &td.modified {
+            lines.push(format!("~ {}", m.name));
+        }
+        lines
+    };
+
+    let memory_summary = match d.memory_snapshot {
+        None => String::new(),
+        Some(ref ch) => match (ch.from, ch.to) {
+            (None, Some(t)) => format!("memory snapshot added → {}", t.short()),
+            (Some(f), None) => format!("memory snapshot removed (was {})", f.short()),
+            (Some(f), Some(t)) => format!("memory snapshot {} → {}", f.short(), t.short()),
+            (None, None) => String::new(),
+        },
+    };
+    let schema_summary = match d.schema_version {
+        None => String::new(),
+        Some(ref sc) => format!(
+            "schema_version {} → {}",
+            sc.from.as_deref().unwrap_or("(none)"),
+            sc.to.as_deref().unwrap_or("(none)")
+        ),
+    };
+
+    Ok(DiffOutput {
+        from: from_hash.to_hex(),
+        to: to_hash.to_hex(),
+        prompts: render_tree(&d.prompts),
+        tools: render_tree(&d.tools),
+        model_changed: d.model.is_some(),
+        memory_summary,
+        schema_summary,
+    })
 }
 
 async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Result<CommitOutput> {
@@ -196,6 +263,25 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         (None, None)
     };
 
+    // ADR-0002 Decision 3, Step 1 (continued): stage tools. Fingerprint
+    // each configured MCP server in turn, collect the canonical manifest
+    // bytes keyed by server name, and let `stage_and_commit` build the
+    // tools Tree downstream. A per-server failure is surfaced as an
+    // error so the operator sees it; if the call returned partial
+    // success and we silently dropped a server, the resulting tools-tree
+    // hash would be wrong relative to the supposed commit state.
+    let tools = if state.mcp_servers.is_empty() {
+        Default::default()
+    } else {
+        let fingerprints = fingerprint_all(&state.http, &state.mcp_servers).await;
+        let mut tools_map = std::collections::BTreeMap::new();
+        for (spec, result) in state.mcp_servers.iter().zip(fingerprints) {
+            let fp = result.with_context(|| format!("fingerprinting MCP server {}", spec.name))?;
+            tools_map.insert(fp.name, fp.canonical_manifest);
+        }
+        tools_map
+    };
+
     let prompts = input
         .prompts
         .into_iter()
@@ -208,7 +294,7 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         parent,
         code_sha: input.code_sha,
         prompts,
-        tools: Default::default(),
+        tools,
         model: input.model,
         memory_snapshot,
         schema_version,

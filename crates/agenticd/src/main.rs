@@ -3,6 +3,7 @@
 //! Long-lived Rust process. Listens on a Unix domain socket for SDK and
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
+mod mcp;
 mod server;
 
 use agentic_memory::postgres::TrackedTable;
@@ -12,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 
+use crate::mcp::parse_mcp_spec;
 use crate::server::{handle_connection, DaemonState};
 
 fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
@@ -48,6 +50,13 @@ struct Args {
     /// `--postgres` is set. Example: `episodes:id,user_facts:id`.
     #[arg(long, value_delimiter = ',')]
     tables: Vec<String>,
+
+    /// Comma-separated `name=url` MCP servers to fingerprint on each
+    /// commit. Each `tools/list` response gets canonicalized and hashed
+    /// into the commit's `tools` dimension. Example:
+    /// `--mcp search=http://localhost:8001,rag=http://localhost:8002/rpc`.
+    #[arg(long, value_delimiter = ',')]
+    mcp: Vec<String>,
 }
 
 #[tokio::main]
@@ -62,8 +71,16 @@ async fn main() -> anyhow::Result<()> {
     let agentic_dir = args.repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
-    let state =
-        Arc::new(DaemonState::open(agentic_dir.clone(), args.postgres.as_deref(), tables).await?);
+    let mcp_servers = parse_mcp_spec(&args.mcp)?;
+    let state = Arc::new(
+        DaemonState::open(
+            agentic_dir.clone(),
+            args.postgres.as_deref(),
+            tables,
+            mcp_servers,
+        )
+        .await?,
+    );
 
     let socket_path = args
         .socket

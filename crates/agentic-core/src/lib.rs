@@ -11,11 +11,13 @@
 //! roadmap.
 
 pub mod commit;
+pub mod diff;
 pub mod hash;
 pub mod object;
 pub mod refs;
 pub mod store;
 
+pub use diff::{diff as diff_commits, CommitDiff, HashChange, StringChange, TreeDiff};
 pub use hash::Hash;
 pub use object::{Attestation, Blob, Commit, Object, ObjectKind, Tree, TypedRef};
 pub use refs::Refs;
