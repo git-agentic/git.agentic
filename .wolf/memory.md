@@ -33,3 +33,21 @@
 | 17:30 | Edited crates/agenticd/src/server.rs | inline fix | ~11 |
 | 17:30 | Edited crates/agentic-cli/src/main.rs | 22→22 lines | ~212 |
 | 17:33 | Session end: 22 writes across 11 files (read-the-project-folder-s-functional-lerdorf.md, object.rs, lib.rs, refs.rs, commit.rs) | 17 reads | ~39774 tok |
+| 17:52 | Created crates/agentic-memory/src/segment.rs | — | ~2552 |
+| 17:53 | Edited crates/agentic-memory/src/lib.rs | 2→4 lines | ~42 |
+| 17:56 | Created crates/agentic-memory/src/postgres.rs | — | ~3443 |
+| 17:57 | Edited crates/agenticd/src/main.rs | expanded (+10 lines) | ~192 |
+| 17:59 | Edited crates/agenticd/src/main.rs | 3→5 lines | ~65 |
+| 17:59 | Edited crates/agenticd/src/main.rs | modified parse_tracked_tables() | ~177 |
+| 17:59 | Edited crates/agenticd/src/server.rs | added 2 import(s) | ~155 |
+| 18:00 | Edited crates/agenticd/src/server.rs | modified open() | ~526 |
+| 18:00 | Edited crates/agenticd/src/server.rs | modified handle_commit() | ~546 |
+| 18:00 | Edited crates/agenticd/src/server.rs | inline fix | ~19 |
+| 18:02 | Created tests/fixtures/pg.yml | — | ~260 |
+| 18:03 | Created crates/agentic-memory/tests/integration.rs | — | ~1168 |
+| 18:03 | Edited tests/fixtures/pg.yml | modified podman() | ~150 |
+| 18:04 | Edited crates/agentic-memory/Cargo.toml | 1→4 lines | ~18 |
+| 18:05 | Edited crates/agentic-memory/src/postgres.rs | modified install_helpers() | ~281 |
+| 18:06 | Edited crates/agentic-cli/src/main.rs | 12→16 lines | ~175 |
+| 18:06 | Edited crates/agentic-cli/src/main.rs | 5→6 lines | ~54 |
+| 18:06 | Edited crates/agentic-cli/src/main.rs | modified cmd_commit() | ~158 |

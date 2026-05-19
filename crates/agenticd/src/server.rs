@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
 use agentic_core::refs::{HeadRef, Refs};
-use agentic_core::{FsObjectStore, Hash};
+use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
+use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
+use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
 use agentic_proto::{
     CommitInput, CommitOutput, DiffOutput, Envelope, LogEntry, Request, Response, RollbackOutput,
@@ -24,24 +26,54 @@ use tokio::sync::Mutex;
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
     /// Object store rooted at `<repo>/.agentic/objects/`.
-    pub store: FsObjectStore,
+    pub store: Arc<FsObjectStore>,
     /// Ref manager rooted at `<repo>/.agentic/`.
     pub refs: Refs,
     /// Serialises every write-path request. Per ADR-0001 the daemon does
     /// one commit at a time.
     pub commit_lock: Mutex<()>,
+    /// Optional memory backend. When present, every commit takes a memory
+    /// snapshot under the commit lock and threads its manifest hash into
+    /// the Commit's `memory_snapshot` dimension.
+    pub memory: Option<Mutex<PostgresAdapter>>,
 }
 
 impl DaemonState {
-    pub fn open(agentic_dir: PathBuf) -> anyhow::Result<Self> {
+    pub async fn open(
+        agentic_dir: PathBuf,
+        postgres_url: Option<&str>,
+        tables: Vec<TrackedTable>,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&agentic_dir).context("creating .agentic directory")?;
-        let store =
-            FsObjectStore::open(agentic_dir.join("objects")).context("opening object store")?;
+        let store = Arc::new(
+            FsObjectStore::open(agentic_dir.join("objects")).context("opening object store")?,
+        );
         let refs = Refs::open(&agentic_dir).context("opening refs")?;
+
+        let memory = match postgres_url {
+            None => None,
+            Some(url) => {
+                if tables.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "--postgres requires at least one --tables entry"
+                    ));
+                }
+                let cfg = PgConfig::new(url, tables);
+                let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await?;
+                adapter.init().await?;
+                tracing::info!(
+                    logical_decoding = adapter.logical_decoding_available(),
+                    "memory backend attached"
+                );
+                Some(Mutex::new(adapter))
+            }
+        };
+
         Ok(Self {
             store,
             refs,
             commit_lock: Mutex::new(()),
+            memory,
         })
     }
 }
@@ -100,7 +132,7 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
             let head = state.refs.resolve("HEAD")?;
             let entries = match head {
                 None => Vec::new(),
-                Some(h) => walk_log(&state.store, h, limit)?
+                Some(h) => walk_log(state.store.as_ref(), h, limit)?
                     .into_iter()
                     .map(|(hash, c)| LogEntry {
                         hash: hash.to_hex(),
@@ -146,6 +178,24 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
 
     let parent: Option<Hash> = state.refs.read_branch(&branch)?;
 
+    // ADR-0002 Decision 3, Step 1: stage memory before any other blob.
+    // We capture a snapshot, persist its manifest as a raw object, and
+    // thread the manifest hash + schema version into the Commit.
+    let (memory_snapshot, schema_version) = if input.no_memory {
+        (None, None)
+    } else if let Some(memory) = &state.memory {
+        let adapter = memory.lock().await;
+        let handle = adapter.snapshot().await.context("taking memory snapshot")?;
+        let manifest_bytes = handle.manifest.to_canonical_bytes();
+        let manifest_hash = state
+            .store
+            .put_raw(ObjectKind::Tree, &manifest_bytes)
+            .context("persisting segment manifest")?;
+        (Some(manifest_hash), Some(handle.schema_version))
+    } else {
+        (None, None)
+    };
+
     let prompts = input
         .prompts
         .into_iter()
@@ -160,8 +210,8 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         prompts,
         tools: Default::default(),
         model: input.model,
-        memory_snapshot: None,
-        schema_version: None,
+        memory_snapshot,
+        schema_version,
         intent: None,
         plan: None,
         transcript: None,
@@ -169,7 +219,7 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         cost_cents: 0,
     };
 
-    let out = stage_and_commit(&state.store, &state.refs, &branch, inputs)?;
+    let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)?;
     Ok(CommitOutput {
         commit_hash: out.commit_hash.to_hex(),
         branch: out.branch,

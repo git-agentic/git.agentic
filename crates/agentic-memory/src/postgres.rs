@@ -1,64 +1,396 @@
 //! Postgres + pgvector adapter — the MVP's only first-class memory backend.
 //!
-//! Phase 1 (week 3): bulk segment build from a snapshot of current state.
-//! Phase 2 (week 4): logical-decoding streamer for real-time segment writes.
-//! Phase 3 (week 5): atomic snapshot via advisory lock + COW of the active head.
+//! Phase 1 (this file): bulk segment build from a snapshot of current state.
+//!   * `init()` validates pgvector, installs the schema-version helper and
+//!     migrations table, and best-effort-creates the logical replication
+//!     slot.
+//!   * `bootstrap()` (called by `snapshot()`) does a single cursor scan of
+//!     every tracked table and emits sealed segments into the provided
+//!     ObjectStore, building a `SegmentManifest` snapshot of the current
+//!     state.
 //!
-//! This file currently sketches the surface area. Each method returns
-//! `unimplemented!()` until its scheduled week.
+//! Phase 2 (`decoder.rs`, follow-up commit): logical-decoding stream that
+//! keeps the segment store hot as the user's agent writes.
+//!
+//! Phase 3 (`snapshot.rs`, follow-up commit): atomic snapshot via
+//! `pg_advisory_xact_lock` + CoW of the active head segment.
+
+use std::sync::Arc;
+
+use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
+use serde_json::Value as Json;
+use sqlx::PgPool;
 
 use crate::adapter::{MemoryAdapter, SnapshotHandle};
-use crate::segment::SegmentManifest;
-use crate::Result;
+use crate::segment::{Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::{Error, Result};
 
-use sqlx::PgPool;
+/// One tracked table's identity plus its primary-key column.
+#[derive(Clone, Debug)]
+pub struct TrackedTable {
+    pub name: String,
+    /// Primary-key column name (single-column PKs only for MVP).
+    pub pk: String,
+}
+
+/// Configuration passed to `PostgresAdapter::connect`.
+#[derive(Clone, Debug)]
+pub struct PgConfig {
+    pub url: String,
+    pub tables: Vec<TrackedTable>,
+    /// Target sealed-segment size in bytes. Defaults to 64 MiB.
+    pub segment_target_bytes: usize,
+    /// Logical replication slot name. One per repo.
+    pub replication_slot: String,
+}
+
+impl PgConfig {
+    pub fn new(url: impl Into<String>, tables: Vec<TrackedTable>) -> Self {
+        Self {
+            url: url.into(),
+            tables,
+            segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
+            replication_slot: "agentic_slot".into(),
+        }
+    }
+}
 
 pub struct PostgresAdapter {
     pool: PgPool,
-    tables: Vec<String>,
+    cfg: PgConfig,
+    store: Arc<FsObjectStore>,
+    /// Whether `init()` confirmed logical decoding is usable. False on
+    /// managed Postgres without `wal_level=logical`; the trigger fallback
+    /// runs instead (lands in `triggers.rs`).
+    logical_decoding_available: bool,
 }
 
 impl PostgresAdapter {
-    pub async fn connect(url: &str, tables: Vec<String>) -> Result<Self> {
-        let pool = PgPool::connect(url).await?;
-        Ok(Self { pool, tables })
+    pub async fn connect(cfg: PgConfig, store: Arc<FsObjectStore>) -> Result<Self> {
+        let pool = PgPool::connect(&cfg.url).await?;
+        Ok(Self {
+            pool,
+            cfg,
+            store,
+            logical_decoding_available: false,
+        })
+    }
+
+    pub fn logical_decoding_available(&self) -> bool {
+        self.logical_decoding_available
+    }
+
+    /// Validate the database meets MVP preconditions. Fails loudly if
+    /// pgvector is missing; we intentionally don't auto-install it
+    /// (CREATE EXTENSION requires superuser).
+    async fn validate_pgvector(&self) -> Result<()> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT extname FROM pg_extension WHERE extname = 'vector'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if row.is_none() {
+            return Err(Error::Backend(
+                "pgvector extension is not installed; run \
+                 `CREATE EXTENSION vector;` as a superuser before \
+                 `agentic init`"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Install `agentic_schema_version()` and the `agentic_migrations`
+    /// table. Both are idempotent. sqlx's prepared-statement path rejects
+    /// multi-statement queries, so we send them one at a time.
+    async fn install_helpers(&self) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agentic_migrations (
+                id          serial      PRIMARY KEY,
+                name        text        NOT NULL,
+                applied_at  timestamptz NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION agentic_schema_version()
+            RETURNS text
+            LANGUAGE sql
+            AS $$
+                SELECT coalesce(
+                    (SELECT name FROM agentic_migrations ORDER BY id DESC LIMIT 1),
+                    '0.0.0'
+                );
+            $$
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Try to create the logical replication slot. On managed Postgres
+    /// without `wal_level=logical` we fall back to trigger capture.
+    async fn ensure_replication_slot(&mut self) -> Result<()> {
+        let row: (String,) = sqlx::query_as("SHOW wal_level")
+            .fetch_one(&self.pool)
+            .await?;
+        if row.0 != "logical" {
+            tracing::warn!(
+                wal_level = row.0,
+                "wal_level != logical; falling back to trigger capture"
+            );
+            self.logical_decoding_available = false;
+            return Ok(());
+        }
+
+        let existing: Option<(String,)> =
+            sqlx::query_as("SELECT slot_name FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(&self.cfg.replication_slot)
+                .fetch_optional(&self.pool)
+                .await?;
+        if existing.is_some() {
+            self.logical_decoding_available = true;
+            return Ok(());
+        }
+
+        let created = sqlx::query("SELECT pg_create_logical_replication_slot($1, 'pgoutput')")
+            .bind(&self.cfg.replication_slot)
+            .execute(&self.pool)
+            .await;
+        match created {
+            Ok(_) => {
+                self.logical_decoding_available = true;
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not create replication slot; trigger fallback");
+                self.logical_decoding_available = false;
+                Ok(())
+            }
+        }
+    }
+
+    /// Read every tracked table cursor-style and emit sealed segments.
+    /// Returns a manifest pinning the segments by `(table, pk_lo..pk_hi)`.
+    pub async fn bootstrap(&self) -> Result<SegmentManifest> {
+        let schema_version = self.current_schema_version_inner().await?;
+        let mut manifest = SegmentManifest::new(schema_version.clone());
+
+        for table in &self.cfg.tables {
+            self.bootstrap_table(table, &schema_version, &mut manifest)
+                .await?;
+        }
+        Ok(manifest)
+    }
+
+    async fn bootstrap_table(
+        &self,
+        table: &TrackedTable,
+        schema_version: &str,
+        manifest: &mut SegmentManifest,
+    ) -> Result<()> {
+        validate_identifier(&table.name)?;
+        validate_identifier(&table.pk)?;
+
+        let sql = format!(
+            "SELECT * FROM {} ORDER BY {}",
+            quote_qualified(&table.name),
+            quote_ident(&table.pk),
+        );
+
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
+
+        let mut current = blank_segment(&table.name, schema_version);
+        let mut have_lo = false;
+
+        for row in &rows {
+            let row_json = row_to_json(row);
+            let pk_value = row_json.get(&table.pk).cloned().unwrap_or(Json::Null);
+
+            if !have_lo {
+                current.pk_lo = pk_value.clone();
+                have_lo = true;
+            }
+            current.pk_hi = pk_value.clone();
+            current.rows.push(row_json);
+            current.row_count = current.rows.len() as u64;
+
+            if current.canonical_size() >= self.cfg.segment_target_bytes {
+                self.seal_segment(&mut current, schema_version, manifest)?;
+                have_lo = false;
+            }
+        }
+
+        if !current.rows.is_empty() {
+            self.seal_segment(&mut current, schema_version, manifest)?;
+        }
+        Ok(())
+    }
+
+    fn seal_segment(
+        &self,
+        current: &mut Segment,
+        schema_version: &str,
+        manifest: &mut SegmentManifest,
+    ) -> Result<()> {
+        // Persist segment bytes via the object store. Segments live outside
+        // the typed `Object` enum (snapshot-model §1.3); we use `put_raw`
+        // keyed by raw BLAKE3 of the canonical JSON.
+        let bytes = current.to_canonical_bytes();
+        let segment_hash: Hash = self
+            .store
+            .put_raw(ObjectKind::Segment, &bytes)
+            .map_err(|e| Error::Backend(format!("persisting segment: {e}")))?;
+
+        manifest.push(SegmentRef {
+            table: current.table.clone(),
+            pk_lo: current.pk_lo.clone(),
+            pk_hi: current.pk_hi.clone(),
+            segment: segment_hash,
+            row_count: current.row_count,
+        });
+
+        *current = blank_segment(&current.table, schema_version);
+        Ok(())
+    }
+
+    async fn current_schema_version_inner(&self) -> Result<String> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT agentic_schema_version()")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0).unwrap_or_else(|| "0.0.0".to_string()))
     }
 }
 
 #[async_trait::async_trait]
 impl MemoryAdapter for PostgresAdapter {
     async fn init(&mut self) -> Result<()> {
-        // Week 3–4: validate pgvector, create replication slot, install
-        // helper functions, begin streaming.
-        unimplemented!("PostgresAdapter::init lands in week 3")
+        self.validate_pgvector().await?;
+        self.install_helpers().await?;
+        self.ensure_replication_slot().await?;
+        Ok(())
     }
 
+    /// MVP snapshot is the bootstrap result. Once the streamer lands, the
+    /// snapshot will instead read from the live segment store under an
+    /// advisory lock. Until then bootstrap-on-each-snapshot is correct
+    /// (slow but correct) and lets the daemon populate
+    /// `Commit.memory_snapshot` end-to-end today.
     async fn snapshot(&self) -> Result<SnapshotHandle> {
-        unimplemented!("PostgresAdapter::snapshot lands in week 5")
+        let manifest = self.bootstrap().await?;
+        let schema_version = manifest.schema_version.clone();
+        Ok(SnapshotHandle {
+            manifest,
+            schema_version,
+        })
     }
 
     async fn restore(&self, _target: &SnapshotHandle) -> Result<()> {
-        unimplemented!("PostgresAdapter::restore lands in week 8")
+        Err(Error::Backend(
+            "restore is not implemented yet (Chunk C / week 8)".into(),
+        ))
     }
 
     async fn current_schema_version(&self) -> Result<String> {
-        // Read from a helper function we install during init.
-        let row: (String,) = sqlx::query_as("SELECT agentic_schema_version()")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0)
+        self.current_schema_version_inner().await
     }
 }
 
-// Reference the unused field so clippy doesn't complain pre-implementation.
-impl PostgresAdapter {
-    #[allow(dead_code)]
-    fn tracked_tables(&self) -> &[String] {
-        &self.tables
+fn blank_segment(table: &str, schema_version: &str) -> Segment {
+    Segment {
+        table: table.to_string(),
+        schema_version: schema_version.to_string(),
+        pk_lo: Json::Null,
+        pk_hi: Json::Null,
+        row_count: 0,
+        rows: Vec::new(),
+        embeddings: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+fn validate_identifier(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Err(Error::Backend("empty identifier".into()));
+    }
+    for c in s.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            return Err(Error::Backend(format!(
+                "invalid character in identifier: {s:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn quote_ident(s: &str) -> String {
+    // We already validated the character set, so this is safe to inline.
+    format!("\"{s}\"")
+}
+
+fn quote_qualified(s: &str) -> String {
+    if let Some((schema, table)) = s.split_once('.') {
+        format!("\"{schema}\".\"{table}\"")
+    } else {
+        format!("\"{s}\"")
+    }
+}
+
+/// Convert one sqlx Postgres row to a JSON object keyed by column name.
+/// Tries the JSON-decoded shape first (works for jsonb columns and many
+/// scalars sqlx maps cleanly); falls back to a stringified value otherwise.
+fn row_to_json(row: &sqlx::postgres::PgRow) -> Json {
+    use sqlx::Column;
+    use sqlx::Row;
+
+    let mut map = serde_json::Map::new();
+    for (idx, col) in row.columns().iter().enumerate() {
+        let name = col.name().to_string();
+        let value = row
+            .try_get::<sqlx::types::JsonValue, _>(idx)
+            .or_else(|_| {
+                row.try_get::<Option<String>, _>(idx).map(|v| match v {
+                    Some(s) => Json::String(s),
+                    None => Json::Null,
+                })
+            })
+            .unwrap_or(Json::Null);
+        map.insert(name, value);
+    }
+    Json::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_identifier_accepts_simple_names() {
+        assert!(validate_identifier("episodes").is_ok());
+        assert!(validate_identifier("user_facts").is_ok());
+        assert!(validate_identifier("schema.table").is_ok());
+        assert!(validate_identifier("EpisodesV2").is_ok());
     }
 
-    #[allow(dead_code)]
-    fn placeholder_manifest(&self) -> SegmentManifest {
-        SegmentManifest { entries: vec![] }
+    #[test]
+    fn validate_identifier_rejects_injection() {
+        assert!(validate_identifier("episodes; DROP TABLE x;").is_err());
+        assert!(validate_identifier("foo bar").is_err());
+        assert!(validate_identifier("\"quoted\"").is_err());
+        assert!(validate_identifier("").is_err());
+    }
+
+    #[test]
+    fn quote_qualified_handles_schema_prefix() {
+        assert_eq!(
+            quote_qualified("public.episodes"),
+            "\"public\".\"episodes\""
+        );
+        assert_eq!(quote_qualified("episodes"), "\"episodes\"");
     }
 }

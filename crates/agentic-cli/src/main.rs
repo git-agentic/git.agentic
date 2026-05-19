@@ -52,6 +52,10 @@ enum Command {
         /// Model version string captured into the commit.
         #[arg(long)]
         model: Option<String>,
+        /// Skip the memory snapshot dimension. Useful when no backend is
+        /// attached or for fast iteration on prompts alone.
+        #[arg(long)]
+        no_memory: bool,
     },
 
     /// Show commit history.
@@ -87,7 +91,8 @@ async fn main() -> anyhow::Result<()> {
             message,
             prompt_dir,
             model,
-        } => cmd_commit(&repo, message, prompt_dir, model, cli.json).await,
+            no_memory,
+        } => cmd_commit(&repo, message, prompt_dir, model, no_memory, cli.json).await,
         Command::Log { limit, oneline } => cmd_log(&repo, limit, oneline, cli.json).await,
         Command::Resolve { name } => cmd_resolve(&repo, name, cli.json).await,
         Command::Status => cmd_status(&repo, cli.json).await,
@@ -128,6 +133,7 @@ async fn cmd_commit(
     message: String,
     prompt_dir: PathBuf,
     model: Option<String>,
+    no_memory: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let resolved_dir = if prompt_dir.is_absolute() {
@@ -144,7 +150,7 @@ async fn cmd_commit(
         prompts,
         mcp_servers: Vec::new(),
         model,
-        no_memory: true,
+        no_memory,
     };
     let resp = round_trip(repo, Request::Commit(input)).await?;
     match resp {

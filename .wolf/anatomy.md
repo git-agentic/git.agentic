@@ -1,7 +1,7 @@
 # anatomy.md
 
-> Auto-maintained by OpenWolf. Last scanned: 2026-05-19T14:30:19.350Z
-> Files: 47 tracked | Anatomy hits: 0 | Misses: 0
+> Auto-maintained by OpenWolf. Last scanned: 2026-05-19T15:06:41.013Z
+> Files: 49 tracked | Anatomy hits: 0 | Misses: 0
 
 ## ../../../.claude/plans/
 
@@ -37,7 +37,7 @@
 ## crates/agentic-cli/src/
 
 - `client.rs` — Unix-socket client for the `agentic` CLI. (~678 tok)
-- `main.rs` — The `agentic` command-line interface. (~2266 tok)
+- `main.rs` — The `agentic` command-line interface. (~2327 tok)
 
 ## crates/agentic-core/
 
@@ -59,9 +59,13 @@
 ## crates/agentic-memory/src/
 
 - `adapter.rs` — The trait every memory backend implements. (~482 tok)
-- `lib.rs` — agentic-memory (~330 tok)
-- `postgres.rs` — Postgres + pgvector adapter — the MVP's only first-class memory backend. (~580 tok)
-- `segment.rs` — Segment objects: content-addressed, immutable chunks of memory rows. (~501 tok)
+- `lib.rs` — agentic-memory (~321 tok)
+- `postgres.rs` — Postgres + pgvector adapter — the MVP's only first-class memory backend. (~3520 tok)
+- `segment.rs` — Segment objects: content-addressed, immutable chunks of memory rows. (~2552 tok)
+
+## crates/agentic-memory/tests/
+
+- `integration.rs` — End-to-end integration tests for the Postgres backend. (~1168 tok)
 
 ## crates/agentic-proto/
 
@@ -78,8 +82,8 @@
 
 ## crates/agenticd/src/
 
-- `main.rs` — agenticd — the git.agentic daemon. (~594 tok)
-- `server.rs` — The daemon's per-connection request dispatcher. (~1579 tok)
+- `main.rs` — agenticd — the git.agentic daemon. (~847 tok)
+- `server.rs` — The daemon's per-connection request dispatcher. (~2139 tok)
 
 ## docs/adr/
 
@@ -112,3 +116,7 @@
 - `client.py` — The client that talks to `agenticd` over a Unix domain socket. (~559 tok)
 - `langgraph.py` — LangGraph integration: drop-in checkpointer that commits the agent (~392 tok)
 - `types.py` — Typed data classes mirroring the daemon's wire protocol. (~210 tok)
+
+## tests/fixtures/
+
+- `pg.yml` (~304 tok)

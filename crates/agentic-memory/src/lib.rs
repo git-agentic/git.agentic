@@ -13,7 +13,7 @@ pub mod postgres;
 pub mod segment;
 
 pub use adapter::{MemoryAdapter, SnapshotHandle};
-pub use segment::{Segment, SegmentManifest, SegmentRef};
+pub use segment::{Embedding, Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

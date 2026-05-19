@@ -86,6 +86,21 @@
       "count": 1,
       "tokens": 406,
       "first_read": "2026-05-19T14:11:46.745Z"
+    },
+    "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/segment.rs": {
+      "count": 1,
+      "tokens": 501,
+      "first_read": "2026-05-19T14:49:41.133Z"
+    },
+    "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/postgres.rs": {
+      "count": 1,
+      "tokens": 580,
+      "first_read": "2026-05-19T14:49:54.551Z"
+    },
+    "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/Cargo.toml": {
+      "count": 1,
+      "tokens": 406,
+      "first_read": "2026-05-19T15:04:24.951Z"
     }
   },
   "files_written": [
@@ -220,6 +235,114 @@
       "action": "edit",
       "tokens": 227,
       "at": "2026-05-19T14:30:19.358Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/segment.rs",
+      "action": "create",
+      "tokens": 2734,
+      "at": "2026-05-19T14:52:37.439Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/lib.rs",
+      "action": "edit",
+      "tokens": 44,
+      "at": "2026-05-19T14:53:31.181Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/postgres.rs",
+      "action": "create",
+      "tokens": 3689,
+      "at": "2026-05-19T14:56:31.044Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/main.rs",
+      "action": "edit",
+      "tokens": 206,
+      "at": "2026-05-19T14:57:43.781Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/main.rs",
+      "action": "edit",
+      "tokens": 69,
+      "at": "2026-05-19T14:59:31.531Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/main.rs",
+      "action": "edit",
+      "tokens": 190,
+      "at": "2026-05-19T14:59:39.051Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/server.rs",
+      "action": "edit",
+      "tokens": 166,
+      "at": "2026-05-19T14:59:50.796Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/server.rs",
+      "action": "edit",
+      "tokens": 564,
+      "at": "2026-05-19T15:00:04.595Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/server.rs",
+      "action": "edit",
+      "tokens": 585,
+      "at": "2026-05-19T15:00:23.983Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agenticd/src/server.rs",
+      "action": "edit",
+      "tokens": 20,
+      "at": "2026-05-19T15:00:30.678Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/tests/fixtures/pg.yml",
+      "action": "create",
+      "tokens": 260,
+      "at": "2026-05-19T15:02:14.551Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/tests/integration.rs",
+      "action": "create",
+      "tokens": 1251,
+      "at": "2026-05-19T15:03:19.672Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/tests/fixtures/pg.yml",
+      "action": "edit",
+      "tokens": 150,
+      "at": "2026-05-19T15:03:28.847Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/Cargo.toml",
+      "action": "edit",
+      "tokens": 19,
+      "at": "2026-05-19T15:04:40.266Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-memory/src/postgres.rs",
+      "action": "edit",
+      "tokens": 301,
+      "at": "2026-05-19T15:05:09.318Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-cli/src/main.rs",
+      "action": "edit",
+      "tokens": 188,
+      "at": "2026-05-19T15:06:24.613Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-cli/src/main.rs",
+      "action": "edit",
+      "tokens": 57,
+      "at": "2026-05-19T15:06:31.934Z"
+    },
+    {
+      "file": "/Users/toni/Developer/Codento/git.agentic/crates/agentic-cli/src/main.rs",
+      "action": "edit",
+      "tokens": 169,
+      "at": "2026-05-19T15:06:41.022Z"
     }
   ],
   "edit_counts": {
@@ -231,13 +354,19 @@
     "crates/agentic-proto/src/lib.rs": 3,
     "crates/agentic-proto/Cargo.toml": 1,
     "crates/agentic-proto/src/framing.rs": 1,
-    "crates/agenticd/src/server.rs": 3,
-    "crates/agenticd/src/main.rs": 1,
+    "crates/agenticd/src/server.rs": 7,
+    "crates/agenticd/src/main.rs": 4,
     "crates/agentic-cli/src/client.rs": 1,
-    "crates/agentic-cli/src/main.rs": 2,
-    ".github/workflows/ci.yml": 1
+    "crates/agentic-cli/src/main.rs": 5,
+    ".github/workflows/ci.yml": 1,
+    "crates/agentic-memory/src/segment.rs": 1,
+    "crates/agentic-memory/src/lib.rs": 1,
+    "crates/agentic-memory/src/postgres.rs": 2,
+    "tests/fixtures/pg.yml": 2,
+    "crates/agentic-memory/tests/integration.rs": 1,
+    "crates/agentic-memory/Cargo.toml": 1
   },
-  "anatomy_hits": 17,
+  "anatomy_hits": 20,
   "anatomy_misses": 0,
   "repeated_reads_warned": 0,
   "cerebrum_warnings": 0,
