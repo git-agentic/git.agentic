@@ -49,7 +49,7 @@ docs/
 ## Build, test, run
 
 ```bash
-# Rust workspace (toolchain pinned to 1.78 via rust-toolchain.toml)
+# Rust workspace (toolchain pinned to 1.95 via rust-toolchain.toml)
 cargo check
 cargo test
 cargo clippy --workspace --all-targets -- -D warnings
