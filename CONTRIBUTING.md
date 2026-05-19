@@ -24,7 +24,7 @@ Please read `docs/adr/0001-architecture-foundations.md` before proposing changes
 ## Development setup
 
 ```bash
-# Rust workspace (1.78+ required; pinned via rust-toolchain.toml)
+# Rust workspace (1.95+ required; pinned via rust-toolchain.toml)
 cargo check
 cargo test
 cargo clippy --workspace --all-targets -- -D warnings
