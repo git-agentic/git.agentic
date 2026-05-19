@@ -5,13 +5,28 @@
 
 mod server;
 
-use anyhow::Context;
+use agentic_memory::postgres::TrackedTable;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 
 use crate::server::{handle_connection, DaemonState};
+
+fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
+    spec.iter()
+        .map(|s| {
+            let (name, pk) = s
+                .split_once(':')
+                .ok_or_else(|| anyhow!("--tables expects table:pk, got {s:?}"))?;
+            Ok(TrackedTable {
+                name: name.trim().to_string(),
+                pk: pk.trim().to_string(),
+            })
+        })
+        .collect()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "agenticd", version, about = "git.agentic daemon")]
@@ -23,6 +38,16 @@ struct Args {
     /// Socket path. Default: <repo>/.agentic/agenticd.sock.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Postgres URL to attach as the memory backend. If absent, commits
+    /// land without a `memory_snapshot` dimension (Chunk A behaviour).
+    #[arg(long)]
+    postgres: Option<String>,
+
+    /// Comma-separated `table:pk` pairs to track. Required when
+    /// `--postgres` is set. Example: `episodes:id,user_facts:id`.
+    #[arg(long, value_delimiter = ',')]
+    tables: Vec<String>,
 }
 
 #[tokio::main]
@@ -35,7 +60,10 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let agentic_dir = args.repo.join(".agentic");
-    let state = Arc::new(DaemonState::open(agentic_dir.clone())?);
+
+    let tables = parse_tracked_tables(&args.tables)?;
+    let state =
+        Arc::new(DaemonState::open(agentic_dir.clone(), args.postgres.as_deref(), tables).await?);
 
     let socket_path = args
         .socket
