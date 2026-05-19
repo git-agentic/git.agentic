@@ -98,7 +98,7 @@ git.agentic/
 
 ## Building locally
 
-Requirements: Rust 1.85+ (pinned via `rust-toolchain.toml`), Python 3.10+, Postgres 15+ with `pgvector`.
+Requirements: Rust 1.95+ (pinned via `rust-toolchain.toml`), Python 3.10+, Postgres 15+ with `pgvector`.
 
 ```bash
 # Rust workspace
