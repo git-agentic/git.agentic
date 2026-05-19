@@ -4,6 +4,7 @@
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
 mod mcp;
+mod rollback;
 mod server;
 
 use agentic_memory::postgres::TrackedTable;
@@ -74,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let mcp_servers = parse_mcp_spec(&args.mcp)?;
     let state = Arc::new(
         DaemonState::open(
+            args.repo.clone(),
             agentic_dir.clone(),
             args.postgres.as_deref(),
             tables,

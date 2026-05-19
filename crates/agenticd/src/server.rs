@@ -17,9 +17,7 @@ use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
-use agentic_proto::{
-    CommitInput, CommitOutput, DiffOutput, Envelope, LogEntry, Request, Response, RollbackOutput,
-};
+use agentic_proto::{CommitInput, CommitOutput, DiffOutput, Envelope, LogEntry, Request, Response};
 use anyhow::{anyhow, Context};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -28,6 +26,9 @@ use crate::mcp::{fingerprint_all, McpServerSpec};
 
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
+    /// Filesystem root of the repo (parent of `.agentic/`). Rollback uses
+    /// this to compute the `prompts/` write-back target.
+    pub repo_root: PathBuf,
     /// Object store rooted at `<repo>/.agentic/objects/`.
     pub store: Arc<FsObjectStore>,
     /// Ref manager rooted at `<repo>/.agentic/`.
@@ -48,6 +49,7 @@ pub struct DaemonState {
 
 impl DaemonState {
     pub async fn open(
+        repo_root: PathBuf,
         agentic_dir: PathBuf,
         postgres_url: Option<&str>,
         tables: Vec<TrackedTable>,
@@ -88,6 +90,7 @@ impl DaemonState {
         }
 
         Ok(Self {
+            repo_root,
             store,
             refs,
             commit_lock: Mutex::new(()),
@@ -168,12 +171,24 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
         Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state, &from, &to)?)),
 
         Request::Rollback {
-            target, dry_run: _, ..
-        } => Ok(Response::Rollback(RollbackOutput {
-            planned_steps: vec![format!("would rollback to {target} (Chunk C)")],
-            executed: false,
-            new_head_hash: None,
-        })),
+            target,
+            dry_run,
+            accept_data_loss,
+        } => {
+            let _guard = state.commit_lock.lock().await;
+            let repo_root = state.repo_root.clone();
+            let out = crate::rollback::execute(
+                state,
+                crate::rollback::RollbackArgs {
+                    target: &target,
+                    dry_run,
+                    accept_data_loss,
+                    repo: &repo_root,
+                },
+            )
+            .await?;
+            Ok(Response::Rollback(out))
+        }
     }
 }
 

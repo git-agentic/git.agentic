@@ -21,6 +21,10 @@ pub trait ObjectStore: Send + Sync {
     fn put(&self, object: &Object) -> Result<Hash>;
     fn put_raw(&self, kind: ObjectKind, bytes: &[u8]) -> Result<Hash>;
     fn get(&self, hash: &Hash) -> Result<Object>;
+    /// Read the raw uncompressed bytes that were originally `put_raw`'d.
+    /// Used for object kinds (Segment, SegmentManifest) that live outside
+    /// the typed `Object` enum.
+    fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>>;
     fn has(&self, hash: &Hash) -> bool;
 }
 
@@ -98,6 +102,14 @@ impl ObjectStore for FsObjectStore {
             });
         }
         Ok(object)
+    }
+
+    fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
+        let path = self.path_for(hash);
+        if !path.exists() {
+            return Err(Error::NotFound(*hash));
+        }
+        self.read_at(&path)
     }
 
     fn has(&self, hash: &Hash) -> bool {
