@@ -38,6 +38,9 @@ clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP — for MCP fingerprinting (Chunk C)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 # Errors
 thiserror = "1.0"
 anyhow = "1.0"
