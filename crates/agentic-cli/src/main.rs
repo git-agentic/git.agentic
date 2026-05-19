@@ -71,6 +71,15 @@ enum Command {
 
     /// Show the current branch + head hash.
     Status,
+
+    /// Show a behavioral diff between two refs.
+    Diff {
+        /// From-ref (commit hash, "HEAD", or branch name).
+        from: String,
+        /// To-ref. Defaults to "HEAD".
+        #[arg(default_value = "HEAD")]
+        to: String,
+    },
 }
 
 #[tokio::main]
@@ -96,6 +105,51 @@ async fn main() -> anyhow::Result<()> {
         Command::Log { limit, oneline } => cmd_log(&repo, limit, oneline, cli.json).await,
         Command::Resolve { name } => cmd_resolve(&repo, name, cli.json).await,
         Command::Status => cmd_status(&repo, cli.json).await,
+        Command::Diff { from, to } => cmd_diff(&repo, from, to, cli.json).await,
+    }
+}
+
+async fn cmd_diff(repo: &Path, from: String, to: String, json: bool) -> anyhow::Result<()> {
+    let resp = round_trip(repo, Request::Diff { from, to }).await?;
+    match resp {
+        Response::Diff(d) if json => println!("{}", serde_json::to_string(&d)?),
+        Response::Diff(d) => render_diff(&d),
+        Response::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+fn render_diff(d: &agentic_proto::DiffOutput) {
+    println!("diff {} → {}", &d.from[..7], &d.to[..7]);
+    if !d.prompts.is_empty() {
+        println!("\nprompts:");
+        for line in &d.prompts {
+            println!("  {line}");
+        }
+    }
+    if !d.tools.is_empty() {
+        println!("\ntools:");
+        for line in &d.tools {
+            println!("  {line}");
+        }
+    }
+    if d.model_changed {
+        println!("\nmodel:    changed");
+    }
+    if !d.memory_summary.is_empty() {
+        println!("\nmemory:   {}", d.memory_summary);
+    }
+    if !d.schema_summary.is_empty() {
+        println!("\nschema:   {}", d.schema_summary);
+    }
+    if d.prompts.is_empty()
+        && d.tools.is_empty()
+        && !d.model_changed
+        && d.memory_summary.is_empty()
+        && d.schema_summary.is_empty()
+    {
+        println!("(no changes)");
     }
 }
 
