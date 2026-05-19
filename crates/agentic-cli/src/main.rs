@@ -80,6 +80,23 @@ enum Command {
         #[arg(default_value = "HEAD")]
         to: String,
     },
+
+    /// Roll back to a previous agent version. Forward-records the
+    /// rollback as a new commit so history is preserved.
+    Rollback {
+        /// Target ref (commit hash or branch name).
+        target: String,
+        /// Show the plan without executing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Reserved for the migration runner: allow destructive
+        /// migrations whose reverse loses data between snapshot and now.
+        #[arg(long)]
+        accept_data_loss: bool,
+    },
 }
 
 #[tokio::main]
@@ -106,7 +123,78 @@ async fn main() -> anyhow::Result<()> {
         Command::Resolve { name } => cmd_resolve(&repo, name, cli.json).await,
         Command::Status => cmd_status(&repo, cli.json).await,
         Command::Diff { from, to } => cmd_diff(&repo, from, to, cli.json).await,
+        Command::Rollback {
+            target,
+            dry_run,
+            yes,
+            accept_data_loss,
+        } => cmd_rollback(&repo, target, dry_run, yes, accept_data_loss, cli.json).await,
     }
+}
+
+async fn cmd_rollback(
+    repo: &Path,
+    target: String,
+    dry_run: bool,
+    yes: bool,
+    accept_data_loss: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if !dry_run && !yes {
+        // First show the plan, then confirm.
+        let plan = match round_trip(
+            repo,
+            Request::Rollback {
+                target: target.clone(),
+                dry_run: true,
+                accept_data_loss,
+            },
+        )
+        .await?
+        {
+            Response::Rollback(p) => p,
+            Response::Error { message } => return Err(anyhow!(message)),
+            other => return Err(anyhow!("unexpected response: {other:?}")),
+        };
+        println!("Planned rollback to {target}:");
+        for step in &plan.planned_steps {
+            println!("  - {step}");
+        }
+        eprint!("Proceed? [y/N] ");
+        use std::io::{BufRead, Write};
+        std::io::stderr().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+            return Err(anyhow!("rollback aborted by user"));
+        }
+    }
+
+    let resp = round_trip(
+        repo,
+        Request::Rollback {
+            target,
+            dry_run,
+            accept_data_loss,
+        },
+    )
+    .await?;
+    match resp {
+        Response::Rollback(out) if json => println!("{}", serde_json::to_string(&out)?),
+        Response::Rollback(out) => {
+            for step in &out.planned_steps {
+                println!("  - {step}");
+            }
+            match (out.executed, out.new_head_hash) {
+                (true, Some(h)) => println!("✓ rollback complete; HEAD now at {}", &h[..7]),
+                (true, None) => println!("✓ rollback executed (no new head)"),
+                (false, _) => println!("(dry run; nothing executed)"),
+            }
+        }
+        Response::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
 }
 
 async fn cmd_diff(repo: &Path, from: String, to: String, json: bool) -> anyhow::Result<()> {
