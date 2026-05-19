@@ -20,9 +20,12 @@ use std::sync::Arc;
 use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
 use serde_json::Value as Json;
 use sqlx::PgPool;
+use tokio::task::JoinHandle;
 
 use crate::adapter::{MemoryAdapter, SnapshotHandle};
 use crate::segment::{Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
+use crate::streamer::{self, StreamerHandle};
+use crate::triggers;
 use crate::{Error, Result};
 
 /// One tracked table's identity plus its primary-key column.
@@ -61,8 +64,17 @@ pub struct PostgresAdapter {
     store: Arc<FsObjectStore>,
     /// Whether `init()` confirmed logical decoding is usable. False on
     /// managed Postgres without `wal_level=logical`; the trigger fallback
-    /// runs instead (lands in `triggers.rs`).
+    /// (in `triggers.rs`) runs instead.
     logical_decoding_available: bool,
+    /// Streamer handle. Set after `init()`; `snapshot()` goes through
+    /// `streamer.take_snapshot` to produce O(delta)-sized manifests.
+    streamer: Option<StreamerHandle>,
+    /// Streamer + poller tasks. Held so they stay alive for the
+    /// adapter's lifetime; dropped when the adapter is dropped.
+    #[allow(dead_code)]
+    streamer_join: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
+    poller_join: Option<JoinHandle<()>>,
 }
 
 impl PostgresAdapter {
@@ -73,6 +85,9 @@ impl PostgresAdapter {
             cfg,
             store,
             logical_decoding_available: false,
+            streamer: None,
+            streamer_join: None,
+            poller_join: None,
         })
     }
 
@@ -217,7 +232,11 @@ impl PostgresAdapter {
                 have_lo = true;
             }
             current.pk_hi = pk_value.clone();
-            current.rows.push(row_json);
+            // Wrap in the streamer's envelope shape so the restore code
+            // path is uniform across bootstrap and delta segments.
+            current
+                .rows
+                .push(serde_json::json!({"op": "insert", "row": row_json}));
             current.row_count = current.rows.len() as u64;
 
             if current.canonical_size() >= self.cfg.segment_target_bytes {
@@ -273,17 +292,53 @@ impl MemoryAdapter for PostgresAdapter {
         self.validate_pgvector().await?;
         self.install_helpers().await?;
         self.ensure_replication_slot().await?;
+
+        // Trigger-based change capture is the portable path; even when
+        // logical decoding is available the trigger fallback still works
+        // and gives us a uniform event source for the streamer.
+        triggers::install_triggers(&self.pool, &self.cfg.tables).await?;
+
+        // One-shot baseline: bootstrap-scan every tracked table into
+        // sealed segments. The resulting SegmentRefs anchor the
+        // streamer's view of the world; every subsequent change rides
+        // on top as delta segments.
+        let baseline = self.bootstrap().await?;
+        let schema_version = baseline.schema_version.clone();
+
+        let (handle, streamer_join) = streamer::spawn(
+            self.store.clone(),
+            self.cfg.tables.clone(),
+            self.cfg.segment_target_bytes,
+            schema_version.clone(),
+        );
+        handle.seed_sealed(baseline.entries).await?;
+
+        let poller_join = triggers::spawn_poller(
+            self.pool.clone(),
+            handle.clone(),
+            triggers::DEFAULT_POLL_INTERVAL,
+            self.cfg.tables.clone(),
+        );
+
+        self.streamer = Some(handle);
+        self.streamer_join = Some(streamer_join);
+        self.poller_join = Some(poller_join);
         Ok(())
     }
 
-    /// MVP snapshot is the bootstrap result. Once the streamer lands, the
-    /// snapshot will instead read from the live segment store under an
-    /// advisory lock. Until then bootstrap-on-each-snapshot is correct
-    /// (slow but correct) and lets the daemon populate
-    /// `Commit.memory_snapshot` end-to-end today.
+    /// Snapshot via the streamer. Before asking the streamer to seal
+    /// active heads we synchronously drain `agentic_change_log` so the
+    /// snapshot reflects every change that committed before this call.
+    /// Without that fence we could miss events captured between the
+    /// poller's last tick and this snapshot.
     async fn snapshot(&self) -> Result<SnapshotHandle> {
-        let manifest = self.bootstrap().await?;
-        let schema_version = manifest.schema_version.clone();
+        let handle = self
+            .streamer
+            .as_ref()
+            .ok_or_else(|| Error::Backend("snapshot called before init".into()))?;
+        triggers::drain_to_completion(&self.pool, handle, &self.cfg.tables).await?;
+        let schema_version = self.current_schema_version_inner().await?;
+        let manifest = handle.take_snapshot(&schema_version).await?;
         Ok(SnapshotHandle {
             manifest,
             schema_version,
