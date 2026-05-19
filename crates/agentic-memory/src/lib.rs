@@ -10,6 +10,7 @@
 
 pub mod adapter;
 pub mod postgres;
+pub mod restore;
 pub mod segment;
 
 pub use adapter::{MemoryAdapter, SnapshotHandle};

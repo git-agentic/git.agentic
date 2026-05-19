@@ -290,10 +290,26 @@ impl MemoryAdapter for PostgresAdapter {
         })
     }
 
-    async fn restore(&self, _target: &SnapshotHandle) -> Result<()> {
-        Err(Error::Backend(
-            "restore is not implemented yet (Chunk C / week 8)".into(),
-        ))
+    async fn restore(&self, target: &SnapshotHandle) -> Result<()> {
+        // Schema-version gate: the migration runner lands in a follow-up.
+        // For Chunk C-part-2 we fail loudly if schema versions diverge,
+        // matching ADR-0002 Decision 5's "destructive migration"
+        // honesty — the operator must hand-write the reverse before
+        // rollback can proceed.
+        let live = self.current_schema_version_inner().await?;
+        if live != target.schema_version {
+            return Err(Error::SchemaMismatch {
+                live,
+                target: target.schema_version.clone(),
+            });
+        }
+        crate::restore::restore_manifest(
+            &self.pool,
+            self.store.as_ref(),
+            &target.manifest,
+            &self.cfg.tables,
+        )
+        .await
     }
 
     async fn current_schema_version(&self) -> Result<String> {
@@ -342,25 +358,50 @@ fn quote_qualified(s: &str) -> String {
 }
 
 /// Convert one sqlx Postgres row to a JSON object keyed by column name.
-/// Tries the JSON-decoded shape first (works for jsonb columns and many
-/// scalars sqlx maps cleanly); falls back to a stringified value otherwise.
+/// Dispatches on the column's Postgres type name so the JSON value's type
+/// matches what restore will need to bind back (a bigint round-trips as
+/// `Json::Number`, not `Json::String`).
 fn row_to_json(row: &sqlx::postgres::PgRow) -> Json {
-    use sqlx::Column;
-    use sqlx::Row;
+    use sqlx::postgres::PgRow;
+    use sqlx::types::JsonValue;
+    use sqlx::{Column, Row, TypeInfo};
+
+    fn json_for_column(row: &PgRow, idx: usize, ty: &str) -> Json {
+        // NULL short-circuit.
+        if let Ok(None) = row.try_get::<Option<JsonValue>, _>(idx) {
+            return Json::Null;
+        }
+
+        match ty {
+            "INT8" | "BIGINT" | "INT4" | "INT" | "INTEGER" | "INT2" | "SMALLINT" | "OID" => row
+                .try_get::<i64, _>(idx)
+                .map(|i| Json::Number(i.into()))
+                .unwrap_or(Json::Null),
+            "FLOAT4" | "REAL" | "FLOAT8" | "DOUBLE PRECISION" => row
+                .try_get::<f64, _>(idx)
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Json::Number)
+                .unwrap_or(Json::Null),
+            "BOOL" | "BOOLEAN" => row
+                .try_get::<bool, _>(idx)
+                .map(Json::Bool)
+                .unwrap_or(Json::Null),
+            "JSON" | "JSONB" => row.try_get::<JsonValue, _>(idx).unwrap_or(Json::Null),
+            // text / varchar / char / uuid / timestamptz / date / time
+            // and anything else we don't special-case: round-trip as text.
+            _ => row
+                .try_get::<String, _>(idx)
+                .map(Json::String)
+                .unwrap_or(Json::Null),
+        }
+    }
 
     let mut map = serde_json::Map::new();
     for (idx, col) in row.columns().iter().enumerate() {
         let name = col.name().to_string();
-        let value = row
-            .try_get::<sqlx::types::JsonValue, _>(idx)
-            .or_else(|_| {
-                row.try_get::<Option<String>, _>(idx).map(|v| match v {
-                    Some(s) => Json::String(s),
-                    None => Json::Null,
-                })
-            })
-            .unwrap_or(Json::Null);
-        map.insert(name, value);
+        let ty = col.type_info().name().to_uppercase();
+        map.insert(name, json_for_column(row, idx, &ty));
     }
     Json::Object(map)
 }
