@@ -1,10 +1,14 @@
 //! End-to-end tests for `GcsObjectStore` against `fake-gcs-server`.
 //!
 //! Gated by `#[ignore]` so the default `cargo test` run skips them.
-//! Bring up the fixture and run with:
+//! Bring up the fixture, create the bucket, and run with:
 //!
 //! ```bash
 //! podman compose -f tests/fixtures/fake-gcs.yml up -d
+//! curl -X POST \
+//!   -H 'Content-Type: application/json' \
+//!   http://localhost:54323/storage/v1/b \
+//!   -d '{"name":"agentic-test-bucket"}'
 //! GCS_ENDPOINT=http://localhost:54323 GCS_BUCKET=agentic-test-bucket \
 //!   cargo test -p agentic-core --test gcs_integration -- --ignored
 //! ```
