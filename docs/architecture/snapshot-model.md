@@ -263,6 +263,8 @@ The PII story will need refinement with a real security review. Documented now s
 
 These are aspirational and will be re-tuned as we benchmark. The point is to commit to numbers publicly so we don't ship a fast demo and a slow product.
 
+See [`benchmarks.md`](benchmarks.md) for the latest measured numbers and which targets remain pending an integration benchmark.
+
 ## 10. Open implementation questions
 
 - **Logical decoding vs. triggers.** Logical decoding is cleaner but requires Postgres configuration (`wal_level=logical`, replication slots). Triggers work on any Postgres. Lean: logical decoding with triggers as a fallback, both gated on `agentic init` detecting capabilities.
