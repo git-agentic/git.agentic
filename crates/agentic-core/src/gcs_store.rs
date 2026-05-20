@@ -1,0 +1,408 @@
+//! GCS-backed `ObjectStore`.
+//!
+//! Implements ADR-0004 Decision 5: every object goes through to Google
+//! Cloud Storage (write-through), with a read-through local cache that
+//! makes diff and replay free of network cost.
+//!
+//! Bytes on the wire are wire-compatible with [`FsObjectStore`]:
+//! zstd-compressed JSON of an [`Object`] for [`ObjectStore::put`], or
+//! raw zstd-compressed user bytes for [`ObjectStore::put_raw`]. A
+//! future migration tool can copy in either direction with no
+//! transformation.
+//!
+//! ## Endpoint override
+//!
+//! The default endpoint is GCS's public host
+//! (`https://storage.googleapis.com`). Pass an endpoint override into
+//! [`GcsObjectStore::new`] for `fake-gcs-server` or any other
+//! GCS-JSON-API-compatible backend — that's how the integration tests
+//! run without real GCP credentials.
+//!
+//! ## Auth
+//!
+//! For v1.0 we accept an optional bearer token. On a Cloud Run worker
+//! the sidecar reads the token from the GCE metadata server before
+//! constructing the store; for local dev / tests against fake-gcs the
+//! token is `None` and no `Authorization` header is sent. Full Google
+//! ADC integration (refreshing tokens from the metadata server on
+//! expiry) lands when the sidecar work begins — for now keep it
+//! explicit.
+//!
+//! ## Threading
+//!
+//! Uses `reqwest::blocking` so the [`ObjectStore`] trait stays sync.
+//! That blocks the calling thread for the duration of a GCS round trip
+//! (~50–200 ms per ADR-0004); inside the daemon's tokio runtime that
+//! is acceptable because the commit lock already serialises writers,
+//! and read-through hits the local cache after the first call.
+
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use crate::hash::Hash;
+use crate::object::{Object, ObjectKind};
+use crate::store::ObjectStore;
+use crate::{Error, Result};
+
+/// Default upstream — GCS's public JSON API host.
+pub const DEFAULT_GCS_ENDPOINT: &str = "https://storage.googleapis.com";
+
+/// One HTTP request budget. GCS p99 round-trip for small objects is
+/// well under this; we want a clean error rather than a hang if the
+/// network drops.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Storage-class hint we set on every upload. Standard class is the
+/// only sensible default for hot-path commit objects; the MVP doesn't
+/// tier.
+const STORAGE_CLASS: &str = "STANDARD";
+
+#[derive(Debug, Clone)]
+pub struct GcsObjectStore {
+    bucket: String,
+    /// Object-name prefix inside the bucket. Lets a single bucket host
+    /// multiple repos without colliding on hash addresses.
+    prefix: String,
+    cache_dir: PathBuf,
+    endpoint: String,
+    bearer_token: Option<String>,
+    client: reqwest::blocking::Client,
+}
+
+impl GcsObjectStore {
+    pub fn new(
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        cache_dir: impl Into<PathBuf>,
+        endpoint: Option<String>,
+        bearer_token: Option<String>,
+    ) -> Result<Self> {
+        let cache_dir = cache_dir.into();
+        fs::create_dir_all(&cache_dir)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| Error::Other(anyhow::anyhow!("building HTTP client: {e}")))?;
+        Ok(Self {
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+            cache_dir,
+            endpoint: endpoint.unwrap_or_else(|| DEFAULT_GCS_ENDPOINT.to_string()),
+            bearer_token,
+            client,
+        })
+    }
+
+    // ---------- naming + caching -------------------------------------------
+
+    /// GCS object name for a given hash. Sharded by the first two hex
+    /// chars (matches the on-disk layout) so a ``gsutil ls gs://b/<p>``
+    /// looks familiar.
+    fn object_name(&self, hash: &Hash) -> String {
+        let (a, b) = hash.shard();
+        let p = self.prefix.trim_matches('/');
+        if p.is_empty() {
+            format!("{a}/{b}.zst")
+        } else {
+            format!("{p}/{a}/{b}.zst")
+        }
+    }
+
+    fn cache_path(&self, hash: &Hash) -> PathBuf {
+        let (a, b) = hash.shard();
+        self.cache_dir.join(a).join(format!("{b}.zst"))
+    }
+
+    fn cache_read(&self, hash: &Hash) -> Option<Vec<u8>> {
+        let path = self.cache_path(hash);
+        let compressed = fs::read(&path).ok()?;
+        zstd::stream::decode_all(&compressed[..]).ok()
+    }
+
+    fn cache_write_compressed(&self, hash: &Hash, compressed: &[u8]) -> Result<()> {
+        let path = self.cache_path(hash);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // tmp + rename keeps the cache torn-write-safe; readers either
+        // see the previous file or the new one.
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, compressed)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    // ---------- HTTP plumbing ----------------------------------------------
+
+    fn upload_url(&self, name: &str) -> String {
+        let encoded = urlencode(name);
+        format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            encoded,
+        )
+    }
+
+    fn download_url(&self, name: &str) -> String {
+        let encoded = urlencode(name);
+        format!(
+            "{}/storage/v1/b/{}/o/{}?alt=media",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            encoded,
+        )
+    }
+
+    fn metadata_url(&self, name: &str) -> String {
+        let encoded = urlencode(name);
+        format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint.trim_end_matches('/'),
+            self.bucket,
+            encoded,
+        )
+    }
+
+    fn with_auth(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        if let Some(token) = &self.bearer_token {
+            builder.bearer_auth(token)
+        } else {
+            builder
+        }
+    }
+
+    fn http_err(context: &str, status: reqwest::StatusCode, body: &str) -> Error {
+        Error::Other(anyhow::anyhow!("{context}: HTTP {status}: {body}"))
+    }
+
+    fn upload_compressed(&self, hash: &Hash, compressed: &[u8]) -> Result<()> {
+        let name = self.object_name(hash);
+        let url = self.upload_url(&name);
+        let resp = self
+            .with_auth(
+                self.client
+                    .post(&url)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("x-goog-storage-class", STORAGE_CLASS),
+            )
+            .body(compressed.to_vec())
+            .send()
+            .map_err(|e| Error::Other(anyhow::anyhow!("PUT {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            return Err(Self::http_err("uploading object", status, &body));
+        }
+        Ok(())
+    }
+
+    /// Returns ``Some((decompressed_bytes, raw_compressed_bytes))`` if
+    /// the object exists in GCS. The raw bytes are returned so the
+    /// caller can populate the local cache without re-compressing.
+    fn download_compressed(&self, hash: &Hash) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let name = self.object_name(hash);
+        let url = self.download_url(&name);
+        let resp = self
+            .with_auth(self.client.get(&url))
+            .send()
+            .map_err(|e| Error::Other(anyhow::anyhow!("GET {url}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            return Err(Self::http_err("downloading object", status, &body));
+        }
+        let compressed = resp
+            .bytes()
+            .map_err(|e| Error::Other(anyhow::anyhow!("reading body: {e}")))?
+            .to_vec();
+        let bytes = zstd::stream::decode_all(&compressed[..])?;
+        Ok(Some((bytes, compressed)))
+    }
+
+    fn remote_exists(&self, hash: &Hash) -> bool {
+        let name = self.object_name(hash);
+        let url = self.metadata_url(&name);
+        // HEAD against the metadata endpoint is the cheapest existence
+        // check the JSON API offers.
+        let resp = self.with_auth(self.client.head(&url)).send();
+        matches!(resp, Ok(r) if r.status().is_success())
+    }
+}
+
+impl ObjectStore for GcsObjectStore {
+    fn put(&self, object: &Object) -> Result<Hash> {
+        let bytes = serde_json::to_vec(object)?;
+        let hash = object.hash();
+        let compressed = zstd::stream::encode_all(&bytes[..], 3)?;
+        // Cache locally first so a concurrent reader that lands during
+        // the upload doesn't miss; on upload failure the cache entry
+        // gets blown away. (The cache is a hint, not a source of
+        // truth — see post-MVP `agentic gc` for sweeping.)
+        self.cache_write_compressed(&hash, &compressed)?;
+        if let Err(e) = self.upload_compressed(&hash, &compressed) {
+            let _ = fs::remove_file(self.cache_path(&hash));
+            return Err(e);
+        }
+        Ok(hash)
+    }
+
+    fn put_raw(&self, _kind: ObjectKind, bytes: &[u8]) -> Result<Hash> {
+        let hash = Hash::of(bytes);
+        let compressed = zstd::stream::encode_all(bytes, 3)?;
+        self.cache_write_compressed(&hash, &compressed)?;
+        if let Err(e) = self.upload_compressed(&hash, &compressed) {
+            let _ = fs::remove_file(self.cache_path(&hash));
+            return Err(e);
+        }
+        Ok(hash)
+    }
+
+    fn get(&self, hash: &Hash) -> Result<Object> {
+        let bytes = self.get_raw(hash)?;
+        let object: Object = serde_json::from_slice(&bytes)?;
+        let computed = object.hash();
+        if &computed != hash {
+            return Err(Error::IntegrityError {
+                declared: *hash,
+                computed,
+            });
+        }
+        Ok(object)
+    }
+
+    fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
+        if let Some(cached) = self.cache_read(hash) {
+            return Ok(cached);
+        }
+        match self.download_compressed(hash)? {
+            None => Err(Error::NotFound(*hash)),
+            Some((bytes, compressed)) => {
+                // Best-effort cache fill; a write failure here doesn't
+                // affect correctness.
+                let _ = self.cache_write_compressed(hash, &compressed);
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn has(&self, hash: &Hash) -> bool {
+        if self.cache_path(hash).exists() {
+            return true;
+        }
+        self.remote_exists(hash)
+    }
+}
+
+/// Percent-encode the few characters that appear in GCS object names
+/// after sharding (the rest are hex digits and dots). Anything outside
+/// the unreserved + slash set is encoded.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else if c == '/' {
+            // GCS treats "/" as part of the object name; the JSON API
+            // requires it percent-encoded inside the resource path.
+            out.push_str("%2F");
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn object_name_shards_and_prefixes() {
+        let dir = tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "repo-A",
+            dir.path(),
+            Some("http://localhost:4443".into()),
+            None,
+        )
+        .unwrap();
+        let h = Hash::of(b"hello");
+        let name = store.object_name(&h);
+        let hex = h.to_hex();
+        assert!(name.starts_with("repo-A/"));
+        assert!(name.contains(&format!("{}/", &hex[..2])));
+        assert!(name.ends_with(".zst"));
+        assert!(name.contains(&hex[2..]));
+    }
+
+    #[test]
+    fn empty_prefix_skips_leading_slash() {
+        let dir = tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "",
+            dir.path(),
+            Some("http://localhost:4443".into()),
+            None,
+        )
+        .unwrap();
+        let h = Hash::of(b"hello");
+        let name = store.object_name(&h);
+        assert!(!name.starts_with('/'));
+        let hex = h.to_hex();
+        assert!(name.starts_with(&format!("{}/", &hex[..2])));
+    }
+
+    #[test]
+    fn urlencode_handles_slash_and_unreserved() {
+        assert_eq!(urlencode("abc"), "abc");
+        assert_eq!(urlencode("a/b"), "a%2Fb");
+        assert_eq!(urlencode("a.b-c_d~e"), "a.b-c_d~e");
+        assert_eq!(urlencode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn cache_read_returns_none_when_missing() {
+        let dir = tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            Some("http://localhost:4443".into()),
+            None,
+        )
+        .unwrap();
+        let h = Hash::of(b"nope");
+        assert!(store.cache_read(&h).is_none());
+    }
+
+    #[test]
+    fn cache_write_and_read_roundtrip() {
+        let dir = tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            Some("http://localhost:4443".into()),
+            None,
+        )
+        .unwrap();
+        let h = Hash::of(b"hello");
+        let payload = b"hello-world";
+        let compressed = zstd::stream::encode_all(&payload[..], 3).unwrap();
+        store.cache_write_compressed(&h, &compressed).unwrap();
+        let got = store.cache_read(&h).unwrap();
+        assert_eq!(got, payload);
+    }
+}
