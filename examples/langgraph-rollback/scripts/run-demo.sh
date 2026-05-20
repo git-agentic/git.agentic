@@ -62,7 +62,7 @@ fi
 
 step "2. seeding episodes (baseline state)"
 # Restore baseline prompt in case a prior run left the bad one in place.
-git -C "${REPO_ROOT}" checkout -- "${DEMO_DIR}/prompts/system.txt" 2>/dev/null || true
+git -C "${REPO_ROOT}" checkout -- "examples/langgraph-rollback/prompts/system.txt" 2>/dev/null || true
 psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${DEMO_DIR}/seed.sql" >/dev/null
 
 step "3. building + starting agenticd"
