@@ -9,6 +9,8 @@
 pub mod framing;
 
 use serde::{Deserialize, Serialize};
+use serde_with::base64::Base64;
+use serde_with::serde_as;
 
 /// Every daemon request carries an opaque correlation id chosen by the
 /// caller. Responses echo it back. This lets the SDK demultiplex
@@ -49,6 +51,7 @@ pub enum Request {
     ReadObject { hash: String },
 }
 
+#[serde_as]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -65,6 +68,7 @@ pub enum Response {
     ObjectData {
         hash: String,
         object_kind: String,
+        #[serde_as(as = "Base64")]
         data: Vec<u8>,
     },
     Error {
