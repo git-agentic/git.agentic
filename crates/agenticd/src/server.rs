@@ -185,6 +185,20 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
                     serde_json::to_vec(&c).context("serializing commit")?,
                 ),
             };
+            // Base64 expands by ~33%; guard against blowing the 16 MiB frame
+            // limit so the client receives a structured error rather than a
+            // dropped connection.
+            const MAX_OBJECT_BYTES: usize = 10 * 1024 * 1024;
+            if data.len() > MAX_OBJECT_BYTES {
+                return Ok(Response::Error {
+                    message: format!(
+                        "object {} is too large to fetch inline ({} bytes > {} byte limit)",
+                        h.to_hex(),
+                        data.len(),
+                        MAX_OBJECT_BYTES,
+                    ),
+                });
+            }
             Ok(Response::ObjectData {
                 hash: h.to_hex(),
                 object_kind: object_kind.to_string(),
