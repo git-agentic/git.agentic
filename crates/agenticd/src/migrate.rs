@@ -39,27 +39,16 @@ pub struct MigrationStep {
     pub sql: String,
 }
 
-/// Compute and load the reverse-migration steps needed to move from the live
-/// schema version down to `target_version`.
+/// Load and validate the `.down.sql` files for the given migration names.
 ///
-/// Uses `adapter` to query `agentic_migrations` for the authoritative list of
-/// applied migrations, then maps each to its `.down.sql` file under
-/// `<agentic_dir>/schema/`. Returns steps in execution order (most-recent
-/// migration first).
+/// `names` must already be in execution order (most-recent first), as returned
+/// by `PostgresAdapter::migrations_after`. This function is **synchronous** so
+/// callers can release the `MutexGuard<PostgresAdapter>` before doing file I/O.
 ///
-/// Returns an empty vec when no migration is needed (versions are equal).
-/// Returns an error if any step is missing its `.down.sql` or is marked
-/// `-- IRREVERSIBLE`.
-pub async fn plan_reverse(
-    adapter: &PostgresAdapter,
-    agentic_dir: &Path,
-    target_version: &str,
-) -> anyhow::Result<Vec<MigrationStep>> {
-    let names = adapter
-        .migrations_after(target_version)
-        .await
-        .context("querying applied migrations")?;
-
+/// Returns an empty vec if `names` is empty. Errors if any file is missing,
+/// unreadable, or marked `-- IRREVERSIBLE`, or if a name contains path
+/// separators that would escape `<agentic_dir>/schema/`.
+pub fn load_steps(agentic_dir: &Path, names: &[String]) -> anyhow::Result<Vec<MigrationStep>> {
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -74,7 +63,8 @@ pub async fn plan_reverse(
     }
 
     let mut steps = Vec::with_capacity(names.len());
-    for name in &names {
+    for name in names {
+        validate_migration_name(name)?;
         let path = schema_dir.join(format!("{name}.down.sql"));
         if !path.exists() {
             return Err(anyhow!(
@@ -103,13 +93,34 @@ pub async fn plan_reverse(
 /// `agentic_migrations` in a single transaction (see
 /// `PostgresAdapter::apply_down_migration`). On any error the function
 /// returns immediately; steps already completed are not rolled back.
-pub async fn run_reverse(adapter: &PostgresAdapter, steps: &[MigrationStep]) -> anyhow::Result<()> {
+///
+/// The caller must hold a lock on the `PostgresAdapter` for the duration of
+/// this call. Do not hold the lock while calling `load_steps` — that function
+/// does blocking filesystem I/O and should run without the lock held.
+pub async fn run_reverse(
+    adapter: &PostgresAdapter,
+    steps: Vec<MigrationStep>,
+) -> anyhow::Result<()> {
     for step in steps {
         adapter
             .apply_down_migration(&step.name, &step.sql)
             .await
             .with_context(|| format!("applying reverse migration {:?}", step.name))?;
         tracing::info!(migration = %step.name, "reverse migration applied");
+    }
+    Ok(())
+}
+
+/// Reject migration names containing path separators or `..` components that
+/// could escape the schema directory. Names come from `agentic_migrations`
+/// which is controlled by the operator, but a compromised row should not be
+/// able to cause arbitrary file reads.
+fn validate_migration_name(name: &str) -> anyhow::Result<()> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(anyhow!(
+            "migration name {name:?} contains path separators or '..' and would escape the \
+             schema directory — refusing to proceed"
+        ));
     }
     Ok(())
 }
@@ -178,22 +189,43 @@ mod tests {
     }
 
     #[test]
-    fn missing_down_sql_path_is_detectable() {
+    fn load_steps_errors_on_missing_file() {
         let tmp = TempDir::new().unwrap();
         let dir = make_schema_dir(&tmp);
         write_down(&dir, "001_init", "DROP TABLE foo;");
-        // 002 is absent — path.exists() returns false
-        let missing_path = dir.join("002_missing.down.sql");
-        assert!(!missing_path.exists());
+        // 002 is absent — load_steps should error with a clear message
+        let err = load_steps(tmp.path(), &["001_init".into(), "002_missing".into()]).unwrap_err();
+        assert!(err.to_string().contains("002_missing"), "{err}");
     }
 
     #[test]
-    fn down_sql_irreversible_is_caught_after_read() {
+    fn load_steps_returns_steps_in_given_order() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_schema_dir(&tmp);
+        write_down(&dir, "002_b", "DROP TABLE b;");
+        write_down(&dir, "001_a", "DROP TABLE a;");
+        // names already in reverse order (most-recent first), as from migrations_after
+        let steps = load_steps(tmp.path(), &["002_b".into(), "001_a".into()]).unwrap();
+        assert_eq!(steps[0].name, "002_b");
+        assert_eq!(steps[1].name, "001_a");
+        assert_eq!(steps[1].sql, "DROP TABLE a;");
+    }
+
+    #[test]
+    fn load_steps_catches_irreversible_in_file() {
         let tmp = TempDir::new().unwrap();
         let dir = make_schema_dir(&tmp);
         write_down(&dir, "003_bad", "-- IRREVERSIBLE\nDROP TABLE data;");
-        let sql = fs::read_to_string(dir.join("003_bad.down.sql")).unwrap();
-        let err = check_irreversible("003_bad", &sql).unwrap_err();
+        let err = load_steps(tmp.path(), &["003_bad".into()]).unwrap_err();
         assert!(err.to_string().contains("003_bad"), "{err}");
+        assert!(err.to_string().contains("IRREVERSIBLE"), "{err}");
+    }
+
+    #[test]
+    fn validate_name_rejects_path_separators() {
+        assert!(validate_migration_name("../../etc/passwd").is_err());
+        assert!(validate_migration_name("sub/dir").is_err());
+        assert!(validate_migration_name("001_init").is_ok());
+        assert!(validate_migration_name("003_add-embeddings").is_ok());
     }
 }

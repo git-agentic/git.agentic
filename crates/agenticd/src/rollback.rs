@@ -32,23 +32,23 @@ use anyhow::{anyhow, Context};
 use crate::migrate;
 use crate::server::DaemonState;
 
-pub struct RollbackArgs<'a> {
-    pub target: &'a str,
+pub struct RollbackArgs {
+    pub target: String,
     pub dry_run: bool,
     pub accept_data_loss: bool,
     /// Filesystem root of the repo (where `prompts/` lives).
-    pub repo: &'a Path,
+    pub repo: PathBuf,
 }
 
 pub async fn execute(
-    state: &DaemonState,
-    args: RollbackArgs<'_>,
+    state: std::sync::Arc<DaemonState>,
+    args: RollbackArgs,
 ) -> anyhow::Result<RollbackOutput> {
     let target_hash = state
         .refs
-        .resolve(args.target)?
+        .resolve(&args.target)?
         .ok_or_else(|| anyhow!("ref not found: {}", args.target))?;
-    let target = load_commit(state, &target_hash)?;
+    let target = load_commit(&state, &target_hash)?;
 
     let mut plan: Vec<String> = Vec::new();
 
@@ -80,26 +80,46 @@ pub async fn execute(
     }
 
     // -- Schema migrations ---------------------------------------------------
+    // The MutexGuard is released before any filesystem I/O so the daemon
+    // stays responsive and the future remains Send (no &adapter across awaits
+    // in separate async fns).
     if let Some(ref target_schema) = target.schema_version {
-        let memory = state.memory.as_ref().ok_or_else(|| {
-            anyhow!("target commit has a schema_version but no memory backend is attached")
-        })?;
-        let adapter = memory.lock().await;
-        let live_schema = adapter
-            .current_schema_version()
-            .await
-            .context("reading live schema version")?;
+        let memory: std::sync::Arc<tokio::sync::Mutex<agentic_memory::postgres::PostgresAdapter>> =
+            std::sync::Arc::clone(state.memory.as_ref().ok_or_else(|| {
+                anyhow!("target commit has a schema_version but no memory backend is attached")
+            })?);
+
+        // Phase 1: query DB for live schema version and pending migration names.
+        // Guard is dropped at the end of this block.
+        let (live_schema, migration_names) = {
+            let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
+            let live = adapter
+                .current_schema_version()
+                .await
+                .context("reading live schema version")?;
+            let names = if live != *target_schema {
+                adapter
+                    .migrations_after(target_schema)
+                    .await
+                    .context("querying pending reverse migrations")?
+            } else {
+                Vec::new()
+            };
+            (live, names)
+        };
 
         if live_schema != *target_schema {
             plan.push(format!(
                 "reverse schema migrations: {live_schema} → {target_schema}"
             ));
+            // Phase 2: synchronous filesystem I/O — no lock held.
+            let steps = migrate::load_steps(state.refs.agentic_dir(), &migration_names)
+                .context("loading reverse migration files")?;
+
+            // Phase 3: execute migrations — re-acquire lock.
             if !args.dry_run {
-                let steps =
-                    migrate::plan_reverse(&adapter, state.refs.agentic_dir(), target_schema)
-                        .await
-                        .context("planning reverse migrations")?;
-                migrate::run_reverse(&adapter, &steps)
+                let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
+                migrate::run_reverse(&adapter, steps)
                     .await
                     .context("running reverse migrations")?;
             }
@@ -116,11 +136,12 @@ pub async fn execute(
                 manifest_hash.short()
             ));
             if !args.dry_run {
-                let manifest = load_manifest(state, &manifest_hash)?;
+                let manifest = load_manifest(&state, &manifest_hash)?;
                 let handle = SnapshotHandle {
                     manifest,
                     schema_version: target_schema.clone(),
                 };
+                let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
                 adapter
                     .restore(&handle)
                     .await
@@ -143,7 +164,7 @@ pub async fn execute(
             prompts_hash.short()
         ));
         if !args.dry_run {
-            restore_prompts(state, args.repo, &prompts_hash)?;
+            restore_prompts(&state, &args.repo, &prompts_hash)?;
         }
     } else {
         plan.push("no prompts in target — skipping prompts rewrite".into());
@@ -172,9 +193,9 @@ pub async fn execute(
     // Build a fresh Commit whose dimensions match the target but whose
     // parent is the current branch tip. History shows C → C' even though
     // C' contains A's state.
-    let prompts_payload = read_prompts_for_commit(state, &target)?;
-    let tools_payload = read_tools_for_commit(state, &target)?;
-    let model_text = read_model_text(state, &target)?;
+    let prompts_payload = read_prompts_for_commit(&state, &target)?;
+    let tools_payload = read_tools_for_commit(&state, &target)?;
+    let model_text = read_model_text(&state, &target)?;
 
     let inputs = CommitInputs {
         author: "agentic-rollback".to_string(),

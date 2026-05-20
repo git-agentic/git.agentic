@@ -37,11 +37,11 @@ pub struct DaemonState {
     pub refs: Refs,
     /// Serialises every write-path request. Per ADR-0001 the daemon does
     /// one commit at a time.
-    pub commit_lock: Mutex<()>,
+    pub commit_lock: Arc<Mutex<()>>,
     /// Optional memory backend. When present, every commit takes a memory
     /// snapshot under the commit lock and threads its manifest hash into
     /// the Commit's `memory_snapshot` dimension.
-    pub memory: Option<Mutex<PostgresAdapter>>,
+    pub memory: Option<Arc<Mutex<PostgresAdapter>>>,
     /// MCP servers to fingerprint on each commit.
     pub mcp_servers: Vec<McpServerSpec>,
     /// Shared HTTP client for MCP calls. Reusing one client lets the
@@ -76,7 +76,7 @@ impl DaemonState {
                     logical_decoding = adapter.logical_decoding_available(),
                     "memory backend attached"
                 );
-                Some(Mutex::new(adapter))
+                Some(Arc::new(Mutex::new(adapter)))
             }
         };
 
@@ -93,7 +93,7 @@ impl DaemonState {
             repo_root,
             store,
             refs,
-            commit_lock: Mutex::new(()),
+            commit_lock: Arc::new(Mutex::new(())),
             memory,
             mcp_servers,
             http,
@@ -103,17 +103,14 @@ impl DaemonState {
 
 /// Handle a single accepted connection. Runs the read/dispatch/write loop
 /// until the peer closes the socket.
-pub async fn handle_connection(
-    state: Arc<DaemonState>,
-    mut sock: UnixStream,
-) -> anyhow::Result<()> {
-    let (read_half, write_half) = sock.split();
+pub async fn handle_connection(state: Arc<DaemonState>, sock: UnixStream) -> anyhow::Result<()> {
+    let (read_half, write_half) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut writer = tokio::io::BufWriter::new(write_half);
 
     while let Some(envelope) = read_frame::<_, Envelope<Request>>(&mut reader).await? {
         let correlation_id = envelope.correlation_id.clone();
-        let response = match dispatch(state.as_ref(), envelope.payload).await {
+        let response = match dispatch(Arc::clone(&state), envelope.payload).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
@@ -128,7 +125,7 @@ pub async fn handle_connection(
     Ok(())
 }
 
-async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Response> {
+async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<Response> {
     match request {
         Request::Ping => Ok(Response::Pong),
 
@@ -146,8 +143,8 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
         }
 
         Request::Commit(input) => {
-            let _guard = state.commit_lock.lock().await;
-            let out = handle_commit(state, input).await?;
+            let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
+            let out = handle_commit(state.as_ref(), input).await?;
             Ok(Response::Commit(out))
         }
 
@@ -168,22 +165,22 @@ async fn dispatch(state: &DaemonState, request: Request) -> anyhow::Result<Respo
             Ok(Response::Log { entries })
         }
 
-        Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state, &from, &to)?)),
+        Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state.as_ref(), &from, &to)?)),
 
         Request::Rollback {
             target,
             dry_run,
             accept_data_loss,
         } => {
-            let _guard = state.commit_lock.lock().await;
+            let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
             let repo_root = state.repo_root.clone();
             let out = crate::rollback::execute(
-                state,
+                Arc::clone(&state),
                 crate::rollback::RollbackArgs {
-                    target: &target,
+                    target,
                     dry_run,
                     accept_data_loss,
-                    repo: &repo_root,
+                    repo: repo_root,
                 },
             )
             .await?;
@@ -265,8 +262,8 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
     // thread the manifest hash + schema version into the Commit.
     let (memory_snapshot, schema_version) = if input.no_memory {
         (None, None)
-    } else if let Some(memory) = &state.memory {
-        let adapter = memory.lock().await;
+    } else if let Some(memory) = state.memory.as_ref().map(Arc::clone) {
+        let adapter = memory.lock_owned().await;
         let handle = adapter.snapshot().await.context("taking memory snapshot")?;
         let manifest_bytes = handle.manifest.to_canonical_bytes();
         let manifest_hash = state
