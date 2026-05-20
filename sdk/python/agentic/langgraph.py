@@ -44,6 +44,8 @@ import base64
 import hashlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
 
@@ -112,7 +114,7 @@ class AgenticCheckpointer(BaseCheckpointSaver):
         # restore-and-resume "just works".
         on_disk = self.repo / "prompts" / blob_path
         on_disk.parent.mkdir(parents=True, exist_ok=True)
-        on_disk.write_text(envelope_json)
+        _atomic_write_text(on_disk, envelope_json)
 
         commit = self.client.commit(
             message=f"langgraph step {metadata.get('step', '?')} ({metadata.get('source', '?')})",
@@ -293,6 +295,35 @@ def _branch_for_thread(thread_id: str) -> str:
 def _checkpoint_blob_path(thread_id: str) -> str:
     h = hashlib.blake2b(thread_id.encode("utf-8"), digest_size=8).hexdigest()
     return f"{CHECKPOINT_BLOB_PREFIX}/{h}/checkpoint.json"
+
+
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Write ``body`` to ``path`` atomically.
+
+    Crash safety: if the process dies mid-write, the destination keeps
+    its previous (or absent) state — no half-written envelope to confuse
+    ``get_tuple``. Concurrent writers race on ``os.replace`` but each
+    sees a coherent file. We don't add per-thread locking because the
+    LangGraph runtime already serialises ``put`` calls for a given
+    thread; a real race here would mean two daemons fighting over the
+    same on-disk checkpoint, which is broken by other means.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=path.name + ".", dir=str(parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(body)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        # On any failure, sweep the half-written tempfile.
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _serialise_envelope(
