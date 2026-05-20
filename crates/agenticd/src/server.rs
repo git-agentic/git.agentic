@@ -186,7 +186,7 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
                 ),
             };
             Ok(Response::ObjectData {
-                hash,
+                hash: h.to_hex(),
                 object_kind: object_kind.to_string(),
                 data,
             })
