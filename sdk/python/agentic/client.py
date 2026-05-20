@@ -198,6 +198,11 @@ class AgenticClient:
                 f"{reply.get('correlation_id')!r}"
             )
         response = reply.get("payload", {})
+        if not isinstance(response, dict):
+            raise AgenticError(
+                f"daemon returned non-dict payload ({type(response).__name__!r}); "
+                "protocol version mismatch?"
+            )
         if response.get("kind") == "error":
             raise AgenticError(response.get("message", "daemon returned Error"))
         return response
