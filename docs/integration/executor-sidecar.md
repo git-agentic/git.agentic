@@ -58,7 +58,7 @@ spec:
 | `AGENTIC_GCS_TOKEN` | Bearer for the GCS JSON API | _none_; required for real GCS |
 | `RUST_LOG` | tracing filter | `info` |
 
-The sidecar does NOT call ADC or the GCE metadata server itself — either inject the token via env or have the worker's init step write it. v1.0 keeps this surface small on purpose.
+The sidecar does NOT call ADC or the GCE metadata server itself. In v1.0 the only supported wiring is to **inject the token via env at Cloud Run service startup** — the YAML excerpt above does that via a Secret Manager reference. ("Have the worker write it to `/shared`" is intentionally NOT supported: both containers start at the same time, `/shared` is empty on boot, and the sidecar would race the worker's first checkpoint. If token rotation past the Cloud Run instance lifetime becomes a requirement, file a follow-up — that needs a refresh thread inside `agenticd`.)
 
 ## Worker code
 
