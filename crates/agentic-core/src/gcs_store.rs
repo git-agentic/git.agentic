@@ -192,7 +192,7 @@ impl GcsObjectStore {
             )
             .body(compressed.to_vec())
             .send()
-            .map_err(|e| Error::Other(anyhow::anyhow!("PUT {url}: {e}")))?;
+            .map_err(|e| Error::Other(anyhow::anyhow!("POST {url}: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
