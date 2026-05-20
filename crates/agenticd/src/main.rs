@@ -4,6 +4,7 @@
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
 mod mcp;
+mod migrate;
 mod objstore;
 mod rollback;
 mod server;

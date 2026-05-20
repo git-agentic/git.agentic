@@ -3,9 +3,8 @@
 //! Implements `agentic rollback <ref>` end-to-end:
 //!
 //!   1. Resolve target ref → target Commit object.
-//!   2. (Schema check.) If the target's `schema_version` differs from the
-//!      live database's, fail loudly. The reverse-migration runner lands
-//!      in a follow-up commit.
+//!   2. If the target's `schema_version` differs from the live database's,
+//!      run reverse SQL migrations via `crate::migrate` to align the schema.
 //!   3. Restore memory: load the target's SegmentManifest, hand it to
 //!      `MemoryAdapter::restore` which TRUNCATEs each tracked table and
 //!      re-INSERTs from the captured segments inside one transaction.
@@ -30,6 +29,7 @@ use agentic_memory::MemoryAdapter;
 use agentic_proto::RollbackOutput;
 use anyhow::{anyhow, Context};
 
+use crate::migrate;
 use crate::server::DaemonState;
 
 pub struct RollbackArgs<'a> {
@@ -79,31 +79,60 @@ pub async fn execute(
         ));
     }
 
-    // -- Memory --------------------------------------------------------------
-    if let (Some(manifest_hash), Some(schema_version)) =
-        (target.memory_snapshot, target.schema_version.clone())
-    {
-        plan.push(format!(
-            "restore memory from manifest {}",
-            manifest_hash.short()
-        ));
-        if !args.dry_run {
-            let manifest = load_manifest(state, &manifest_hash)?;
-            let handle = SnapshotHandle {
-                manifest,
-                schema_version: schema_version.clone(),
-            };
-            let memory = state.memory.as_ref().ok_or_else(|| {
-                anyhow!("target commit has a memory snapshot but no memory backend is attached")
-            })?;
-            let adapter = memory.lock().await;
-            adapter
-                .restore(&handle)
-                .await
-                .context("restoring memory snapshot")?;
+    // -- Schema migrations ---------------------------------------------------
+    if let Some(ref target_schema) = target.schema_version {
+        let memory = state.memory.as_ref().ok_or_else(|| {
+            anyhow!("target commit has a schema_version but no memory backend is attached")
+        })?;
+        let adapter = memory.lock().await;
+        let live_schema = adapter
+            .current_schema_version()
+            .await
+            .context("reading live schema version")?;
+
+        if live_schema != *target_schema {
+            plan.push(format!(
+                "reverse schema migrations: {live_schema} → {target_schema}"
+            ));
+            if !args.dry_run {
+                let steps =
+                    migrate::plan_reverse(&adapter, state.refs.agentic_dir(), target_schema)
+                        .await
+                        .context("planning reverse migrations")?;
+                migrate::run_reverse(&adapter, &steps)
+                    .await
+                    .context("running reverse migrations")?;
+            }
+        } else {
+            plan.push(format!(
+                "schema already at {target_schema} — no migrations needed"
+            ));
+        }
+
+        // -- Memory ----------------------------------------------------------
+        if let Some(manifest_hash) = target.memory_snapshot {
+            plan.push(format!(
+                "restore memory from manifest {}",
+                manifest_hash.short()
+            ));
+            if !args.dry_run {
+                let manifest = load_manifest(state, &manifest_hash)?;
+                let handle = SnapshotHandle {
+                    manifest,
+                    schema_version: target_schema.clone(),
+                };
+                adapter
+                    .restore(&handle)
+                    .await
+                    .context("restoring memory snapshot")?;
+            }
+        } else {
+            plan.push("no memory snapshot in target — skipping memory data restore".into());
         }
     } else {
-        plan.push("no memory snapshot in target — skipping memory restore".into());
+        plan.push(
+            "no schema_version in target — skipping schema migration and memory restore".into(),
+        );
     }
 
     // -- Prompts -------------------------------------------------------------
