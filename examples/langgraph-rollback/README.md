@@ -84,6 +84,9 @@ history reflects the rollback action rather than rewriting it.
   requires the reverse SQL migration runner which is the next planned
   ADR-0002 §5 follow-up. Today the demo exercises prompts + memory
   rollback only.
+- **Compose covers the database only.** `docker-compose.yml` starts
+  Postgres + pgvector. `agenticd` and the Python agent are built and
+  run locally by `scripts/run-demo.sh` — they are not containerised.
 
 ## Files
 
