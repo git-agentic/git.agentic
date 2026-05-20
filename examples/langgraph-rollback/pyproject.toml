@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-broken-prompt-demo"
+version = "0.1.0"
+description = "End-to-end demo: a LangGraph customer-support agent that `agentic rollback` rescues from a broken prompt."
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "agentic-sdk[langgraph]",
+    "psycopg[binary]>=3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+# Demo is not packaged; this entry keeps hatchling quiet when
+# `pip install -e .` is run for dev use.
+packages = []
