@@ -1,0 +1,189 @@
+//! Criterion benchmarks for the content-addressed object store.
+//!
+//! Performance targets (from docs/architecture/snapshot-model.md §9):
+//!   commit     < 2 s
+//!   rollback   < 5 s  (end-to-end; snapshot-restore benches are integration-only)
+//!   diff       < 1 s
+//!   write overhead < 5 ms p99 per object
+//!
+//! The benchmarks here are CI-safe (no Postgres, no network).
+//! Integration-only benchmarks (memory snapshot / restore on a real DB)
+//! live in tests/integration/ and are gated behind `#[ignore]`.
+
+use std::collections::BTreeMap;
+
+use agentic_core::{Blob, FsObjectStore, Hash, Object, ObjectKind, ObjectStore, Tree, TypedRef};
+use agentic_core::commit::{CommitInputs, stage_and_commit};
+use agentic_core::refs::Refs;
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
+use tempfile::TempDir;
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn tmp_store() -> (TempDir, FsObjectStore, Refs) {
+    let dir = TempDir::new().unwrap();
+    let agentic_dir = dir.path().join(".agentic");
+    std::fs::create_dir_all(&agentic_dir).unwrap();
+    let store = FsObjectStore::open(&agentic_dir).unwrap();
+    let refs = Refs::open(&agentic_dir).unwrap();
+    (dir, store, refs)
+}
+
+/// Deterministic pseudo-random bytes — reproducible across runs.
+fn det_bytes(n: usize) -> Vec<u8> {
+    (0..n)
+        .map(|i| (i.wrapping_mul(6_364_136_223_846_793_005usize) >> 56) as u8)
+        .collect()
+}
+
+// ── hash ──────────────────────────────────────────────────────────────────────
+
+fn bench_hash(c: &mut Criterion) {
+    let mut g = c.benchmark_group("hash");
+    for size in [1_024usize, 64 * 1_024, 1_024 * 1_024] {
+        let data = det_bytes(size);
+        g.throughput(Throughput::Bytes(size as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, d| {
+            b.iter(|| Hash::of(d));
+        });
+    }
+    g.finish();
+}
+
+// ── blob put / get ────────────────────────────────────────────────────────────
+
+fn bench_blob_put(c: &mut Criterion) {
+    let mut g = c.benchmark_group("blob_put");
+    for size in [1_024usize, 64 * 1_024, 512 * 1_024] {
+        g.throughput(Throughput::Bytes(size as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
+            b.iter_batched(
+                || {
+                    let (dir, store, refs) = tmp_store();
+                    let blob = Blob::new(det_bytes(sz));
+                    (dir, store, refs, blob)
+                },
+                |(_dir, store, _refs, blob)| store.put(&Object::Blob(blob)).unwrap(),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+fn bench_blob_roundtrip(c: &mut Criterion) {
+    let mut g = c.benchmark_group("blob_roundtrip");
+    for size in [1_024usize, 64 * 1_024, 512 * 1_024] {
+        g.throughput(Throughput::Bytes(size as u64));
+        g.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &sz| {
+            let (_dir, store, _refs) = tmp_store();
+            let blob = Blob::new(det_bytes(sz));
+            let hash = store.put(&Object::Blob(blob)).unwrap();
+            b.iter(|| store.get(&hash).unwrap());
+        });
+    }
+    g.finish();
+}
+
+// ── tree hash ─────────────────────────────────────────────────────────────────
+
+fn bench_tree_hash(c: &mut Criterion) {
+    let mut g = c.benchmark_group("tree_hash");
+    for n in [10usize, 100, 1_000] {
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let mut tree = Tree::new();
+                    for i in 0..n {
+                        let blob = Blob::new(det_bytes(64));
+                        tree.insert(
+                            format!("file_{i:04}.txt"),
+                            TypedRef { kind: ObjectKind::Blob, hash: blob.hash() },
+                        );
+                    }
+                    tree
+                },
+                |tree| tree.hash(),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+// ── tree put ──────────────────────────────────────────────────────────────────
+
+fn bench_tree_put(c: &mut Criterion) {
+    let mut g = c.benchmark_group("tree_put");
+    for n in [10usize, 100, 500] {
+        g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let (dir, store, refs) = tmp_store();
+                    let mut tree = Tree::new();
+                    for i in 0..n {
+                        let blob = Blob::new(det_bytes(64));
+                        tree.insert(
+                            format!("file_{i:04}.txt"),
+                            TypedRef { kind: ObjectKind::Blob, hash: blob.hash() },
+                        );
+                    }
+                    (dir, store, refs, tree)
+                },
+                |(_dir, store, _refs, tree)| store.put(&Object::Tree(tree)).unwrap(),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+// ── commit (prompts-only, no memory) ─────────────────────────────────────────
+
+fn bench_commit(c: &mut Criterion) {
+    let mut g = c.benchmark_group("commit");
+    g.bench_function("prompts_only", |b| {
+        b.iter_batched(
+            || {
+                let (dir, store, refs) = tmp_store();
+                let mut prompts = BTreeMap::new();
+                prompts.insert("system.txt".into(), b"You are helpful.".to_vec());
+                let inputs = CommitInputs {
+                    author: "bench".into(),
+                    message: "bench commit".into(),
+                    parent: None,
+                    code_sha: Some("abc123".into()),
+                    prompts,
+                    tools: BTreeMap::new(),
+                    model: Some("anthropic:claude-opus:2026-05-01".into()),
+                    memory_snapshot: None,
+                    schema_version: None,
+                    intent: None,
+                    plan: None,
+                    transcript: None,
+                    evals: None,
+                    cost_cents: 0,
+                };
+                (dir, store, refs, inputs)
+            },
+            |(_dir, store, refs, inputs)| {
+                stage_and_commit(&store, &refs, "main", inputs).unwrap()
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hash,
+    bench_blob_put,
+    bench_blob_roundtrip,
+    bench_tree_hash,
+    bench_tree_put,
+    bench_commit,
+);
+criterion_main!(benches);

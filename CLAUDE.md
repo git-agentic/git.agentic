@@ -65,7 +65,7 @@ ruff check .
 mypy agentic
 ```
 
-`docker-compose.yml` for the full Postgres + agenticd + demo-agent stack lands in week 11 of the roadmap.
+`examples/langgraph-rollback/docker-compose.yml` brings up Postgres + pgvector for the demo on port 54322. `agenticd` and the Python agent are started by `scripts/run-demo.sh` (built locally from the Rust workspace, not containerised).
 
 ## Code style
 
