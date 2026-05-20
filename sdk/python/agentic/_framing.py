@@ -41,7 +41,10 @@ def read_frame(sock: socket.socket) -> Any:
     if length > MAX_FRAME_BYTES:
         raise FrameError(f"frame too large: {length} bytes (max {MAX_FRAME_BYTES})")
     body = _read_exact(sock, length)
-    return json.loads(body)
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise FrameError(f"invalid JSON payload in frame: {exc}") from exc
 
 
 def _read_exact(sock: socket.socket, n: int) -> bytes:
