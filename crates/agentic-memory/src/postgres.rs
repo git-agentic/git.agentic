@@ -482,7 +482,7 @@ impl PostgresAdapter {
     /// which is the correct failure mode — the migration file must be rewritten.
     pub async fn apply_down_migration(&self, name: &str, sql: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(sql)
+        sqlx::raw_sql(sql)
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("executing down migration {name:?}: {e}")))?;
