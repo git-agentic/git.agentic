@@ -2,7 +2,7 @@
 
 > OpenWolf's learning memory. Updated automatically as the AI learns from interactions.
 > Do not edit manually unless correcting an error.
-> Last updated: 2026-05-19
+> Last updated: 2026-05-20
 
 ## User Preferences
 
@@ -33,3 +33,5 @@
 - **2026-05-19 — 2PC staging order is fixed (ADR-0002 Decision 3).** Blobs to object store first → collect content hashes → build Commit blob → Git push as single commit point → update branch ref. Failure-injection tests required at each boundary. This is the plumbing that makes "atomic rollback" honest rather than aspirational.
 - **2026-05-19 — Production deployments require filesystem snapshot-capable storage (ADR-0002 Decision 4).** ZFS / Btrfs / EBS or equivalent. Logical export acceptable for MVP demos only. Design `agenticd`'s storage interface around snapshot capabilities from day one to avoid an architectural rip-out at the first production deployment.
 - **2026-05-19 — Rollback for destructive migrations is explicitly bounded (ADR-0002 Decision 5).** Atomic for non-destructive migrations. For destructive migrations, rollback restores from the last snapshot taken before the migration; activity between snapshot and rollback is lost. Must be in design-partner pilot conversations, not discovered after.
+- **2026-05-20 — Pivoted from feature-add to a hardening sprint.** Audit of `main` on 2026-05-20 shows roadmap weeks 1–11 all landed (snapshot, rollback, diff, Python SDK + LangGraph, demo compose). Remaining risk is verification, not implementation: GCS integration tests are `#[ignore]`d (ADR-0003 end-of-week-8 kill-criterion still open), the cold-start demo has never been timed on a fresh machine, no published benchmark numbers vs `snapshot-model.md` §9, no screencast, no Executor sidecar image, no design-partner pipeline. Two-week plan in `docs/product/sprint-2026-05-20.md`; full reasoning in `/Users/toni/.claude/plans/analyze-the-project-where-concurrent-parnas.md`. Note: `CLAUDE.md` and `docs/product/roadmap.md` still describe the project as "Pre-MVP scaffolding, currently early in the build" — that text is stale and should be updated after Week A finishes.
+- **2026-05-20 — Claude Agent SDK is integrable via `SessionStore`, NOT via `on_checkpoint` hooks.** ADR-0004 Decision 3 assumed hook-based snapshotting at tool-call boundaries; the SDK's actual primitive is a `SessionStore` protocol (`append(key, entries)` + `load(key)`), called once per turn (batched) or per frame (eager). Pause/resume across hosts works via `ClaudeAgentOptions(session_store=store, resume="<id>")`. `append` is best-effort by design — incompatible with ADR-0004 Decision 4's "loud-fail" without a synchronising `PreToolUse` hook that gates the next tool call on agenticd ack. Full memo: `docs/integration/executor-harness-check.md`. Action: amend ADR-0004 Decisions 3 + 4; do NOT trigger ADR-0003 escape hatch — integration is feasible, just differently shaped than originally drafted.
