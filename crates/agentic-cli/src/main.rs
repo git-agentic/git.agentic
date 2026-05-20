@@ -81,9 +81,10 @@ enum Command {
         to: String,
     },
 
-    /// Print the raw bytes of an object by its content-addressed hash.
-    /// Useful for inspecting any stored blob, tree, or commit object.
-    CatBlob {
+    /// Print the canonical bytes of any stored object (blob, tree, commit).
+    /// Equivalent to `git cat-file`. Clients can verify the output against
+    /// the hash: Blake3::of(data) == hash.
+    CatObject {
         /// Full content-addressed hash.
         hash: String,
         /// Emit raw bytes to stdout instead of a hex dump.
@@ -132,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Log { limit, oneline } => cmd_log(&repo, limit, oneline, cli.json).await,
         Command::Resolve { name } => cmd_resolve(&repo, name, cli.json).await,
         Command::Status => cmd_status(&repo, cli.json).await,
-        Command::CatBlob { hash, raw } => cmd_cat_blob(&repo, hash, raw).await,
+        Command::CatObject { hash, raw } => cmd_cat_object(&repo, hash, raw).await,
         Command::Diff { from, to } => cmd_diff(&repo, from, to, cli.json).await,
         Command::Rollback {
             target,
@@ -208,10 +209,10 @@ async fn cmd_rollback(
     Ok(())
 }
 
-async fn cmd_cat_blob(repo: &Path, hash: String, raw: bool) -> anyhow::Result<()> {
-    let resp = round_trip(repo, Request::ReadBlob { hash }).await?;
+async fn cmd_cat_object(repo: &Path, hash: String, raw: bool) -> anyhow::Result<()> {
+    let resp = round_trip(repo, Request::ReadObject { hash }).await?;
     match resp {
-        Response::Blob {
+        Response::ObjectData {
             hash,
             object_kind,
             data,

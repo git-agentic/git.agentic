@@ -13,7 +13,7 @@ use std::sync::Arc;
 use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
 use agentic_core::diff as diff_mod;
 use agentic_core::refs::{HeadRef, Refs};
-use agentic_core::{Hash, ObjectKind, ObjectStore};
+use agentic_core::{Hash, Object, ObjectKind, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
@@ -167,22 +167,27 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
 
         Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state.as_ref(), &from, &to)?)),
 
-        Request::ReadBlob { hash } => {
+        Request::ReadObject { hash } => {
             let h: agentic_core::Hash = hash
                 .parse()
                 .with_context(|| format!("invalid hash: {hash}"))?;
             let object = state
                 .store
                 .get(&h)
-                .with_context(|| format!("object not found: {hash}"))?;
-            let object_kind = format!("{:?}", object.kind()).to_lowercase();
-            let data = state
-                .store
-                .get_raw(&h)
-                .with_context(|| format!("reading raw bytes for {hash}"))?;
-            Ok(Response::Blob {
+                .with_context(|| format!("reading object {hash}"))?;
+            // Extract canonical bytes — the same bytes the hash commits to —
+            // so callers can verify Hash::of(&data) == hash.
+            let (object_kind, data) = match object {
+                Object::Blob(b) => ("blob", b.bytes),
+                Object::Tree(t) => ("tree", serde_json::to_vec(&t).context("serializing tree")?),
+                Object::Commit(c) => (
+                    "commit",
+                    serde_json::to_vec(&c).context("serializing commit")?,
+                ),
+            };
+            Ok(Response::ObjectData {
                 hash,
-                object_kind,
+                object_kind: object_kind.to_string(),
                 data,
             })
         }
