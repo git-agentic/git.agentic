@@ -1,17 +1,26 @@
 """agentic — the Python SDK for git.agentic.
 
 This package is intentionally small. The interesting work happens in the
-local `agenticd` daemon (a Rust binary); the SDK is a typed client.
+local `agenticd` daemon (a Rust binary); the SDK is a typed Unix-socket
+client that mirrors `agentic-cli`. Both speak `agentic-proto` directly:
+length-prefixed JSON envelopes.
 
-MVP status: function signatures are defined and stubbed. Real daemon I/O
-wires in over weeks 10–11 of the roadmap.
+Usage:
+
+    import agentic
+    assert agentic.ping()
+    c = agentic.commit(message="initial", prompts={"system.txt": "you are helpful"})
+    print(c.hash, c.branch)
+
+Override the socket location via the ``AGENTIC_SOCKET`` env var or by
+constructing :class:`AgenticClient` directly.
 """
 
 from __future__ import annotations
 
 from typing import Iterable, Mapping
 
-from .client import AgenticClient, DEFAULT_SOCKET_PATH
+from .client import AgenticClient, AgenticError, DEFAULT_SOCKET_PATH
 from .types import Commit, Diff, LogEntry, RollbackPlan
 
 __version__ = "0.1.0"
@@ -19,17 +28,28 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     "AgenticClient",
+    "AgenticError",
     "DEFAULT_SOCKET_PATH",
     "Commit",
     "Diff",
     "LogEntry",
     "RollbackPlan",
     "commit",
-    "log",
     "diff",
+    "log",
+    "ping",
+    "resolve",
     "rollback",
     "status",
 ]
+
+
+def ping() -> bool:
+    return AgenticClient.default().ping()
+
+
+def resolve(name: str) -> str | None:
+    return AgenticClient.default().resolve(name)
 
 
 def commit(
