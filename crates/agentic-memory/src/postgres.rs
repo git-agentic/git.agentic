@@ -342,30 +342,35 @@ impl MemoryAdapter for PostgresAdapter {
     ///   1. **No two snapshots interleave.** The in-process streamer
     ///      task already serialises events and snapshot RPCs through a
     ///      single channel — that gives single-daemon atomicity. For
-    ///      cross-process / multi-daemon coordination we add a Postgres
-    ///      advisory lock (`pg_advisory_lock`) held on a dedicated
-    ///      connection for the whole snapshot window.
+    ///      cross-process / multi-daemon coordination we hold a Postgres
+    ///      advisory lock (`pg_advisory_lock`) for the whole snapshot
+    ///      window.
     ///   2. **Every committed change has been forwarded to the streamer
     ///      before sealing.** `triggers::drain_to_completion` is the
     ///      synchronous fence that guarantees this.
     ///   3. **Active heads are sealed before reading the manifest.**
     ///      The streamer's `take_snapshot` RPC does this.
     ///
-    /// The advisory lock is taken on a dedicated `PgConnection`, not on
-    /// a pool checkout, so connection-rotation can't strand the lock.
+    /// The advisory lock is taken on a **dedicated** `PgConnection`
+    /// (via `Connection::connect`, not via the pool). This is the
+    /// cancellation-safety contract: if the snapshot future is dropped
+    /// mid-flight, the connection drops with it, the Postgres session
+    /// ends, and the lock releases automatically. A pooled connection
+    /// would otherwise return to the pool still holding the lock and
+    /// block every subsequent snapshot indefinitely.
     async fn snapshot(&self) -> Result<SnapshotHandle> {
+        use sqlx::Connection;
         let handle = self
             .streamer
             .as_ref()
             .ok_or_else(|| Error::Backend("snapshot called before init".into()))?;
 
-        // Acquire the snapshot-coordination lock. `pg_advisory_lock` is
-        // session-scoped; we keep it on this connection for the
-        // duration of the snapshot window and release explicitly below.
-        let mut conn = self.pool.acquire().await?;
+        // Dedicated session: dropped at end of scope (or on cancellation)
+        // → Postgres ends the session → advisory lock released.
+        let mut conn = sqlx::postgres::PgConnection::connect(&self.cfg.url).await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(SNAPSHOT_ADVISORY_LOCK_KEY)
-            .execute(&mut *conn)
+            .execute(&mut conn)
             .await?;
 
         let result = async {
@@ -379,15 +384,22 @@ impl MemoryAdapter for PostgresAdapter {
         }
         .await;
 
-        // Best-effort release. We surface a warning rather than a hard
-        // error so we don't mask a real snapshot failure with a release
-        // failure — the lock would drop on session end anyway.
-        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        // `pg_advisory_unlock` returns false if the session didn't hold
+        // the lock — surface that explicitly so lock-state bugs are
+        // diagnosable. We log rather than fail so a release miss doesn't
+        // mask a real snapshot error (and the dedicated connection
+        // dropping below releases anything we missed anyway).
+        match sqlx::query_scalar::<_, Option<bool>>("SELECT pg_advisory_unlock($1)")
             .bind(SNAPSHOT_ADVISORY_LOCK_KEY)
-            .execute(&mut *conn)
+            .fetch_one(&mut conn)
             .await
         {
-            tracing::warn!(error = %e, "releasing snapshot advisory lock");
+            Ok(Some(true)) => {}
+            Ok(other) => tracing::warn!(
+                returned = ?other,
+                "pg_advisory_unlock returned non-true — session may not have held the lock"
+            ),
+            Err(e) => tracing::warn!(error = %e, "releasing snapshot advisory lock"),
         }
 
         result
