@@ -46,8 +46,9 @@ pub enum Request {
     /// Look up a single ref → commit hash.
     ResolveRef { name: String },
 
-    /// Fetch the canonical content bytes of any object by its hash.
-    /// Unblocks checkpointer time-travel and direct object inspection.
+    /// Fetch the canonical content bytes of a typed object by its hash.
+    /// Currently supported object kinds are blob, tree, and commit.
+    /// Unblocks checkpointer time-travel and direct inspection of those objects.
     ReadObject { hash: String },
 }
 
