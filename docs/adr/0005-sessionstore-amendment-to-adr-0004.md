@@ -120,6 +120,7 @@ If the SDK adds a `PostMessage`-style synchronous hook in a future release, pref
 - If the Claude Agent SDK changes the `SessionStore` protocol (e.g., adds required methods, changes flush semantics), this ADR's `AgenticSessionStore` pseudocode and the conformance assumption need re-verification. Pin the SDK version in `sdk/python/pyproject.toml` to a known-good range.
 - `forkSession` in the SDK rewrites every `sessionId` and remaps message UUIDs (per the SDK docs). Our commit DAG keys branches off the session_id — forking creates a new branch with no shared history. Document this for users who might expect forked sessions to share a rollback target with their parent.
 - Compaction: the SDK runs auto-compaction at length thresholds; `getSessionMessages` returns the post-compaction chain while `load` returns the raw history. Rolling back across a compaction boundary needs explicit handling — out of scope for this ADR; track separately.
+- **Subagent transcripts.** The SDK mirrors subagent sessions under `SessionKey.subpath = "subagents/agent-<id>"` and `listSubkeys` enumerates them on resume. A rollback that touches the parent session without addressing its subagents leaves orphaned subagent commits referencing the rolled-back parent state. Two options for v1.0: (a) commit subagents as children of the parent's branch with explicit parent linkage so rollback walks them coherently, or (b) ban subagents in v1.0 of the Executor integration and document the limitation. Pick during the spike. (Lifted from `executor-harness-check.md` §"Open questions" item 2.)
 
 ## Implementation plan
 
@@ -132,4 +133,11 @@ Owner for the spike: TBD. Owner for the integration-doc amendment: whoever lands
 
 ## Pseudocode caveats
 
-The `AgenticSessionStore` and `gate_on_durability` snippets in this ADR are illustrative. They assume an `AgenticClient.commit(branch=, entries=, parent=)` method shape; the actual SDK surface in `sdk/python/agentic/client.py` may need extension to accept `entries` as an opaque payload. Final API shape is the spike's responsibility, not this ADR's.
+The `AgenticSessionStore` and `gate_on_durability` snippets in this ADR are illustrative.
+
+The actual `AgenticClient.commit` signature in `sdk/python/agentic/client.py` today is `commit(*, message, prompts, tools, model, no_memory, author, code_sha, branch)` — **it has no `entries=` or `parent=` kwargs, and there is no `read_entries` method on the client at all**. Both are spike deliverables, not optional polish:
+
+- The client needs a new entry point (or an extension of `commit`) that takes an opaque `entries: list[dict]` payload and an optional `parent: Hash`. Wire support exists — `agentic-proto`'s `Commit` op already carries an opaque JSON payload — but no Python surface today exposes it that way.
+- The client needs a `read_entries(branch=...) -> list[dict]` method (or equivalent) returning the appended entries for a session branch in append order.
+
+Final API shape, naming, and async semantics are the spike's responsibility. Reopen this ADR if the conformance suite (`claude_agent_sdk.testing.run_session_store_conformance`) reveals additional protocol requirements the snippets above don't address.
