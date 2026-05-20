@@ -1,20 +1,18 @@
-version: "3.9"
-
-# Local fake-gcs-server for testing GcsObjectStore without real GCP
-# credentials.
+# Fake GCS server fixture for `agentic-core::gcs_store` integration tests.
 #
+# Usage:
 #   podman compose -f tests/fixtures/fake-gcs.yml up -d
-#   curl -X POST -H "Content-Type: application/json" \
+#   curl -fsSL -X POST -H 'Content-Type: application/json' \
 #     -d '{"name":"agentic-test-bucket"}' \
 #     http://localhost:54323/storage/v1/b
 #   GCS_ENDPOINT=http://localhost:54323 GCS_BUCKET=agentic-test-bucket \
 #     cargo test -p agentic-core --test gcs_integration -- --ignored
 #   podman compose -f tests/fixtures/fake-gcs.yml down -v
 #
-# fake-gcs-server speaks the GCS JSON API. The bucket referenced by
-# GCS_BUCKET must exist before the tests run; create it via the JSON API
+# fsouza/fake-gcs-server speaks the GCS JSON API. The bucket referenced
+# by GCS_BUCKET must exist before the tests run; create it via the
 # `POST /storage/v1/b` call shown above. Image tag is pinned for
-# reproducibility across local/CI runs.
+# reproducibility.
 
 services:
   fake-gcs:
@@ -23,14 +21,11 @@ services:
     command:
       - "-scheme"
       - "http"
-      - "-public-host"
-      - "localhost:54323"
       - "-port"
       - "4443"
+      - "-public-host"
+      - "localhost:54323"
+      - "-backend"
+      - "memory"
     ports:
       - "54323:4443"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:4443/storage/v1/b || exit 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
