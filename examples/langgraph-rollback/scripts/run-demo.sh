@@ -32,22 +32,36 @@ export AGENTIC_SOCKET="${DEMO_DIR}/.agentic/agenticd.sock"
 AGENTICD_BIN="${REPO_ROOT}/target/release/agenticd"
 AGENTIC_BIN="${REPO_ROOT}/target/release/agentic"
 
+# Container runtime selection. The README advertises "podman OR docker";
+# pick whichever is present. Both speak compose-file v3 well enough for
+# the demo's needs.
+if command -v podman >/dev/null 2>&1; then
+    CONTAINER_RUNTIME=podman
+elif command -v docker >/dev/null 2>&1; then
+    CONTAINER_RUNTIME=docker
+else
+    echo "error: neither podman nor docker found on PATH" >&2
+    exit 1
+fi
+compose() { "${CONTAINER_RUNTIME}" compose "$@"; }
+container_run() { "${CONTAINER_RUNTIME}" "$@"; }
+
 DAEMON_PID=""
 cleanup() {
     if [[ -n "${DAEMON_PID}" ]]; then
         kill "${DAEMON_PID}" 2>/dev/null || true
     fi
-    podman compose -f "${COMPOSE_FILE}" down -v >/dev/null 2>&1 || true
+    compose -f "${COMPOSE_FILE}" down -v >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 step() { printf "\n=== %s ===\n" "$*"; }
 
-step "1. starting Postgres + pgvector"
-podman compose -f "${COMPOSE_FILE}" up -d >/dev/null
+step "1. starting Postgres + pgvector (${CONTAINER_RUNTIME})"
+compose -f "${COMPOSE_FILE}" up -d >/dev/null
 pg_ready=false
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    if podman exec agentic-test-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
+    if container_run exec agentic-test-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
         echo "ready after ${i}s"
         pg_ready=true
         break
@@ -72,7 +86,29 @@ rm -rf "${DEMO_DIR}/.agentic"
 "${AGENTICD_BIN}" --repo "${DEMO_DIR}" --postgres "${DATABASE_URL}" --tables episodes:id \
     > "${DEMO_DIR}/.agentic/daemon.log" 2>&1 &
 DAEMON_PID=$!
-sleep 1
+
+# Wait for the daemon's Unix socket to appear before continuing. Fixed
+# `sleep 1` was flaky on cold caches / slow systems; this also catches
+# an early daemon crash and prints the log so the failure is
+# actionable.
+socket_ready=false
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if [[ -S "${AGENTIC_SOCKET}" ]]; then
+        socket_ready=true
+        break
+    fi
+    if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
+        echo "error: agenticd exited before binding the socket. Log:" >&2
+        cat "${DEMO_DIR}/.agentic/daemon.log" >&2
+        exit 1
+    fi
+    sleep 0.5
+done
+if [[ "${socket_ready}" != "true" ]]; then
+    echo "error: agenticd did not bind ${AGENTIC_SOCKET} within 5s. Log:" >&2
+    cat "${DEMO_DIR}/.agentic/daemon.log" >&2
+    exit 1
+fi
 
 step "4. baseline ask"
 "${DEMO_DIR}/scripts/ask.sh" "I'm thinking about cancelling my subscription."
