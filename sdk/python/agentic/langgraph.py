@@ -169,14 +169,19 @@ class AgenticCheckpointer(BaseCheckpointSaver):
         envelope = json.loads(blob_path.read_text())
         checkpoint, metadata = _deserialise_envelope(self.serde, envelope)
 
+        checkpoint_config = dict(config)
+        configurable = dict(config.get("configurable", {}))
+        configurable.update(
+            {
+                "thread_id": thread_id,
+                "checkpoint_ns": _ns(config),
+                "checkpoint_id": head,
+            }
+        )
+        checkpoint_config["configurable"] = configurable
+
         return CheckpointTuple(
-            config={
-                "configurable": {
-                    "thread_id": thread_id,
-                    "checkpoint_ns": _ns(config),
-                    "checkpoint_id": head,
-                }
-            },
+            config=checkpoint_config,
             checkpoint=checkpoint,
             metadata=metadata,
             parent_config=None,
