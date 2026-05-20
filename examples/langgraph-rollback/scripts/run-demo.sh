@@ -130,10 +130,14 @@ step "8. commit bad change"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.8 friendlier prompt" \
     --model "anthropic:claude-opus:2026-05-01"
 
-step "8.5. locally restore prompt file — shows code-only restore is insufficient"
-# Locally restore the prompt file in the working tree; this simulates only the
-# code-restoration part of a revert and does not create a revert commit.
-git -C "${REPO_ROOT}" checkout -- "examples/langgraph-rollback/prompts/system.txt" 2>/dev/null || true
+step "8.5. simulate git revert — shows code-only revert is insufficient"
+# Restore the prompt file to baseline (simulating what a code-only rollback, e.g.
+# git revert, achieves: the file on disk goes back to its original content).
+# This is a local working-tree restore, not a revert commit.
+if ! git -C "${REPO_ROOT}" checkout -- "examples/langgraph-rollback/prompts/system.txt" 2>/dev/null; then
+    echo "error: could not restore prompts/system.txt to baseline" >&2
+    exit 1
+fi
 "${DEMO_DIR}/scripts/redeploy.sh"
 "${DEMO_DIR}/scripts/ask.sh" "I'm thinking about cancelling my subscription."
 # Contaminated memory rows are still in Postgres — the answer is still broken.
