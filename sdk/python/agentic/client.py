@@ -17,7 +17,7 @@ import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from ._framing import FrameError, read_frame, write_frame
 from .types import Commit, Diff, LogEntry, RollbackPlan
@@ -200,7 +200,7 @@ class AgenticClient:
         response = reply.get("payload", {})
         if response.get("kind") == "error":
             raise AgenticError(response.get("message", "daemon returned Error"))
-        return response
+        return cast(dict[str, Any], response)
 
     @classmethod
     def _next_correlation_id(cls) -> str:

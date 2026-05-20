@@ -18,7 +18,7 @@ constructing :class:`AgenticClient` directly.
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from .client import AgenticClient, AgenticError, DEFAULT_SOCKET_PATH
 from .types import Commit, Diff, LogEntry, RollbackPlan
@@ -91,5 +91,5 @@ def rollback(target: str, *, dry_run: bool = False, accept_data_loss: bool = Fal
     )
 
 
-def status() -> dict:
+def status() -> dict[str, Any]:
     return AgenticClient.default().status()

@@ -47,7 +47,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence
+from typing import Any, AsyncIterator, Iterator, Optional, Sequence, cast
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -72,7 +72,7 @@ CHECKPOINT_BLOB_PREFIX = "__langgraph__"
 ENVELOPE_VERSION = 1
 
 
-class AgenticCheckpointer(BaseCheckpointSaver):
+class AgenticCheckpointer(BaseCheckpointSaver[JsonPlusSerializer]):
     """A LangGraph checkpointer backed by ``agenticd``.
 
     One branch per ``thread_id``. One commit per checkpoint. The
@@ -171,7 +171,7 @@ class AgenticCheckpointer(BaseCheckpointSaver):
         envelope = json.loads(blob_path.read_text())
         checkpoint, metadata = _deserialise_envelope(self.serde, envelope)
 
-        checkpoint_config = dict(config)
+        checkpoint_config = cast(RunnableConfig, dict(config))
         configurable = dict(config.get("configurable", {}))
         configurable.update(
             {
@@ -251,7 +251,7 @@ class AgenticCheckpointer(BaseCheckpointSaver):
         filter: Optional[dict[str, Any]] = None,
         before: Optional[RunnableConfig] = None,
         limit: Optional[int] = None,
-    ):
+    ) -> AsyncIterator[CheckpointTuple]:
         for tup in self.list(config, filter=filter, before=before, limit=limit):
             yield tup
 
@@ -278,7 +278,7 @@ def _require_thread_id(config: RunnableConfig) -> str:
 
 
 def _ns(config: RunnableConfig) -> str:
-    return config.get("configurable", {}).get("checkpoint_ns", "") or ""
+    return str(config.get("configurable", {}).get("checkpoint_ns", "") or "")
 
 
 def _branch_for_thread(thread_id: str) -> str:
