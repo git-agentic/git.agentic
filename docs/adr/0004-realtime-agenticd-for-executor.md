@@ -5,6 +5,7 @@
 **Deciders:** Toni
 **Supersedes:** —
 **Relates to:** ADR-0003 Decision 2 (this ADR specifies the topology that makes that decision implementable)
+**Amendments:** Decisions 3 and 4 amended by [ADR-0005](0005-sessionstore-amendment-to-adr-0004.md) — snapshot primitive is the Claude Agent SDK's `SessionStore.append` (not an `on_checkpoint` hook); loud-fail is preserved via a synchronising `PreToolUse` hook gated on `agenticd` ack.
 
 ## Context
 
