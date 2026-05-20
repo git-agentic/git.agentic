@@ -31,3 +31,20 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: doc
         run: cargo doc --workspace --no-deps
+
+  python:
+    name: python sdk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: pip install -e "sdk/python[langgraph,dev]"
+      - name: ruff
+        run: ruff check sdk/python
+      - name: mypy
+        run: mypy --strict sdk/python/agentic
+      - name: pytest
+        run: pytest sdk/python/tests -q

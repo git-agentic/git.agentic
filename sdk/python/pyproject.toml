@@ -28,5 +28,11 @@ packages = ["agentic"]
 line-length = 100
 target-version = "py310"
 
+[tool.mypy]
+strict = true
+# langgraph and pydantic v2 ship partial stubs; suppress missing-import
+# noise so mypy focuses on our own surface.
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
