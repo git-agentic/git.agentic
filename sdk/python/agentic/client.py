@@ -64,8 +64,10 @@ class AgenticClient:
         or ``{"head": None}`` on a repo with no commits yet."""
         try:
             reply = self._request({"op": "resolve_ref", "name": "HEAD"})
-        except AgenticError:
-            return {"head": None}
+        except AgenticError as exc:
+            if str(exc) == "ref not found: HEAD":
+                return {"head": None}
+            raise
         return {"head": reply.get("hash")}
 
     def resolve(self, name: str) -> Optional[str]:
