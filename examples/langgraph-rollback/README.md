@@ -22,6 +22,8 @@ with the Rust integration-test database.
 
 ## 60-second walkthrough
 
+A recorded asciinema of one end-to-end run is checked in at [`demo.cast`](demo.cast). Replay it with `asciinema play demo.cast`. (The current recording was captured headlessly — output is faithful but inter-step pacing is collapsed; a polished re-record with a real TTY is on the Week-A backlog.)
+
 ```bash
 cd examples/langgraph-rollback
 python -m venv .venv
