@@ -1,0 +1,22 @@
+# Sidecar agenticd for the the first platform-partner integration (ADR-0004).
+# Build (from repo root):
+#   docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .
+
+FROM rust:1.95-slim-bookworm AS builder
+WORKDIR /src
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN cargo build --release -p agenticd && strip target/release/agenticd
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 65532 agentic \
+ && useradd  --system --uid 65532 --gid agentic --no-create-home --shell /usr/sbin/nologin agentic
+COPY --from=builder /src/target/release/agenticd /usr/local/bin/agenticd
+USER agentic:agentic
+ENTRYPOINT ["/usr/local/bin/agenticd"]
