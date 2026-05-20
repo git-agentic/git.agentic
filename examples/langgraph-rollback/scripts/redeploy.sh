@@ -32,6 +32,9 @@ if [[ -z "${AGENTIC_BIN}" || ! -x "${AGENTIC_BIN}" ]]; then
     exit 1
 fi
 
+# Verify the CLI can actually reach the daemon (not just that the socket exists).
+"${AGENTIC_BIN}" --repo "${here}" ping >/dev/null
+
 echo "→ daemon still running at ${AGENTIC_SOCKET}"
 echo "→ prompts/system.txt after git revert:"
 head -2 "${here}/prompts/system.txt" | sed 's/^/   /'
