@@ -134,8 +134,9 @@ step "8.5. simulate git revert — shows code-only revert is insufficient"
 # Restore the prompt file to baseline (simulating what a code-only rollback, e.g.
 # git revert, achieves: the file on disk goes back to its original content).
 # This is a local working-tree restore, not a revert commit.
-if ! git -C "${REPO_ROOT}" checkout -- "examples/langgraph-rollback/prompts/system.txt" 2>/dev/null; then
-    echo "error: could not restore prompts/system.txt to baseline" >&2
+PROMPT_PATH="examples/langgraph-rollback/prompts/system.txt"
+if ! git -C "${REPO_ROOT}" checkout -- "${PROMPT_PATH}" 2>/dev/null; then
+    echo "error: could not restore ${REPO_ROOT}/${PROMPT_PATH} to baseline" >&2
     exit 1
 fi
 "${DEMO_DIR}/scripts/redeploy.sh"
