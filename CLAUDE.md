@@ -6,7 +6,7 @@ This file is the standing context for any AI assistant working in this repo. Rea
 
 ## Phase
 
-**Pre-MVP scaffolding. 12-week build to 2026-08-11.** Currently early in the build. The MVP target is a single named demo — ["the broken prompt"](docs/product/demo-scenario.md) — running reliably from `git clone` to working rollback in under 5 minutes. Every design decision must trace back to making that demo crisp.
+**MVP code complete on `main`; hardening sprint in progress. 12-week build to 2026-08-11.** As of 2026-05-20 the implementations for roadmap weeks 1–11 have all landed: object store, atomic memory snapshot, rollback (incl. reverse migrations), MCP fingerprinting, six-dimension diff, Python SDK + LangGraph checkpointer, and the broken-prompt demo (`examples/langgraph-rollback/scripts/run-demo.sh`). Remaining work is verification + outreach, not new features — see [`docs/product/sprint-2026-05-20.md`](docs/product/sprint-2026-05-20.md) for the current sprint and [`docs/architecture/benchmarks.md`](docs/architecture/benchmarks.md) for early performance numbers. Note: the "< 5 min from `git clone` on a fresh machine" claim is still aspirational — the cold-start timing has only been measured on developer machines with warm cargo caches; a fresh-machine timing is sprint item A1. The MVP target is a single named demo — ["the broken prompt"](docs/product/demo-scenario.md) — running reliably from `git clone` to working rollback in under 5 minutes. Every design decision must trace back to making that demo crisp.
 
 If a feature, abstraction, or dependency is not on the path to the demo, it does not ship in MVP. See [`docs/product/mvp-spec.md`](docs/product/mvp-spec.md) §"Explicitly out of scope" — the boundary is hard.
 
