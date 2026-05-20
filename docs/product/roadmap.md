@@ -164,6 +164,23 @@ This roadmap is organized around a single criterion: **at the end of each week, 
 - **Benchmarks.** A simple `criterion`-based benchmark suite runs nightly; regressions block merge.
 - **Daily kill-criteria check.** Are we still on the wedge? Anything we built this week that isn't load-bearing for the demo gets ripped out.
 
+## Executor integration workstream (per ADR-0003 and ADR-0004)
+
+ADR-0003 commits the the first platform-partner integration as the first non-LangGraph integration target in v1.0, with **atomic real-time integration via a co-located sidecar `agenticd`** (ADR-0004). This is the largest MVP scope add since the foundational ADRs. The roadmap must absorb it; if it threatens the broken-prompt demo, the documented escape hatch is to revert to the originally-drafted manifest-export shape (ADR-0003 Decision 2's earlier framing).
+
+Touch points across the existing weeks:
+
+- **Week 6 — schema and harness verification.** When the Commit object captures all six tuple dimensions for LangGraph, verify (a) the schema can express a Claude Agent SDK session without framework-specific fields, and (b) the Claude Agent SDK's checkpoint primitives match what ADR-0004 Decision 3 assumes — `on_checkpoint`-style firing at tool-call boundaries, plus pause/restore support. If either fails, this is the cheapest week to discover it, and the fallback is to revert to manifest-export per the ADR-0003 escape hatch.
+- **Weeks 7–9 — GCS-backed `ObjectStore`.** Alongside the rollback work, add a GCS-backed implementation of the `ObjectStore` trait in `crates/agentic-core/src/store.rs`. Write-through on every checkpoint; read-through local cache for diff/replay. Integration tests against a real GCS bucket (or `fake-gcs-server` in CI). This is real engineering on the substrate, not glue, and is the single biggest piece of new code introduced by the Executor workstream.
+- **Week 10 — sidecar packaging.** Container image that runs `agenticd` as a sidecar with config for GCS-backed storage and Unix-socket IPC. Document how the Coding worker mounts the socket and what env vars wire the dependency. Alongside, ship the LangGraph SDK as planned for week 10 — these two tracks run in parallel.
+- **Week 11 — second smoke demo.** End-to-end Executor session against the sidecar (using a stubbed Cloud Run worker calling the ticket dispatcher MCP, since the real Executor may not be ready). Demonstrate atomic rollback of an in-flight session: pause mid-tool-call, restore prior tuple, resume. This is a second demo alongside the LangGraph broken-prompt demo.
+
+**Coordination with the platform-partner integration team.** The Coding worker must be written checkpoint-aware against the Claude Agent SDK. That is the Executor's responsibility, but our schedule depends on it. Weekly sync starting week 6 to verify the Executor's harness work isn't blocking our sidecar work and vice versa.
+
+**Escape hatch — hard decision point at end of week 8.** If the GCS-backed `ObjectStore` is not passing integration tests by end of week 8, revert ADR-0003 Decision 2 to its originally-drafted manifest-export shape, defer atomic Executor to v1.1, and ship the layered/offline path for v1.0. The demo is the discipline; atomic Executor is additive proof. This trade is non-negotiable.
+
+**Negative slack on this track.** Atomic in v1.0 means the plan no longer has zero slack — it has *negative* slack on the Executor track relative to the original 12-week budget. Closing the gap requires one of: additional engineering capacity dedicated to the Executor workstream, cutting another piece of MVP scope, or accepting that the 2026-08-11 ship date is at higher risk than ADR-0001 assumed. Surface this to design partners up front; do not pretend the plan is unchanged.
+
 ## Slip budget
 
 The plan has zero slack. Slip will happen. Slip strategy:
@@ -171,6 +188,7 @@ The plan has zero slack. Slip will happen. Slip strategy:
 1. **Week 5 (atomic snapshot) is the most likely slip.** If it slips, push weeks 6–7 by the same amount; do not skip them.
 2. **Week 10 (SDK + LangGraph) cannot slip past week 11.** If we're behind by week 9, drop one diff feature, not the LangGraph integration.
 3. **Week 12 design partners must land even if MVP features are reduced.** Three users on a smaller MVP is better than zero users on a perfect MVP.
+4. **The Executor atomic-integration track (ADR-0003 Decision 2 + ADR-0004) is the highest slip risk in the plan.** If the GCS-backed `ObjectStore` + sidecar work cannot land with integration tests passing by **end of week 8**, revert to the originally-drafted manifest-export shape and defer atomic Executor to v1.1. Do not let this track compromise the broken-prompt demo.
 
 ## Kill criteria
 
@@ -186,6 +204,7 @@ If at the **end of week 12** zero design partners are using the tool weekly in t
 - Hosted SaaS. → after seed.
 - Mem0 / Zep / Letta backends. → v1.1.
 - CrewAI / AutoGen integrations. → v1.1.
+- Remote or in-process `agenticd` deployments for the Executor. → v2+. v1.0 uses the sidecar shape per [ADR-0004](../adr/0004-realtime-agenticd-for-executor.md); the rejected alternatives (remote, in-process library) are not on the roadmap.
 - Eval / CI/AE pipeline. → never (out of category).
 - MCP server registry. → never (out of category).
 - A2A protocol routing. → never (out of category).
