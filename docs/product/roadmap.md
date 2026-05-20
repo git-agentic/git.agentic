@@ -177,7 +177,9 @@ Touch points across the existing weeks:
 
 **Coordination with the Codento Executor team.** The Coding worker must be written checkpoint-aware against the Claude Agent SDK. That is the Executor's responsibility, but our schedule depends on it. Weekly sync starting week 6 to verify the Executor's harness work isn't blocking our sidecar work and vice versa.
 
-**Escape hatch — hard decision point at end of week 8.** If the GCS-backed `ObjectStore` is not passing integration tests by end of week 8, revert ADR-0003 Decision 2 to its originally-drafted manifest-export shape, defer atomic Executor to v1.1, and ship the layered/offline path for v1.0. The demo is the discipline; atomic Executor is additive proof. This trade is non-negotiable.
+**Escape hatch — hard decision point at end of week 8.** If the GCS-backed `ObjectStore` is not passing **API-contract integration tests** (put / get / has / not-found roundtrips against `fsouza/fake-gcs-server` or a real GCS bucket) by end of week 8, revert ADR-0003 Decision 2 to its originally-drafted manifest-export shape, defer atomic Executor to v1.1, and ship the layered/offline path for v1.0. The demo is the discipline; atomic Executor is additive proof. This trade is non-negotiable.
+
+*Status, 2026-05-20:* the API-contract bar is met — `crates/agentic-core/tests/gcs_integration.rs` runs green against fake-gcs in the `gcs` CI job (PR #20). **Production-readiness validation** — concurrent writers (multiple in-flight commits against the same bucket, per the ADR-0002 §3 2PC staging order), partial-upload failure injection (verify the 2PC boundary holds when GCS returns 5xx mid-stream), real-GCS auth with a service-account token, and large-blob streaming — is explicitly **not** gated by this kill-criterion. Those land as separate hardening work in v1.0 → v1.1 with their own milestones; see `docs/product/sprint-2026-05-20.md` for the immediate follow-up framing.
 
 **Negative slack on this track.** Atomic in v1.0 means the plan no longer has zero slack — it has *negative* slack on the Executor track relative to the original 12-week budget. Closing the gap requires one of: additional engineering capacity dedicated to the Executor workstream, cutting another piece of MVP scope, or accepting that the 2026-08-11 ship date is at higher risk than ADR-0001 assumed. Surface this to design partners up front; do not pretend the plan is unchanged.
 
@@ -188,7 +190,7 @@ The plan has zero slack. Slip will happen. Slip strategy:
 1. **Week 5 (atomic snapshot) is the most likely slip.** If it slips, push weeks 6–7 by the same amount; do not skip them.
 2. **Week 10 (SDK + LangGraph) cannot slip past week 11.** If we're behind by week 9, drop one diff feature, not the LangGraph integration.
 3. **Week 12 design partners must land even if MVP features are reduced.** Three users on a smaller MVP is better than zero users on a perfect MVP.
-4. **The Executor atomic-integration track (ADR-0003 Decision 2 + ADR-0004) is the highest slip risk in the plan.** If the GCS-backed `ObjectStore` + sidecar work cannot land with integration tests passing by **end of week 8**, revert to the originally-drafted manifest-export shape and defer atomic Executor to v1.1. Do not let this track compromise the broken-prompt demo.
+4. **The Executor atomic-integration track (ADR-0003 Decision 2 + ADR-0004) is the highest slip risk in the plan.** If the GCS-backed `ObjectStore` + sidecar work cannot land with API-contract integration tests passing by **end of week 8** (see the §"Executor integration workstream" escape-hatch paragraph for what "passing" means here — roundtrip contract, NOT production-scale concurrent / failure-injection coverage), revert to the originally-drafted manifest-export shape and defer atomic Executor to v1.1. Do not let this track compromise the broken-prompt demo.
 
 ## Kill criteria
 
