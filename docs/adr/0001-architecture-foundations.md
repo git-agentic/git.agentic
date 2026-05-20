@@ -4,6 +4,7 @@
 **Date:** 2026-05-19
 **Deciders:** Toni
 **Supersedes:** —
+**Amendments:** Decision 7 amended by [ADR-0003](0003-codento-executor-integration.md) — MVP framework support extended to LangGraph + Claude Agent SDK (Codento Executor), via a layered/offline session-manifest path on the framework-neutral SDK contract.
 
 ## Context
 
