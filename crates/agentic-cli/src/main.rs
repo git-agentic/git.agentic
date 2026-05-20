@@ -81,6 +81,17 @@ enum Command {
         to: String,
     },
 
+    /// Print the canonical bytes of any stored object (blob, tree, commit).
+    /// Equivalent to `git cat-file`. Clients can verify the output against
+    /// the hash: agentic_core::Hash::of(data) == hash.
+    CatObject {
+        /// Full content-addressed hash.
+        hash: String,
+        /// Emit raw bytes to stdout instead of a hex dump.
+        #[arg(long)]
+        raw: bool,
+    },
+
     /// Roll back to a previous agent version. Forward-records the
     /// rollback as a new commit so history is preserved.
     Rollback {
@@ -122,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Log { limit, oneline } => cmd_log(&repo, limit, oneline, cli.json).await,
         Command::Resolve { name } => cmd_resolve(&repo, name, cli.json).await,
         Command::Status => cmd_status(&repo, cli.json).await,
+        Command::CatObject { hash, raw } => cmd_cat_object(&repo, hash, raw).await,
         Command::Diff { from, to } => cmd_diff(&repo, from, to, cli.json).await,
         Command::Rollback {
             target,
@@ -189,6 +201,49 @@ async fn cmd_rollback(
                 (true, Some(h)) => println!("✓ rollback complete; HEAD now at {}", &h[..7]),
                 (true, None) => println!("✓ rollback executed (no new head)"),
                 (false, _) => println!("(dry run; nothing executed)"),
+            }
+        }
+        Response::Error { message } => return Err(anyhow!(message)),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
+    }
+    Ok(())
+}
+
+async fn cmd_cat_object(repo: &Path, hash: String, raw: bool) -> anyhow::Result<()> {
+    let resp = round_trip(repo, Request::ReadObject { hash }).await?;
+    match resp {
+        Response::ObjectData {
+            hash,
+            object_kind,
+            data,
+        } => {
+            if raw {
+                use std::io::Write;
+                std::io::stdout().write_all(&data)?;
+            } else {
+                println!("hash: {hash}");
+                println!("kind: {object_kind}");
+                println!("size: {} bytes", data.len());
+                println!();
+                // Hex dump — 16 bytes per line.
+                for (i, chunk) in data.chunks(16).enumerate() {
+                    let hex: String = chunk
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let ascii: String = chunk
+                        .iter()
+                        .map(|b| {
+                            if b.is_ascii_graphic() || *b == b' ' {
+                                *b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    println!("{:08x}  {:<48}  |{ascii}|", i * 16, hex);
+                }
             }
         }
         Response::Error { message } => return Err(anyhow!(message)),
