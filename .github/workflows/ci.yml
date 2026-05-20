@@ -48,3 +48,52 @@ jobs:
         run: mypy --strict --config-file sdk/python/pyproject.toml sdk/python/agentic
       - name: pytest
         run: pytest sdk/python/tests -q
+
+  # GCS integration tests against fsouza/fake-gcs-server. Closes the
+  # ADR-0003 / ADR-0004 end-of-week-8 kill-criterion: GcsObjectStore must
+  # pass integration tests, else revert Executor atomic integration to
+  # the layered manifest-export shape and defer to v1.1.
+  gcs:
+    name: gcs integration (fake-gcs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: start fake-gcs
+        run: |
+          docker run -d --name fake-gcs -p 54323:4443 \
+            fsouza/fake-gcs-server:1.52.2 \
+            -scheme http -port 4443 -public-host localhost:54323 -backend memory
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -fsSL http://localhost:54323/storage/v1/b >/dev/null 2>&1; then
+              echo "fake-gcs ready after ${i}s"
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "fake-gcs did not become ready within 30s" >&2
+            docker logs fake-gcs || true
+            exit 1
+          fi
+      - name: create bucket
+        run: |
+          # POST /storage/v1/b returns 200 on create, 409 if the bucket
+          # already exists. Both are fine for our purposes (re-runs of a
+          # job against the same still-running container should not fail).
+          code=$(curl -s -o /tmp/resp.json -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"name":"agentic-test-bucket"}' \
+            http://localhost:54323/storage/v1/b)
+          case "$code" in
+            200|201|409) echo "bucket ready (HTTP $code)";;
+            *) echo "unexpected HTTP $code from fake-gcs:" >&2; cat /tmp/resp.json >&2; exit 1;;
+          esac
+      - name: run gcs integration tests
+        env:
+          GCS_ENDPOINT: http://localhost:54323
+          GCS_BUCKET: agentic-test-bucket
+        run: cargo test -p agentic-core --test gcs_integration -- --ignored --nocapture
