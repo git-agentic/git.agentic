@@ -80,8 +80,14 @@ fn put_raw_then_get_raw_roundtrip() {
     // Drop the cache and re-read — this exercises the actual GCS GET.
     drop(_cache);
     let cache2 = tempfile::tempdir().unwrap();
-    let cold_store =
-        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), bearer()).unwrap();
+    let cold_store = GcsObjectStore::new(
+        bucket().unwrap(),
+        prefix,
+        cache2.path(),
+        endpoint(),
+        bearer(),
+    )
+    .unwrap();
     let cold = cold_store.get_raw(&h).unwrap();
     assert_eq!(cold, payload);
     // Subsequent reads should now hit the cold-store's cache.
@@ -123,8 +129,14 @@ fn has_returns_true_after_put_false_for_unknown() {
 
     // Force a real GCS HEAD by using a fresh cache.
     let cache2 = tempfile::tempdir().unwrap();
-    let cold =
-        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), bearer()).unwrap();
+    let cold = GcsObjectStore::new(
+        bucket().unwrap(),
+        prefix,
+        cache2.path(),
+        endpoint(),
+        bearer(),
+    )
+    .unwrap();
     let nope = Hash::of(b"never-uploaded");
     assert!(!cold.has(&nope));
 }
