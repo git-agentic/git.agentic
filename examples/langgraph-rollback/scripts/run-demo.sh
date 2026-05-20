@@ -45,13 +45,20 @@ step() { printf "\n=== %s ===\n" "$*"; }
 
 step "1. starting Postgres + pgvector"
 podman compose -f "${COMPOSE_FILE}" up -d >/dev/null
+pg_ready=false
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if podman exec agentic-test-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
         echo "ready after ${i}s"
+        pg_ready=true
         break
     fi
     sleep 1
 done
+
+if [[ "${pg_ready}" != "true" ]]; then
+    echo "Postgres did not become ready after 10 seconds; aborting." >&2
+    exit 1
+fi
 
 step "2. seeding episodes (baseline state)"
 # Restore baseline prompt in case a prior run left the bad one in place.
