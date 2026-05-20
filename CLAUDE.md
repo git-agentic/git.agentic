@@ -12,10 +12,11 @@ If a feature, abstraction, or dependency is not on the path to the demo, it does
 
 ## Authoritative decisions
 
-Two ADRs govern the architecture. Read both before designing anything substantial:
+Three ADRs govern the architecture. Read all three before designing anything substantial:
 
-- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — the 10 foundational decisions: tuple-as-version, content-addressed store, Rust core + Python SDK split, Postgres+pgvector only, LangGraph only, Apache 2.0, CLI-first, self-hosted Docker compose.
+- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — the 10 foundational decisions: tuple-as-version, content-addressed store, Rust core + Python SDK split, Postgres+pgvector only, LangGraph + Claude Agent SDK (per ADR-0003), Apache 2.0, CLI-first, self-hosted Docker compose.
 - [`docs/adr/0002-substrate-and-supercommit.md`](docs/adr/0002-substrate-and-supercommit.md) — Approach C (Git core + content-addressed blob store + coordinator), the extended Commit object as the platform API contract, the mandatory 2PC staging order, bounded rollback for destructive migrations.
+- [`docs/adr/0003-<partner>-executor-integration.md`](docs/adr/0003-<partner>-executor-integration.md) — the first platform-partner integration as the first non-LangGraph integration in v1.0, with **atomic real-time integration** via a sidecar `agenticd` (topology specified in ADR-0004). Hard runtime dependency, full product parity with LangGraph on rollback. Amends ADR-0001 Decision 7.
 
 [`docs/architecture/snapshot-model.md`](docs/architecture/snapshot-model.md) is the technical heart — object model, segment-based snapshot algorithm, rollback semantics, performance targets. [`docs/architecture/overview.md`](docs/architecture/overview.md) is the runtime topology and component boundaries.
 
@@ -25,7 +26,7 @@ The in-repo MVP spec (May 2026) targets **stateful LangGraph teams of 2–15 eng
 
 Recent strategy work (also May 2026) shifted the long-arc positioning toward **"the git host built for when most commits are written by agents,"** with a **platform-led GTM toward the very agent platforms** the MVP spec disqualifies. ADR-0002's extended Commit object is the substrate-level commitment to that direction (Commit object IS the platform API contract).
 
-These two framings are not yet reconciled. The 12-week build remains anchored on the LangGraph-team ICP and the broken-prompt demo. When working on MVP-path code, default to the in-repo spec. When making decisions that lock in long-term API or substrate (object schemas, daemon protocol, SDK surface), prefer choices that don't preclude the platform-led direction — for example, the storage layer must stay swappable per ADR-0002 Decision 6. If a decision genuinely splits between the two framings, flag it rather than picking silently.
+ADR-0003 reconciles these by accepting the the first platform-partner integration (Claude Agent SDK) as the first platform-led integration alongside the LangGraph MVP work — at **full product parity, including atomic rollback**. The broken-prompt demo discipline still runs on LangGraph; the Executor integration is real-time via a sidecar `agenticd` per [ADR-0004](docs/adr/0004-realtime-agenticd-for-executor.md), which also pulls the GCS-backed `ObjectStore` forward from v2+ (exercising ADR-0002 Decision 6's swappable storage). If the sidecar/GCS work threatens the broken-prompt demo, the documented escape hatch (ADR-0003 Decision 2, end-of-week-8 decision point) is to revert to a layered manifest-export shape for v1.0 and defer atomic to v1.1. When working on MVP-path code, default to the in-repo spec. When making decisions that lock in long-term API or substrate (object schemas, daemon protocol, SDK surface), prefer choices that don't preclude the platform-led direction — in particular the SDK contract must stay framework-neutral per ADR-0003 Decision 3 (no framework-specific Commit fields). If a decision genuinely splits between the two framings, flag it rather than picking silently.
 
 ## Repository layout
 
@@ -77,7 +78,7 @@ mypy agentic
 
 - **Don't expand scope past the demo path.** If it isn't required for the broken-prompt demo, it's v1.1+ work. The deferral list in [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/product/mvp-spec.md`](docs/product/mvp-spec.md) is the authoritative scope boundary.
 - **Don't add memory backends in MVP.** Postgres + pgvector only. Mem0 / Zep / Letta adapters are v1.1, behind the same `MemoryAdapter` trait.
-- **Don't add framework integrations in MVP.** LangGraph only. CrewAI / AutoGen / LlamaIndex are v1.1, behind the same SDK contract.
+- **Don't add framework integrations in MVP beyond LangGraph and the Claude Agent SDK (the first platform-partner integration), per [ADR-0003](docs/adr/0003-<partner>-executor-integration.md).** CrewAI / AutoGen / LlamaIndex are v1.1, behind the same SDK contract. The Executor integrates via a sidecar `agenticd` co-located with the Coding worker in its Cloud Run instance per [ADR-0004](docs/adr/0004-realtime-agenticd-for-executor.md), over the existing Unix-socket `agentic-proto` wire — through the framework-neutral SDK contract, never via a framework-specific adapter crate. Remote or in-process daemon deployments are explicitly out of scope for v1.0; if the sidecar path proves unworkable mid-MVP, the documented fallback is layered manifest-export (ADR-0003 Decision 2's original framing), not a different deployment shape.
 - **Don't mock Postgres for snapshot/restore tests.** The snapshot algorithm uses Postgres-specific features (logical decoding, advisory locks, pgvector storage); mocking defeats the test. Snapshot/restore code paths must exercise a real Postgres+pgvector via CI integration tests.
 - **Don't reorder the 2PC staging in commit code.** Per ADR-0002 Decision 3: blobs to object store → collect content hashes → build Commit blob → Git push (single commit point) → branch ref update. Failure-injection tests are required at each boundary. This is the plumbing that makes "atomic rollback" honest rather than aspirational.
 - **Don't expose storage-layer concepts to platform integrators.** Per ADR-0002 Decision 6, the SDK's public surface trades in `Commit` objects only. No Git ref names, no object store paths, no internal segment IDs in public types — those preclude the v2+ storage swap.
@@ -119,8 +120,10 @@ When in doubt, these are authoritative:
 - [`docs/product/mvp-spec.md`](docs/product/mvp-spec.md) — what we ship, for whom, what's out
 - [`docs/product/roadmap.md`](docs/product/roadmap.md) — week-by-week plan to 2026-08-11
 - [`docs/product/demo-scenario.md`](docs/product/demo-scenario.md) — the demo as discipline
-- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — foundational decisions
+- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — foundational decisions (Decision 7 amended by ADR-0003)
 - [`docs/adr/0002-substrate-and-supercommit.md`](docs/adr/0002-substrate-and-supercommit.md) — substrate, extended Commit, 2PC staging order
+- [`docs/adr/0003-<partner>-executor-integration.md`](docs/adr/0003-<partner>-executor-integration.md) — first non-LangGraph integration target (the first platform-partner integration / Claude Agent SDK), layered session-manifest path
+- [`docs/adr/0004-realtime-agenticd-for-executor.md`](docs/adr/0004-realtime-agenticd-for-executor.md) — sidecar `agenticd` topology for the Executor's real-time atomic integration: deployment shape, snapshot triggers, failure semantics, GCS-backed `ObjectStore`
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — runtime topology
 - [`docs/architecture/snapshot-model.md`](docs/architecture/snapshot-model.md) — the technical heart
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — what's accepted right now, code style, ADR process
