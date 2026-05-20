@@ -142,7 +142,7 @@ BASELINE=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
 ../../target/release/agentic --repo . commit -m "bad change" \
     --model "anthropic:claude-opus:2026-05-01"
 
-# 4.5. Show that git revert alone does not fix it
+# 4.5. Show that restoring only the prompt file does not fix it
 git checkout -- prompts/system.txt
 ./scripts/redeploy.sh
 ./scripts/ask.sh "I'm thinking about cancelling."  # still broken
