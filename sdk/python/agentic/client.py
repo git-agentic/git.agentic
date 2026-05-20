@@ -17,7 +17,7 @@ import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
 from ._framing import FrameError, read_frame, write_frame
 from .types import Commit, Diff, LogEntry, RollbackPlan
@@ -198,9 +198,14 @@ class AgenticClient:
                 f"{reply.get('correlation_id')!r}"
             )
         response = reply.get("payload", {})
+        if not isinstance(response, dict):
+            raise AgenticError(
+                f"daemon returned non-dict payload ({type(response).__name__!r}); "
+                "protocol version mismatch?"
+            )
         if response.get("kind") == "error":
             raise AgenticError(response.get("message", "daemon returned Error"))
-        return cast(dict[str, Any], response)
+        return response
 
     @classmethod
     def _next_correlation_id(cls) -> str:
