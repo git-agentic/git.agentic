@@ -21,7 +21,7 @@ tokio.workspace = true
 # reqwest's blocking client is the sync wrapper the ObjectStore trait
 # needs. The existing async reqwest dep elsewhere in the workspace uses
 # the same rustls + json features; "blocking" is additive.
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3.10"
