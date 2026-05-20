@@ -25,8 +25,10 @@ use tempfile::TempDir;
 fn tmp_store() -> (TempDir, FsObjectStore, Refs) {
     let dir = TempDir::new().unwrap();
     let agentic_dir = dir.path().join(".agentic");
-    std::fs::create_dir_all(&agentic_dir).unwrap();
-    let store = FsObjectStore::open(&agentic_dir).unwrap();
+    let objects_dir = agentic_dir.join("objects");
+    std::fs::create_dir_all(&objects_dir).unwrap();
+    // Mirror the real layout: store at .agentic/objects/, refs at .agentic/.
+    let store = FsObjectStore::open(&objects_dir).unwrap();
     let refs = Refs::open(&agentic_dir).unwrap();
     (dir, store, refs)
 }
@@ -123,7 +125,7 @@ fn bench_tree_put(c: &mut Criterion) {
     // Measures only the cost of serialising + storing the Tree manifest.
     // The blobs it references are never written to the store here; their
     // hashes are synthesised in-memory. Run bench_blob_put for blob overhead.
-    let mut g = c.benchmark_group("tree_put_metadata");
+    let mut g = c.benchmark_group("tree_put");
     for n in [10usize, 100, 500] {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(

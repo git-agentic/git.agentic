@@ -114,6 +114,9 @@ examples/langgraph-rollback/
 If you want to drive the steps yourself instead of via `run-demo.sh`:
 
 ```bash
+# Run from the repo root:
+cd examples/langgraph-rollback
+
 # 1. Postgres (standalone compose on port 54322)
 podman compose up -d
 
