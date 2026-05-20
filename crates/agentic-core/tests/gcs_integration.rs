@@ -30,6 +30,10 @@ fn bucket() -> Option<String> {
     std::env::var("GCS_BUCKET").ok()
 }
 
+fn bearer() -> Option<String> {
+    std::env::var("GCS_TOKEN").ok()
+}
+
 fn fresh_prefix() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -39,15 +43,18 @@ fn fresh_prefix() -> String {
 }
 
 fn make_store(prefix: &str) -> Option<(GcsObjectStore, tempfile::TempDir)> {
-    let endpoint = endpoint()?;
+    // Bucket is the only hard requirement. `GCS_ENDPOINT` is unset against
+    // public GCS (the store defaults to the real host) and set against
+    // `fake-gcs-server`. `GCS_TOKEN` carries a bearer for real-GCS runs
+    // and is unset for fake-gcs (which ignores auth).
     let bucket = bucket()?;
     let cache = tempfile::tempdir().unwrap();
     let store = GcsObjectStore::new(
         bucket,
         prefix.to_string(),
         cache.path(),
-        Some(endpoint),
-        None,
+        endpoint(),
+        bearer(),
     )
     .unwrap();
     Some((store, cache))
@@ -58,7 +65,7 @@ fn make_store(prefix: &str) -> Option<(GcsObjectStore, tempfile::TempDir)> {
 fn put_raw_then_get_raw_roundtrip() {
     let prefix = fresh_prefix();
     let Some((store, _cache)) = make_store(&prefix) else {
-        eprintln!("GCS_ENDPOINT/GCS_BUCKET not set — skipping");
+        eprintln!("GCS_BUCKET not set — skipping");
         return;
     };
 
@@ -74,7 +81,7 @@ fn put_raw_then_get_raw_roundtrip() {
     drop(_cache);
     let cache2 = tempfile::tempdir().unwrap();
     let cold_store =
-        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), None).unwrap();
+        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), bearer()).unwrap();
     let cold = cold_store.get_raw(&h).unwrap();
     assert_eq!(cold, payload);
     // Subsequent reads should now hit the cold-store's cache.
@@ -87,7 +94,7 @@ fn put_raw_then_get_raw_roundtrip() {
 fn put_object_then_get_validates_integrity() {
     let prefix = fresh_prefix();
     let Some((store, _cache)) = make_store(&prefix) else {
-        eprintln!("GCS_ENDPOINT/GCS_BUCKET not set — skipping");
+        eprintln!("GCS_BUCKET not set — skipping");
         return;
     };
 
@@ -108,7 +115,7 @@ fn put_object_then_get_validates_integrity() {
 fn has_returns_true_after_put_false_for_unknown() {
     let prefix = fresh_prefix();
     let Some((store, _cache)) = make_store(&prefix) else {
-        eprintln!("GCS_ENDPOINT/GCS_BUCKET not set — skipping");
+        eprintln!("GCS_BUCKET not set — skipping");
         return;
     };
     let h = store.put_raw(ObjectKind::Blob, b"abc").unwrap();
@@ -117,7 +124,7 @@ fn has_returns_true_after_put_false_for_unknown() {
     // Force a real GCS HEAD by using a fresh cache.
     let cache2 = tempfile::tempdir().unwrap();
     let cold =
-        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), None).unwrap();
+        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), bearer()).unwrap();
     let nope = Hash::of(b"never-uploaded");
     assert!(!cold.has(&nope));
 }
@@ -127,7 +134,7 @@ fn has_returns_true_after_put_false_for_unknown() {
 fn missing_object_returns_not_found() {
     let prefix = fresh_prefix();
     let Some((store, _cache)) = make_store(&prefix) else {
-        eprintln!("GCS_ENDPOINT/GCS_BUCKET not set — skipping");
+        eprintln!("GCS_BUCKET not set — skipping");
         return;
     };
     let nope = Hash::of(b"definitely-not-uploaded");
