@@ -192,7 +192,7 @@ impl GcsObjectStore {
             )
             .body(compressed.to_vec())
             .send()
-            .map_err(|e| Error::Other(anyhow::anyhow!("POST {url}: {e}")))?;
+            .map_err(|e| Error::Other(anyhow::anyhow!("upload {url}: {e}")))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
@@ -248,7 +248,20 @@ impl ObjectStore for GcsObjectStore {
         // truth — see post-MVP `agentic gc` for sweeping.)
         self.cache_write_compressed(&hash, &compressed)?;
         if let Err(e) = self.upload_compressed(&hash, &compressed) {
-            let _ = fs::remove_file(self.cache_path(&hash));
+            // Best-effort cache rollback so a failed upload can't masquerade as
+            // a successful put on the next get/has. If the unlink itself fails
+            // (permissions, transient FS error) we surface it via tracing so an
+            // operator can investigate — but still return the upload error,
+            // which is the user-visible cause.
+            if let Err(unlink_err) = fs::remove_file(self.cache_path(&hash)) {
+                if unlink_err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        hash = %hash,
+                        error = %unlink_err,
+                        "failed to roll back cache entry after GCS upload error",
+                    );
+                }
+            }
             return Err(e);
         }
         Ok(hash)
@@ -259,7 +272,20 @@ impl ObjectStore for GcsObjectStore {
         let compressed = zstd::stream::encode_all(bytes, 3)?;
         self.cache_write_compressed(&hash, &compressed)?;
         if let Err(e) = self.upload_compressed(&hash, &compressed) {
-            let _ = fs::remove_file(self.cache_path(&hash));
+            // Best-effort cache rollback so a failed upload can't masquerade as
+            // a successful put on the next get/has. If the unlink itself fails
+            // (permissions, transient FS error) we surface it via tracing so an
+            // operator can investigate — but still return the upload error,
+            // which is the user-visible cause.
+            if let Err(unlink_err) = fs::remove_file(self.cache_path(&hash)) {
+                if unlink_err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        hash = %hash,
+                        error = %unlink_err,
+                        "failed to roll back cache entry after GCS upload error",
+                    );
+                }
+            }
             return Err(e);
         }
         Ok(hash)
@@ -302,8 +328,11 @@ impl ObjectStore for GcsObjectStore {
 }
 
 /// Percent-encode the few characters that appear in GCS object names
-/// after sharding (the rest are hex digits and dots). Anything outside
-/// the unreserved + slash set is encoded.
+/// after sharding (the rest are hex digits and dots). `/` is the only
+/// non-unreserved character we expect, and the GCS JSON API requires it
+/// percent-encoded (`%2F`) inside the resource path even though it is a
+/// legal object-name character — so we always encode it here. Everything
+/// else outside the RFC 3986 unreserved set is also percent-encoded.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

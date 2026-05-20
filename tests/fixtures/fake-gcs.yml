@@ -4,12 +4,17 @@ version: "3.9"
 # credentials.
 #
 #   podman compose -f tests/fixtures/fake-gcs.yml up -d
+#   curl -X POST -H "Content-Type: application/json" \
+#     -d '{"name":"agentic-test-bucket"}' \
+#     http://localhost:54323/storage/v1/b
 #   GCS_ENDPOINT=http://localhost:54323 GCS_BUCKET=agentic-test-bucket \
 #     cargo test -p agentic-core --test gcs_integration -- --ignored
 #   podman compose -f tests/fixtures/fake-gcs.yml down -v
 #
 # fake-gcs-server speaks the GCS JSON API. The bucket referenced by
-# GCS_BUCKET is auto-created the first time we upload to it.
+# GCS_BUCKET must exist before the tests run; create it via the JSON API
+# `POST /storage/v1/b` call shown above. Image tag is pinned for
+# reproducibility across local/CI runs.
 
 services:
   fake-gcs:
