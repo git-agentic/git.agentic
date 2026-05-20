@@ -128,6 +128,11 @@ def _spawn_daemon(repo: Path, bin_path: Path):
         time.sleep(0.05)
     else:
         proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
         raise RuntimeError(f"agenticd did not create {sock} in 5s")
     return proc, AgenticClient(socket_path=sock)
 
