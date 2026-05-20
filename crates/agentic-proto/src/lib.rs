@@ -43,6 +43,10 @@ pub enum Request {
 
     /// Look up a single ref → commit hash.
     ResolveRef { name: String },
+
+    /// Fetch the raw bytes of any object by its content-addressed hash.
+    /// Unblocks checkpointer time-travel and direct object inspection.
+    ReadBlob { hash: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,11 +54,22 @@ pub enum Request {
 pub enum Response {
     Pong,
     Commit(CommitOutput),
-    Log { entries: Vec<LogEntry> },
+    Log {
+        entries: Vec<LogEntry>,
+    },
     Diff(DiffOutput),
     Rollback(RollbackOutput),
-    ResolveRef { hash: String },
-    Error { message: String },
+    ResolveRef {
+        hash: String,
+    },
+    Blob {
+        hash: String,
+        object_kind: String,
+        data: Vec<u8>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
