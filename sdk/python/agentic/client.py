@@ -15,7 +15,7 @@ import itertools
 import os
 import socket
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,8 +48,14 @@ class AgenticClient:
 
     @classmethod
     def default(cls) -> "AgenticClient":
+        # Double-checked locking on the singleton. The outer fast path
+        # avoids lock contention once initialised; the inner check
+        # re-validates after acquiring so concurrent first callers don't
+        # construct twice.
         if cls._default is None:
-            cls._default = cls()
+            with cls._lock:
+                if cls._default is None:
+                    cls._default = cls()
         return cls._default
 
     # ---------------- public surface ----------------
@@ -71,11 +77,18 @@ class AgenticClient:
         return {"head": reply.get("hash")}
 
     def resolve(self, name: str) -> Optional[str]:
-        """Resolve a ref name to a commit hash, or ``None`` if not found."""
+        """Resolve a ref name to a commit hash, or ``None`` if not found.
+
+        Only the daemon's "ref not found: <name>" is collapsed to
+        ``None`` — transport failures and other errors propagate so
+        callers can tell "missing ref" apart from "daemon is down".
+        """
         try:
             reply = self._request({"op": "resolve_ref", "name": name})
-        except AgenticError:
-            return None
+        except AgenticError as exc:
+            if str(exc) == f"ref not found: {name}":
+                return None
+            raise
         return reply.get("hash")
 
     def commit(
@@ -108,7 +121,7 @@ class AgenticClient:
             parent=None,
             message=message,
             author=author or "unknown",
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
 
     def log(self, *, limit: int = 20) -> list[LogEntry]:
@@ -118,7 +131,7 @@ class AgenticClient:
                 hash=e["hash"],
                 message=e["message"],
                 author=e["author"],
-                timestamp=datetime.fromisoformat(e["timestamp"]),
+                timestamp=_parse_rfc3339(e["timestamp"]),
             )
             for e in reply.get("entries", [])
         ]
@@ -194,3 +207,17 @@ class AgenticClient:
         with cls._lock:
             n = next(cls._correlation_counter)
         return f"py-{os.getpid()}-{n}"
+
+
+def _parse_rfc3339(s: str) -> datetime:
+    """Parse the daemon's RFC 3339 timestamp string into an aware datetime.
+
+    Python 3.10's ``datetime.fromisoformat`` rejects the trailing ``Z``
+    that strict RFC 3339 emitters use. Rust's chrono ``to_rfc3339()``
+    currently produces ``+00:00`` for UTC (which 3.10 accepts), but
+    normalising defensively keeps us compatible with any RFC 3339
+    encoder upstream might pick later.
+    """
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
