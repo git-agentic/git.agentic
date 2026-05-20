@@ -13,7 +13,7 @@ version: "3.9"
 
 services:
   fake-gcs:
-    image: fsouza/fake-gcs-server:latest
+    image: fsouza/fake-gcs-server:1.52.2
     container_name: agentic-test-fake-gcs
     command:
       - "-scheme"
