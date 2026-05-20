@@ -1,0 +1,48 @@
+name: release-sdk
+
+# Publish agentic-sdk to TestPyPI when a sdk-v* tag is pushed.
+# Uses PyPA trusted publishing (OIDC) — no API token in the repo. To
+# enable, set up a trusted publisher for this workflow on TestPyPI:
+#   https://test.pypi.org/manage/account/publishing/
+# with: project=agentic-sdk, workflow=release-sdk.yml, environment=testpypi.
+#
+# Tag convention: `sdk-v0.1.0a1` for the alpha; bump pyproject.toml's
+# `version` to match, then `git tag sdk-v0.1.0a1 && git push --tags`.
+
+on:
+  push:
+    tags:
+      - "sdk-v*"
+
+jobs:
+  build-and-publish:
+    name: build + publish to TestPyPI
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write     # OIDC trust handshake with TestPyPI
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install build
+        run: pip install --upgrade build
+      - name: build sdist + wheel
+        working-directory: sdk/python
+        run: python -m build
+      - name: verify version matches tag
+        working-directory: sdk/python
+        run: |
+          PY_VER=$(python -c "import tomllib,sys;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          TAG_VER="${GITHUB_REF_NAME#sdk-v}"
+          if [ "$PY_VER" != "$TAG_VER" ]; then
+            echo "::error::pyproject version $PY_VER != tag $TAG_VER" >&2
+            exit 1
+          fi
+      - name: publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: sdk/python/dist
