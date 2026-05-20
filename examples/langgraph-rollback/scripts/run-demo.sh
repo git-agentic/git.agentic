@@ -15,6 +15,7 @@
 #   6. deploy-bad-change.sh
 #   7. agent bad ask  ← the hallucinated refund
 #   8. `agentic commit` "bad change"
+#  8.5. simulate git revert  ← still broken (contaminated memory)
 #   9. `agentic diff` baseline → bad   ← multi-dimensional regression
 #  10. `agentic rollback baseline --yes`
 #  11. agent ask again  ← empathetic answer is back
@@ -24,9 +25,9 @@ set -euo pipefail
 
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "${DEMO_DIR}/../.." && pwd)"
-COMPOSE_FILE="${REPO_ROOT}/tests/fixtures/pg.yml"
+COMPOSE_FILE="${DEMO_DIR}/docker-compose.yml"
 
-DATABASE_URL_BASE="postgres://agentic:agentic@localhost:54321/agentic"
+DATABASE_URL_BASE="postgres://agentic:agentic@localhost:54322/agentic"
 export DATABASE_URL="${DATABASE_URL_BASE}"
 export AGENTIC_SOCKET="${DEMO_DIR}/.agentic/agenticd.sock"
 AGENTICD_BIN="${REPO_ROOT}/target/release/agenticd"
@@ -61,7 +62,7 @@ step "1. starting Postgres + pgvector (${CONTAINER_RUNTIME})"
 compose -f "${COMPOSE_FILE}" up -d >/dev/null
 pg_ready=false
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    if container_run exec agentic-test-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
+    if container_run exec agentic-demo-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
         echo "ready after ${i}s"
         pg_ready=true
         break
@@ -128,6 +129,19 @@ step "7. bad ask  (hallucinated refund + contaminated memory)"
 step "8. commit bad change"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.8 friendlier prompt" \
     --model "anthropic:claude-opus:2026-05-01"
+
+step "8.5. simulate git revert — shows code-only revert is insufficient"
+# Restore the prompt file to baseline (simulating what a code-only rollback, e.g.
+# git revert, achieves: the file on disk goes back to its original content).
+# This is a local working-tree restore, not a revert commit.
+PROMPT_PATH="examples/langgraph-rollback/prompts/system.txt"
+if ! git -C "${REPO_ROOT}" checkout -- "${PROMPT_PATH}" 2>/dev/null; then
+    echo "error: could not restore ${REPO_ROOT}/${PROMPT_PATH} to baseline" >&2
+    exit 1
+fi
+"${DEMO_DIR}/scripts/redeploy.sh"
+"${DEMO_DIR}/scripts/ask.sh" "I'm thinking about cancelling my subscription."
+# Contaminated memory rows are still in Postgres — the answer is still broken.
 
 step "9. diff baseline → bad"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" diff "${BASELINE}" HEAD
