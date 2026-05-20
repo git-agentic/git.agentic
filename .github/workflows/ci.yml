@@ -45,6 +45,6 @@ jobs:
       - name: ruff
         run: ruff check sdk/python
       - name: mypy
-        run: mypy --strict sdk/python/agentic
+        run: mypy --strict --config-file sdk/python/pyproject.toml sdk/python/agentic
       - name: pytest
         run: pytest sdk/python/tests -q
