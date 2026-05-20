@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
+use agentic_core::{Hash, ObjectKind, ObjectStore};
 use serde_json::Value as Json;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
@@ -70,7 +70,7 @@ impl PgConfig {
 pub struct PostgresAdapter {
     pool: PgPool,
     cfg: PgConfig,
-    store: Arc<FsObjectStore>,
+    store: Arc<dyn ObjectStore + Send + Sync>,
     /// Whether `init()` confirmed logical decoding is usable. False on
     /// managed Postgres without `wal_level=logical`; the trigger fallback
     /// (in `triggers.rs`) runs instead.
@@ -87,7 +87,7 @@ pub struct PostgresAdapter {
 }
 
 impl PostgresAdapter {
-    pub async fn connect(cfg: PgConfig, store: Arc<FsObjectStore>) -> Result<Self> {
+    pub async fn connect(cfg: PgConfig, store: Arc<dyn ObjectStore + Send + Sync>) -> Result<Self> {
         let pool = PgPool::connect(&cfg.url).await?;
         Ok(Self {
             pool,
