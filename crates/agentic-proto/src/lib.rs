@@ -44,9 +44,9 @@ pub enum Request {
     /// Look up a single ref → commit hash.
     ResolveRef { name: String },
 
-    /// Fetch the raw bytes of any object by its content-addressed hash.
+    /// Fetch the canonical content bytes of any object by its hash.
     /// Unblocks checkpointer time-travel and direct object inspection.
-    ReadBlob { hash: String },
+    ReadObject { hash: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,7 +62,7 @@ pub enum Response {
     ResolveRef {
         hash: String,
     },
-    Blob {
+    ObjectData {
         hash: String,
         object_kind: String,
         data: Vec<u8>,
