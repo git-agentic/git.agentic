@@ -1,19 +1,21 @@
 # Benchmarks
 
 **Last measured:** 2026-05-20 on Apple Silicon (8-core, libkrun-hosted podman).
-**Methodology:** Criterion (`cargo bench -p agentic-core --bench store`) for micro-benchmarks; the broken-prompt demo end-to-end run (`scripts/run-demo.sh`) for integration timings. This file is the public commitment for `docs/architecture/snapshot-model.md` §9 targets — when the targets move, both files move together.
+**Methodology:** Criterion (`cargo bench -p agentic-core --bench store`) for micro-benchmarks; the broken-prompt demo end-to-end run (`scripts/run-demo.sh`) for integration timings.
+
+This is an **early sanity-check** of where measured performance sits relative to the `docs/architecture/snapshot-model.md` §9 targets, not yet the published commitment. The Criterion run below used reduced sample sizes for quick capture, and the rows covering production-shape inputs (1M-row pgvector with 100 deltas) are still pending an integration benchmark. Treat the numbers as a "no obvious blocker" signal; the published commitment lands once the §9-shaped harness exists.
 
 ## Targets vs measured
 
-| Operation | Target (snapshot-model §9) | Measured | Status |
+| Operation | Target (snapshot-model §9) | Measured | Notes |
 |---|---|---|---|
-| `commit` (prompts-only) | < 2 s | **2.3 ms** | ✓ vastly under |
 | `commit` (1M-row pgvector, 100 deltas) | < 2 s | _not yet benchmarked_ | ⚠ pending Postgres integration bench |
-| `rollback` (demo scenario, end-to-end) | < 5 s | **~1 s** (observed in run-demo.sh; ~6.7 s total for 12 demo steps incl. Postgres bring-up) | ✓ on demo scale |
+| `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** | ✓ no obvious blocker; **not a §9 measurement** |
 | `rollback` (1M-row pgvector, 10 commits) | < 5 s | _not yet benchmarked_ | ⚠ pending Postgres integration bench |
-| `diff` (demo scenario) | < 1 s | sub-second (observed) | ✓ on demo scale |
+| `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in run-demo.sh; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
 | `diff` (1M-row pgvector) | < 1 s | _not yet benchmarked_ | ⚠ pending Postgres integration bench |
-| Per-blob write (p99-ish) | < 5 ms / row | **2.7 ms** (512 KB blob) / **0.83 ms** (1 KB blob) | ✓ |
+| `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
+| Per-blob write, **median** | < 5 ms per row (p99) | **2.7 ms median (512 KB)** / **0.83 ms median (1 KB)** | ⚠ Criterion reports median, not p99 — p99 needs `--save-baseline` raw-sample analysis |
 | Snapshot storage amortized | < 2× changed data | _not yet measured_ | ⚠ pending segment-size sampling job |
 
 ## Raw numbers (Criterion, 2026-05-20)
