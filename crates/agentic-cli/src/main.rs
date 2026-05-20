@@ -83,7 +83,7 @@ enum Command {
 
     /// Print the canonical bytes of any stored object (blob, tree, commit).
     /// Equivalent to `git cat-file`. Clients can verify the output against
-    /// the hash: Blake3::of(data) == hash.
+    /// the hash: agentic_core::Hash::of(data) == hash.
     CatObject {
         /// Full content-addressed hash.
         hash: String,
