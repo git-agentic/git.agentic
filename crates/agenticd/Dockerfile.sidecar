@@ -1,0 +1,29 @@
+# Sidecar agenticd for the Codento Executor (ADR-0004).
+# Build (from repo root):
+#   docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .
+
+FROM rust:1.95-slim-bookworm AS builder
+WORKDIR /src
+# rustls-tls only — no OpenSSL anywhere in the workspace (workspace
+# Cargo.toml pins reqwest with default-features=false + rustls-tls;
+# sqlx uses runtime-tokio-rustls). ca-certificates is for crates.io
+# fetches during the build.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN cargo build --release -p agenticd && strip target/release/agenticd
+
+FROM debian:bookworm-slim
+# No libssl runtime — the whole stack is rustls. ca-certificates is
+# still required so rustls' webpki resolver can validate the GCS
+# endpoint's cert chain via the system trust store.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 65532 agentic \
+ && useradd  --system --uid 65532 --gid agentic --no-create-home --shell /usr/sbin/nologin agentic
+COPY --from=builder /src/target/release/agenticd /usr/local/bin/agenticd
+USER agentic:agentic
+ENTRYPOINT ["/usr/local/bin/agenticd"]
