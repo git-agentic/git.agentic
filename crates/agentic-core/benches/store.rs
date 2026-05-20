@@ -1,14 +1,14 @@
 //! Criterion benchmarks for the content-addressed object store.
 //!
-//! Performance targets (from docs/architecture/snapshot-model.md §9):
-//!   commit     < 2 s
-//!   rollback   < 5 s  (end-to-end; snapshot-restore benches are integration-only)
-//!   diff       < 1 s
-//!   write overhead < 5 ms p99 per object
+//! Performance targets covered here (from docs/architecture/snapshot-model.md §9):
+//!   commit            < 2 s   — measured by bench_commit/prompts_only
+//!   write overhead    < 5 ms p99 per object — measured by bench_blob_put
+//!
+//! Targets NOT measured here (require Postgres; see tests/integration/):
+//!   rollback   < 5 s  (end-to-end memory restore)
+//!   diff       < 1 s  (manifest diff across snapshots)
 //!
 //! The benchmarks here are CI-safe (no Postgres, no network).
-//! Integration-only benchmarks (memory snapshot / restore on a real DB)
-//! live in tests/integration/ and are gated behind `#[ignore]`.
 
 use std::collections::BTreeMap;
 
@@ -82,7 +82,7 @@ fn bench_blob_roundtrip(c: &mut Criterion) {
             let (_dir, store, _refs) = tmp_store();
             let blob = Blob::new(det_bytes(sz));
             let hash = store.put(&Object::Blob(blob)).unwrap();
-            b.iter(|| store.get(&hash).unwrap());
+            b.iter(|| black_box(store.get(black_box(&hash)).unwrap()));
         });
     }
     g.finish();
@@ -117,10 +117,13 @@ fn bench_tree_hash(c: &mut Criterion) {
     g.finish();
 }
 
-// ── tree put ──────────────────────────────────────────────────────────────────
+// ── tree put (Tree object only — referenced blobs are NOT written) ────────────
 
 fn bench_tree_put(c: &mut Criterion) {
-    let mut g = c.benchmark_group("tree_put");
+    // Measures only the cost of serialising + storing the Tree manifest.
+    // The blobs it references are never written to the store here; their
+    // hashes are synthesised in-memory. Run bench_blob_put for blob overhead.
+    let mut g = c.benchmark_group("tree_put_metadata");
     for n in [10usize, 100, 500] {
         g.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
