@@ -1,0 +1,7 @@
+# Per-run state produced by the demo. The agent + AgenticCheckpointer
+# mirror checkpoint envelopes to disk here; they're regenerated on
+# every run and have no business in version control.
+prompts/__langgraph__/
+
+# Python venv used by run-demo.sh.
+.venv/
