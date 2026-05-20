@@ -4,6 +4,7 @@
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
 mod mcp;
+mod migrate;
 mod objstore;
 mod rollback;
 mod server;
@@ -121,19 +122,28 @@ async fn main() -> anyhow::Result<()> {
         "agenticd listening"
     );
 
-    loop {
-        let (sock, _addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed");
-                continue;
+    // Connections are handled on the local task set — no Send bound required,
+    // which avoids HRTB issues with sqlx 0.7 async fn signatures. The daemon
+    // is a local Unix-socket server so single-threaded cooperative scheduling
+    // is the right execution model anyway.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            loop {
+                let (sock, _addr) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed");
+                        continue;
+                    }
+                };
+                let state = state.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_connection(state, sock).await {
+                        tracing::warn!(error = %format!("{e:#}"), "connection error");
+                    }
+                });
             }
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(state, sock).await {
-                tracing::warn!(error = %format!("{e:#}"), "connection error");
-            }
-        });
-    }
+        })
+        .await
 }
