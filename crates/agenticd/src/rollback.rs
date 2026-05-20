@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
-use agentic_core::{Blob, Commit, Hash, Object, ObjectKind, ObjectStore, Tree};
+use agentic_core::{Blob, Commit, Hash, Object, ObjectKind, Tree};
 use agentic_memory::adapter::SnapshotHandle;
 use agentic_memory::segment::SegmentManifest;
 use agentic_memory::MemoryAdapter;
