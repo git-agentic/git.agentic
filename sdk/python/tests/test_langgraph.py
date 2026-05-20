@@ -143,7 +143,9 @@ def _spawn_daemon(repo: Path, bin_path: Path):
 )
 def test_checkpointer_against_real_daemon(short_tmp: Path):
     repo = short_tmp / "repo"
-    proc, client = _spawn_daemon(repo, _daemon_bin())
+    bin_path = _daemon_bin()
+    assert bin_path is not None
+    proc, client = _spawn_daemon(repo, bin_path)
     try:
         cp = AgenticCheckpointer(client=client, repo=repo)
         config = {"configurable": {"thread_id": "user-42"}}
