@@ -5,10 +5,11 @@
 //!
 //! ```bash
 //! podman compose -f tests/fixtures/fake-gcs.yml up -d
-//! curl -X POST \
-//!   -H 'Content-Type: application/json' \
-//!   http://localhost:54323/storage/v1/b \
-//!   -d '{"name":"agentic-test-bucket"}'
+//! # fake-gcs-server does not auto-create buckets; create it via the
+//! # JSON API before running the tests.
+//! curl -X POST -H 'Content-Type: application/json' \
+//!   -d '{"name":"agentic-test-bucket"}' \
+//!   http://localhost:54323/storage/v1/b
 //! GCS_ENDPOINT=http://localhost:54323 GCS_BUCKET=agentic-test-bucket \
 //!   cargo test -p agentic-core --test gcs_integration -- --ignored
 //! ```
@@ -19,9 +20,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agentic_core::{
-    gcs_store::GcsObjectStore, Blob, Hash, Object, ObjectKind, ObjectStore,
-};
+use agentic_core::{gcs_store::GcsObjectStore, Blob, Hash, Object, ObjectKind, ObjectStore};
 
 fn endpoint() -> Option<String> {
     std::env::var("GCS_ENDPOINT").ok()
@@ -74,14 +73,8 @@ fn put_raw_then_get_raw_roundtrip() {
     // Drop the cache and re-read — this exercises the actual GCS GET.
     drop(_cache);
     let cache2 = tempfile::tempdir().unwrap();
-    let cold_store = GcsObjectStore::new(
-        bucket().unwrap(),
-        prefix,
-        cache2.path(),
-        endpoint(),
-        None,
-    )
-    .unwrap();
+    let cold_store =
+        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), None).unwrap();
     let cold = cold_store.get_raw(&h).unwrap();
     assert_eq!(cold, payload);
     // Subsequent reads should now hit the cold-store's cache.
@@ -123,14 +116,8 @@ fn has_returns_true_after_put_false_for_unknown() {
 
     // Force a real GCS HEAD by using a fresh cache.
     let cache2 = tempfile::tempdir().unwrap();
-    let cold = GcsObjectStore::new(
-        bucket().unwrap(),
-        prefix,
-        cache2.path(),
-        endpoint(),
-        None,
-    )
-    .unwrap();
+    let cold =
+        GcsObjectStore::new(bucket().unwrap(), prefix, cache2.path(), endpoint(), None).unwrap();
     let nope = Hash::of(b"never-uploaded");
     assert!(!cold.has(&nope));
 }
