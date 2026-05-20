@@ -486,10 +486,16 @@ impl PostgresAdapter {
             .execute(&mut *tx)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("executing down migration {name:?}: {e}")))?;
-        sqlx::query("DELETE FROM agentic_migrations WHERE name = $1")
+        let delete_result = sqlx::query("DELETE FROM agentic_migrations WHERE name = $1")
             .bind(name)
             .execute(&mut *tx)
             .await?;
+        let deleted_rows = delete_result.rows_affected();
+        if deleted_rows != 1 {
+            return Err(Error::Other(anyhow::anyhow!(
+                "expected to delete exactly 1 agentic_migrations row for down migration {name:?}, deleted {deleted_rows}"
+            )));
+        }
         tx.commit().await?;
         Ok(())
     }
