@@ -4,6 +4,7 @@
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
 mod mcp;
+mod objstore;
 mod rollback;
 mod server;
 
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use tokio::net::UnixListener;
 
 use crate::mcp::parse_mcp_spec;
+use crate::objstore::ObjectStoreSpec;
 use crate::server::{handle_connection, DaemonState};
 
 fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
@@ -58,6 +60,15 @@ struct Args {
     /// `--mcp search=http://localhost:8001,rag=http://localhost:8002/rpc`.
     #[arg(long, value_delimiter = ',')]
     mcp: Vec<String>,
+
+    /// Object-store backend. `fs` (default) uses `<repo>/.agentic/objects`;
+    /// `fs:///abs/path` uses an explicit on-disk root; `gcs://bucket[/prefix]`
+    /// pushes every object through to Google Cloud Storage with a
+    /// write-through local cache (ADR-0004 Decision 5). For GCS, set
+    /// `AGENTIC_GCS_ENDPOINT` to override the host (e.g. fake-gcs-server)
+    /// and `AGENTIC_GCS_TOKEN` for bearer auth.
+    #[arg(long, default_value = "fs")]
+    object_store: String,
 }
 
 #[tokio::main]
@@ -73,10 +84,16 @@ async fn main() -> anyhow::Result<()> {
 
     let tables = parse_tracked_tables(&args.tables)?;
     let mcp_servers = parse_mcp_spec(&args.mcp)?;
+    let store = ObjectStoreSpec::parse(&args.object_store, &agentic_dir)
+        .context("parsing --object-store")?
+        .open()
+        .context("opening object store")?;
+    tracing::info!(spec = %args.object_store, "object store ready");
     let state = Arc::new(
         DaemonState::open(
             args.repo.clone(),
             agentic_dir.clone(),
+            store,
             args.postgres.as_deref(),
             tables,
             mcp_servers,

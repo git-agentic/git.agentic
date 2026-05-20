@@ -13,7 +13,7 @@ use std::sync::Arc;
 use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
 use agentic_core::diff as diff_mod;
 use agentic_core::refs::{HeadRef, Refs};
-use agentic_core::{FsObjectStore, Hash, ObjectKind, ObjectStore};
+use agentic_core::{Hash, ObjectKind, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
@@ -29,8 +29,10 @@ pub struct DaemonState {
     /// Filesystem root of the repo (parent of `.agentic/`). Rollback uses
     /// this to compute the `prompts/` write-back target.
     pub repo_root: PathBuf,
-    /// Object store rooted at `<repo>/.agentic/objects/`.
-    pub store: Arc<FsObjectStore>,
+    /// Object store backing the repo. Concrete type is chosen at startup
+    /// from the `--object-store` flag (see `crate::objstore`); call sites
+    /// only see the [`ObjectStore`] trait.
+    pub store: Arc<dyn ObjectStore + Send + Sync>,
     /// Ref manager rooted at `<repo>/.agentic/`.
     pub refs: Refs,
     /// Serialises every write-path request. Per ADR-0001 the daemon does
@@ -51,14 +53,12 @@ impl DaemonState {
     pub async fn open(
         repo_root: PathBuf,
         agentic_dir: PathBuf,
+        store: Arc<dyn ObjectStore + Send + Sync>,
         postgres_url: Option<&str>,
         tables: Vec<TrackedTable>,
         mcp_servers: Vec<McpServerSpec>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&agentic_dir).context("creating .agentic directory")?;
-        let store = Arc::new(
-            FsObjectStore::open(agentic_dir.join("objects")).context("opening object store")?,
-        );
         let refs = Refs::open(&agentic_dir).context("opening refs")?;
 
         let memory = match postgres_url {
