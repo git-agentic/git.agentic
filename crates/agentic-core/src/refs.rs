@@ -46,6 +46,11 @@ impl Refs {
         Ok(Self { agentic_dir })
     }
 
+    /// Path to the `.agentic/` directory this `Refs` is rooted at.
+    pub fn agentic_dir(&self) -> &std::path::Path {
+        &self.agentic_dir
+    }
+
     fn head_path(&self) -> PathBuf {
         self.agentic_dir.join("HEAD")
     }

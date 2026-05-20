@@ -131,7 +131,7 @@ impl PostgresAdapter {
             r#"
             CREATE TABLE IF NOT EXISTS agentic_migrations (
                 id          serial      PRIMARY KEY,
-                name        text        NOT NULL,
+                name        text        NOT NULL UNIQUE,
                 applied_at  timestamptz NOT NULL DEFAULT now()
             )
             "#,
@@ -429,6 +429,75 @@ impl MemoryAdapter for PostgresAdapter {
 
     async fn current_schema_version(&self) -> Result<String> {
         self.current_schema_version_inner().await
+    }
+}
+
+impl PostgresAdapter {
+    /// Return migration names applied after `target_name`, ordered from
+    /// most-recent to least-recent (i.e. the order they must be reversed).
+    ///
+    /// If `target_name` is `"0.0.0"` (the baseline value returned when no
+    /// migrations have been applied), all recorded migrations are returned.
+    /// If `target_name` is not found in `agentic_migrations` and is not the
+    /// baseline, an error is returned — reversing an unknown target is unsafe.
+    pub async fn migrations_after(&self, target_name: &str) -> Result<Vec<String>> {
+        if target_name == "0.0.0" {
+            let rows: Vec<(String,)> =
+                sqlx::query_as("SELECT name FROM agentic_migrations ORDER BY id DESC")
+                    .fetch_all(&self.pool)
+                    .await?;
+            return Ok(rows.into_iter().map(|(n,)| n).collect());
+        }
+
+        // Check the target exists so we don't silently return zero rows.
+        let exists: Option<(i32,)> =
+            sqlx::query_as("SELECT id FROM agentic_migrations WHERE name = $1")
+                .bind(target_name)
+                .fetch_optional(&self.pool)
+                .await?;
+        if exists.is_none() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "target schema_version {:?} was never recorded in agentic_migrations; \
+                 cannot determine which migrations to reverse",
+                target_name
+            )));
+        }
+
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM agentic_migrations \
+             WHERE id > (SELECT id FROM agentic_migrations WHERE name = $1) \
+             ORDER BY id DESC",
+        )
+        .bind(target_name)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(n,)| n).collect())
+    }
+
+    /// Execute one reverse migration: run `sql` and remove `name` from
+    /// `agentic_migrations`, all in a single transaction.
+    ///
+    /// DDL in Postgres is transactional for most statements. Non-transactional
+    /// DDL (`CREATE INDEX CONCURRENTLY`, etc.) will error inside the transaction,
+    /// which is the correct failure mode — the migration file must be rewritten.
+    pub async fn apply_down_migration(&self, name: &str, sql: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::raw_sql(sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Other(anyhow::anyhow!("executing down migration {name:?}: {e}")))?;
+        let delete_result = sqlx::query("DELETE FROM agentic_migrations WHERE name = $1")
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        let deleted_rows = delete_result.rows_affected();
+        if deleted_rows != 1 {
+            return Err(Error::Other(anyhow::anyhow!(
+                "expected to delete exactly 1 agentic_migrations row for down migration {name:?}, deleted {deleted_rows}"
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
