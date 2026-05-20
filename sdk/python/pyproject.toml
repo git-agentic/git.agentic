@@ -30,8 +30,11 @@ target-version = "py310"
 
 [tool.mypy]
 strict = true
-# langgraph and pydantic v2 ship partial stubs; suppress missing-import
-# noise so mypy focuses on our own surface.
+
+[[tool.mypy.overrides]]
+# langgraph and langchain_core ship partial stubs; suppress missing-import
+# noise only for these modules so mypy still catches regressions elsewhere.
+module = ["langgraph.*", "langchain_core.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
