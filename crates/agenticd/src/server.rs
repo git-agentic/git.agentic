@@ -13,7 +13,7 @@ use std::sync::Arc;
 use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
 use agentic_core::diff as diff_mod;
 use agentic_core::refs::{HeadRef, Refs};
-use agentic_core::{Hash, ObjectKind, ObjectStore};
+use agentic_core::{Hash, Object, ObjectKind, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
@@ -166,6 +166,45 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
         }
 
         Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state.as_ref(), &from, &to)?)),
+
+        Request::ReadObject { hash } => {
+            let h: agentic_core::Hash = hash
+                .parse()
+                .with_context(|| format!("invalid hash: {hash}"))?;
+            let object = state
+                .store
+                .get(&h)
+                .with_context(|| format!("reading object {hash}"))?;
+            // Extract canonical bytes — the same bytes the hash commits to —
+            // so callers can verify Hash::of(&data) == hash.
+            let (object_kind, data) = match object {
+                Object::Blob(b) => ("blob", b.bytes),
+                Object::Tree(t) => ("tree", serde_json::to_vec(&t).context("serializing tree")?),
+                Object::Commit(c) => (
+                    "commit",
+                    serde_json::to_vec(&c).context("serializing commit")?,
+                ),
+            };
+            // Base64 expands by ~33%; guard against blowing the 16 MiB frame
+            // limit so the client receives a structured error rather than a
+            // dropped connection.
+            const MAX_OBJECT_BYTES: usize = 10 * 1024 * 1024;
+            if data.len() > MAX_OBJECT_BYTES {
+                return Ok(Response::Error {
+                    message: format!(
+                        "object {} is too large to fetch inline ({} bytes > {} byte limit)",
+                        h.to_hex(),
+                        data.len(),
+                        MAX_OBJECT_BYTES,
+                    ),
+                });
+            }
+            Ok(Response::ObjectData {
+                hash: h.to_hex(),
+                object_kind: object_kind.to_string(),
+                data,
+            })
+        }
 
         Request::Rollback {
             target,
