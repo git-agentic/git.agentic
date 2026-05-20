@@ -28,5 +28,14 @@ packages = ["agentic"]
 line-length = 100
 target-version = "py310"
 
+[tool.mypy]
+strict = true
+
+[[tool.mypy.overrides]]
+# langgraph and langchain_core ship partial stubs; suppress missing-import
+# noise only for these modules so mypy still catches regressions elsewhere.
+module = ["langgraph.*", "langchain_core.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
