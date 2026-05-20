@@ -16,9 +16,9 @@ for the design and the 90-second pitch shape this implements.
 - Two terminals are not required — `scripts/run-demo.sh` orchestrates
   everything.
 
-The demo runs against the same Postgres + pgvector fixture used by the
-Rust integration tests (`tests/fixtures/pg.yml`), so you don't need a
-separate database.
+The demo ships its own `docker-compose.yml` (Postgres + pgvector on
+port 54322, container `agentic-demo-pg`), so it does not share state
+with the Rust integration-test database.
 
 ## 60-second walkthrough
 
@@ -84,16 +84,16 @@ history reflects the rollback action rather than rewriting it.
   requires the reverse SQL migration runner which is the next planned
   ADR-0002 §5 follow-up. Today the demo exercises prompts + memory
   rollback only.
-- **No containerised packaging.** The demo runs locally against the
-  existing Postgres test fixture. A `docker-compose.yml` that bundles
-  Postgres + `agenticd` + the agent runner into one `docker compose
-  up` lands in a polish pass.
+- **Compose covers the database only.** `docker-compose.yml` starts
+  Postgres + pgvector. `agenticd` and the Python agent are built and
+  run locally by `scripts/run-demo.sh` — they are not containerised.
 
 ## Files
 
 ```
 examples/langgraph-rollback/
 ├── agent.py              the LangGraph agent + fake LLM
+├── docker-compose.yml    Postgres + pgvector on port 54322
 ├── prompts/
 │   └── system.txt        baseline empathetic system prompt
 ├── bad-change/
@@ -103,6 +103,7 @@ examples/langgraph-rollback/
 ├── scripts/
 │   ├── ask.sh            invoke the agent with one user message
 │   ├── deploy-bad-change.sh   apply prompt + memory contamination
+│   ├── redeploy.sh       simulate code-only redeploy after git revert
 │   └── run-demo.sh       full scenario orchestrator
 ├── pyproject.toml        Python deps for the demo
 └── README.md             you are here
@@ -113,21 +114,24 @@ examples/langgraph-rollback/
 If you want to drive the steps yourself instead of via `run-demo.sh`:
 
 ```bash
-# 1. Postgres
-podman compose -f ../../tests/fixtures/pg.yml up -d
+# Run from the repo root:
+cd examples/langgraph-rollback
+
+# 1. Postgres (standalone compose on port 54322)
+podman compose up -d
 
 # 2. Build daemon + CLI
-cargo build --release -p agenticd -p agentic-cli
+cd ../.. && cargo build --release -p agenticd -p agentic-cli && cd examples/langgraph-rollback
 
 # 3. Seed baseline + start daemon
-psql 'postgres://agentic:agentic@localhost:54321/agentic' -f seed.sql
+psql 'postgres://agentic:agentic@localhost:54322/agentic' -f seed.sql
 ../../target/release/agentic --repo . init
 ../../target/release/agenticd --repo . \
-    --postgres 'postgres://agentic:agentic@localhost:54321/agentic' \
+    --postgres 'postgres://agentic:agentic@localhost:54322/agentic' \
     --tables episodes:id &
 
 # 4. Drive the scenario
-export DATABASE_URL='postgres://agentic:agentic@localhost:54321/agentic'
+export DATABASE_URL='postgres://agentic:agentic@localhost:54322/agentic'
 ./scripts/ask.sh "I'm thinking about cancelling."
 ../../target/release/agentic --repo . commit -m "baseline" \
     --model "anthropic:claude-opus:2026-05-01"
@@ -138,13 +142,18 @@ BASELINE=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
 ../../target/release/agentic --repo . commit -m "bad change" \
     --model "anthropic:claude-opus:2026-05-01"
 
+# 4.5. Show that restoring only the prompt file does not fix it
+git checkout -- prompts/system.txt
+./scripts/redeploy.sh
+./scripts/ask.sh "I'm thinking about cancelling."  # still broken
+
 ../../target/release/agentic --repo . diff "$BASELINE" HEAD
 ../../target/release/agentic --repo . rollback "$BASELINE" --yes
-./scripts/ask.sh "I'm thinking about cancelling."
+./scripts/ask.sh "I'm thinking about cancelling."  # fixed
 
 # 5. Tear down
 kill %1
-podman compose -f ../../tests/fixtures/pg.yml down -v
+podman compose down -v
 ```
 
 ## Verifying it on a fresh clone
