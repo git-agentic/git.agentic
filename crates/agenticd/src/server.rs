@@ -167,6 +167,26 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
 
         Request::Diff { from, to } => Ok(Response::Diff(handle_diff(state.as_ref(), &from, &to)?)),
 
+        Request::ReadBlob { hash } => {
+            let h: agentic_core::Hash = hash
+                .parse()
+                .with_context(|| format!("invalid hash: {hash}"))?;
+            let object = state
+                .store
+                .get(&h)
+                .with_context(|| format!("object not found: {hash}"))?;
+            let object_kind = format!("{:?}", object.kind()).to_lowercase();
+            let data = state
+                .store
+                .get_raw(&h)
+                .with_context(|| format!("reading raw bytes for {hash}"))?;
+            Ok(Response::Blob {
+                hash,
+                object_kind,
+                data,
+            })
+        }
+
         Request::Rollback {
             target,
             dry_run,
