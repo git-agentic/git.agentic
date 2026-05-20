@@ -131,7 +131,7 @@ impl PostgresAdapter {
             r#"
             CREATE TABLE IF NOT EXISTS agentic_migrations (
                 id          serial      PRIMARY KEY,
-                name        text        NOT NULL,
+                name        text        NOT NULL UNIQUE,
                 applied_at  timestamptz NOT NULL DEFAULT now()
             )
             "#,
