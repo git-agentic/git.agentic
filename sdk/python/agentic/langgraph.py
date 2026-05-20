@@ -123,11 +123,13 @@ class AgenticCheckpointer(BaseCheckpointSaver):
         )
 
         return {
+            **config,
             "configurable": {
+                **config.get("configurable", {}),
                 "thread_id": thread_id,
                 "checkpoint_ns": _ns(config),
                 "checkpoint_id": commit.hash,
-            }
+            },
         }
 
     # ------------------------------------------------------------ get_tuple
