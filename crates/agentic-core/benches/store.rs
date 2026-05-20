@@ -12,11 +12,11 @@
 
 use std::collections::BTreeMap;
 
-use agentic_core::{Blob, FsObjectStore, Hash, Object, ObjectKind, ObjectStore, Tree, TypedRef};
-use agentic_core::commit::{CommitInputs, stage_and_commit};
+use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::Refs;
+use agentic_core::{Blob, FsObjectStore, Hash, Object, ObjectKind, ObjectStore, Tree, TypedRef};
 use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use tempfile::TempDir;
 
@@ -33,8 +33,9 @@ fn tmp_store() -> (TempDir, FsObjectStore, Refs) {
 
 /// Deterministic pseudo-random bytes — reproducible across runs.
 fn det_bytes(n: usize) -> Vec<u8> {
+    // Use u64 arithmetic so the literal stays in range on 32-bit targets.
     (0..n)
-        .map(|i| (i.wrapping_mul(6_364_136_223_846_793_005usize) >> 56) as u8)
+        .map(|i| ((i as u64).wrapping_mul(6_364_136_223_846_793_005_u64) >> 56) as u8)
         .collect()
 }
 
@@ -46,7 +47,7 @@ fn bench_hash(c: &mut Criterion) {
         let data = det_bytes(size);
         g.throughput(Throughput::Bytes(size as u64));
         g.bench_with_input(BenchmarkId::from_parameter(size), &data, |b, d| {
-            b.iter(|| Hash::of(d));
+            b.iter(|| Hash::of(black_box(d)));
         });
     }
     g.finish();
@@ -100,12 +101,15 @@ fn bench_tree_hash(c: &mut Criterion) {
                         let blob = Blob::new(det_bytes(64));
                         tree.insert(
                             format!("file_{i:04}.txt"),
-                            TypedRef { kind: ObjectKind::Blob, hash: blob.hash() },
+                            TypedRef {
+                                kind: ObjectKind::Blob,
+                                hash: blob.hash(),
+                            },
                         );
                     }
                     tree
                 },
-                |tree| tree.hash(),
+                |tree| black_box(tree.hash()),
                 BatchSize::SmallInput,
             );
         });
@@ -127,7 +131,10 @@ fn bench_tree_put(c: &mut Criterion) {
                         let blob = Blob::new(det_bytes(64));
                         tree.insert(
                             format!("file_{i:04}.txt"),
-                            TypedRef { kind: ObjectKind::Blob, hash: blob.hash() },
+                            TypedRef {
+                                kind: ObjectKind::Blob,
+                                hash: blob.hash(),
+                            },
                         );
                     }
                     (dir, store, refs, tree)
@@ -168,9 +175,7 @@ fn bench_commit(c: &mut Criterion) {
                 };
                 (dir, store, refs, inputs)
             },
-            |(_dir, store, refs, inputs)| {
-                stage_and_commit(&store, &refs, "main", inputs).unwrap()
-            },
+            |(_dir, store, refs, inputs)| stage_and_commit(&store, &refs, "main", inputs).unwrap(),
             BatchSize::SmallInput,
         );
     });

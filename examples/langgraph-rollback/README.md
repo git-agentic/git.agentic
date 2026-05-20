@@ -84,10 +84,6 @@ history reflects the rollback action rather than rewriting it.
   requires the reverse SQL migration runner which is the next planned
   ADR-0002 §5 follow-up. Today the demo exercises prompts + memory
   rollback only.
-- **No LLM in the agent runner.** The scenario uses a deterministic
-  branching function, not a real model call, so it runs without API
-  keys and produces reproducible output. Real LLM-backed agents roll
-  back identically — the snapshotted dimensions are the same.
 
 ## Files
 
@@ -119,7 +115,7 @@ If you want to drive the steps yourself instead of via `run-demo.sh`:
 podman compose up -d
 
 # 2. Build daemon + CLI
-cargo build --release -p agenticd -p agentic-cli ../../
+cd ../.. && cargo build --release -p agenticd -p agentic-cli && cd examples/langgraph-rollback
 
 # 3. Seed baseline + start daemon
 psql 'postgres://agentic:agentic@localhost:54322/agentic' -f seed.sql
