@@ -72,7 +72,7 @@ CHECKPOINT_BLOB_PREFIX = "__langgraph__"
 ENVELOPE_VERSION = 1
 
 
-class AgenticCheckpointer(BaseCheckpointSaver[JsonPlusSerializer]):
+class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
     """A LangGraph checkpointer backed by ``agenticd``.
 
     One branch per ``thread_id``. One commit per checkpoint. The
@@ -104,7 +104,7 @@ class AgenticCheckpointer(BaseCheckpointSaver[JsonPlusSerializer]):
         thread_id = _require_thread_id(config)
         branch = _branch_for_thread(thread_id)
 
-        envelope = _serialise_envelope(self.serde, checkpoint, metadata, thread_id)
+        envelope = _serialise_envelope(cast(JsonPlusSerializer, self.serde), checkpoint, metadata, thread_id)
         blob_path = _checkpoint_blob_path(thread_id)
         envelope_json = json.dumps(envelope, separators=(",", ":"))
 
@@ -169,7 +169,7 @@ class AgenticCheckpointer(BaseCheckpointSaver[JsonPlusSerializer]):
             return None
 
         envelope = json.loads(blob_path.read_text())
-        checkpoint, metadata = _deserialise_envelope(self.serde, envelope)
+        checkpoint, metadata = _deserialise_envelope(cast(JsonPlusSerializer, self.serde), envelope)
 
         checkpoint_config = cast(RunnableConfig, dict(config))
         configurable = dict(config.get("configurable", {}))
@@ -270,7 +270,7 @@ class AgenticCheckpointer(BaseCheckpointSaver[JsonPlusSerializer]):
 
 def _require_thread_id(config: RunnableConfig) -> str:
     try:
-        return config["configurable"]["thread_id"]
+        return cast(str, config["configurable"]["thread_id"])
     except (KeyError, TypeError) as exc:
         raise ValueError(
             "AgenticCheckpointer requires config['configurable']['thread_id']"
