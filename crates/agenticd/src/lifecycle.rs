@@ -61,29 +61,19 @@ impl Lifecycle {
     /// Spawn a background task that fires the shutdown token when the
     /// process receives SIGTERM or SIGINT (or Ctrl+C on non-Unix).
     /// Idempotent on the signal — both raise the same shutdown.
+    ///
+    /// If signal handler installation fails (extremely rare on
+    /// supported platforms), the error is logged and the task falls
+    /// back to whichever handler did install, or — if both fail — to
+    /// `ctrl_c`. The shutdown token is still cancelled when ANY signal
+    /// path fires, so the daemon never silently loses its ability to
+    /// shut down gracefully. (Copilot review on PR #50: previously
+    /// used `expect(...)` which would have panicked the detached task
+    /// and stranded the shutdown token forever.)
     pub fn install_signal_handlers(&self) {
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal, SignalKind};
-                let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-                let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-                tokio::select! {
-                    _ = sigterm.recv() => {
-                        tracing::info!("SIGTERM received; initiating graceful shutdown");
-                    }
-                    _ = sigint.recv() => {
-                        tracing::info!("SIGINT received; initiating graceful shutdown");
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    tracing::info!("Ctrl-C received; initiating graceful shutdown");
-                }
-            }
+            wait_for_shutdown_signal().await;
             shutdown.cancel();
         });
     }
@@ -97,6 +87,56 @@ impl Lifecycle {
         tracing::info!("draining commit_lock for graceful shutdown");
         let _g = self.commit_lock.lock().await;
         tracing::info!("commit_lock acquired; no commit in progress — exiting");
+    }
+}
+
+/// Block the current task until SIGTERM, SIGINT (on Unix), or Ctrl+C
+/// (on non-Unix) fires. Signal-handler installation failures are logged
+/// and the function degrades gracefully to whichever handler did install.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let sigterm = signal(SignalKind::terminate());
+        let sigint = signal(SignalKind::interrupt());
+        match (sigterm, sigint) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {
+                        tracing::info!("SIGTERM received; initiating graceful shutdown");
+                    }
+                    _ = int.recv() => {
+                        tracing::info!("SIGINT received; initiating graceful shutdown");
+                    }
+                }
+            }
+            (Ok(mut term), Err(e)) => {
+                tracing::error!(error = %e, "failed to install SIGINT handler; SIGTERM remains active");
+                let _ = term.recv().await;
+                tracing::info!("SIGTERM received; initiating graceful shutdown");
+            }
+            (Err(e), Ok(mut int)) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; SIGINT remains active");
+                let _ = int.recv().await;
+                tracing::info!("SIGINT received; initiating graceful shutdown");
+            }
+            (Err(term_e), Err(int_e)) => {
+                tracing::error!(
+                    sigterm_error = %term_e,
+                    sigint_error = %int_e,
+                    "failed to install SIGTERM and SIGINT handlers; falling back to ctrl_c"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("Ctrl-C received via fallback; initiating graceful shutdown");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "ctrl_c handler returned error; shutting down anyway");
+        }
+        tracing::info!("Ctrl-C received; initiating graceful shutdown");
     }
 }
 

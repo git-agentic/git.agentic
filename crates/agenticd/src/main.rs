@@ -143,6 +143,12 @@ async fn main() -> anyhow::Result<()> {
     // which avoids HRTB issues with sqlx 0.7 async fn signatures. The daemon
     // is a local Unix-socket server so single-threaded cooperative scheduling
     // is the right execution model anyway.
+    //
+    // The drain step MUST run inside `run_until` so the LocalSet keeps
+    // driving any in-flight `spawn_local` commit/rollback task — those
+    // tasks hold `commit_lock`, and if the LocalSet stops being polled
+    // the drain would deadlock waiting on a lock no task can release.
+    // (Spotted by Copilot review on PR #50.)
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
@@ -169,14 +175,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // Wait for any in-flight commit/rollback to complete its 2PC
+            // sequence before the process exits. ADR-0002 Decision 3
+            // promises atomic commits; this drain step is what makes that
+            // promise survive operator-driven shutdowns (docker stop,
+            // kubectl rollout, systemctl restart).
+            lifecycle.drain().await;
         })
         .await;
 
-    // Wait for any in-flight commit to complete its 2PC sequence before
-    // the process exits. ADR-0002 Decision 3 promises atomic commits;
-    // this drain step is what makes that promise survive operator-driven
-    // shutdowns (docker stop, kubectl rollout, systemctl restart).
-    lifecycle.drain().await;
     tracing::info!("agenticd shutdown complete");
     Ok(())
 }
