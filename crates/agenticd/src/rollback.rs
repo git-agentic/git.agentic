@@ -149,10 +149,21 @@ pub async fn execute(
                     schema_version: target_schema.clone(),
                 };
                 let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
+                // Pause the trigger poller for the restore window, then
+                // call the guard-taking restore method so the quiesce
+                // discipline is visible at the call site. The poller
+                // resumes when `guard` is dropped at end of scope.
+                // Audit anchor: §A1 / [R1] — without this the demo's
+                // atomicity claim is silently false.
+                let guard = adapter
+                    .begin_restore()
+                    .await
+                    .context("pausing trigger poller for restore window")?;
                 adapter
-                    .restore(&handle)
+                    .restore_with_guard(&guard, &handle)
                     .await
                     .context("restoring memory snapshot")?;
+                drop(guard);
             }
         } else {
             plan.push("no memory snapshot in target — skipping memory data restore".into());
