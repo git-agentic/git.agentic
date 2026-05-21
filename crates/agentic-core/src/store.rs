@@ -5,9 +5,10 @@
 //!   - First two hex chars of the BLAKE3 hash form the shard directory.
 //!   - Filename is the remaining 62 hex chars plus `.zst`.
 //!
-//! Week-1 implementation: blob put/get on a local directory. Week-2+ adds
-//! tree/commit support and ref management. The `ObjectStore` trait is the
-//! seam where remote (S3) backends will plug in later (v1.1).
+//! `FsObjectStore` is the local-filesystem implementation; `GcsObjectStore`
+//! (see `gcs.rs`) is the remote backend introduced for the sidecar
+//! `agenticd` topology (ADR-0004). The `ObjectStore` trait is the seam
+//! where additional backends (e.g. S3, network-replicated) will plug in.
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
@@ -252,6 +253,28 @@ mod tests {
         // Confirm no object was written.
         let h = Hash::of(&bytes);
         assert!(!store.has(&h));
+    }
+
+    #[test]
+    fn put_blob_allowlist_suppresses_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec();
+        let obj = Object::Blob(Blob::new(bytes.clone()));
+        let h = obj.hash();
+        let toml_text = format!(
+            r#"
+            [[ignore]]
+            blob_hash = "{}"
+        "#,
+            h.to_hex()
+        );
+        let al = crate::scanner::Allowlist::from_toml(&toml_text).unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap().with_allowlist(al);
+        let hash = store
+            .put(&obj)
+            .expect("allowlisted blob object should put cleanly");
+        assert_eq!(hash, h);
+        assert!(store.has(&h));
     }
 
     #[test]

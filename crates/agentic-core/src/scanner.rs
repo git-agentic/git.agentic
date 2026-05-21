@@ -213,6 +213,18 @@ mod tests {
     }
 
     #[test]
+    fn scanner_catches_github_refresh_token() {
+        let s = Scanner::new();
+        let blob = b"refresh ghr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa end";
+        let hits = s.scan(blob);
+        assert!(
+            hits.iter()
+                .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "github_pat")),
+            "should catch ghr_ refresh token; got {hits:?}"
+        );
+    }
+
+    #[test]
     fn scanner_catches_aws_access_key() {
         let s = Scanner::new();
         let blob = b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE";
@@ -307,9 +319,9 @@ mod tests {
 
     #[test]
     fn entropy_does_not_flag_short_runs() {
-        // 15-char base64 string under the 20-char min.
+        // 13-char base64-ish string under the 20-char min.
         let s = Scanner::new();
-        let blob = b"short: aB3xQ9zPmK7nR"; // 15 chars after the prefix
+        let blob = b"short: aB3xQ9zPmK7nR"; // 13 chars after the prefix
         let hits = s.scan(blob);
         assert!(
             !hits.iter().any(|h| h.kind == HitKind::HighEntropy),

@@ -12,8 +12,8 @@ pub struct TokenPattern {
 pub const PATTERNS: &[TokenPattern] = &[
     TokenPattern {
         name: "github_pat",
-        regex: r"gh[poshu]_[A-Za-z0-9_]{36,}",
-        description: "GitHub personal-access-token format (ghp_, gho_, ghs_, ghu_, ghp_)",
+        regex: r"gh[posur]_[A-Za-z0-9_]{36,}",
+        description: "GitHub personal-access-token format (ghp_, gho_, ghs_, ghu_, ghr_)",
     },
     TokenPattern {
         name: "aws_access_key_id",
