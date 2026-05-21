@@ -35,11 +35,12 @@ pub const PATTERNS: &[TokenPattern] = &[
         regex: r"(sk|pk)_live_[A-Za-z0-9]{24,}",
         description: "Stripe live secret or publishable key",
     },
-    TokenPattern {
-        name: "gcp_service_account_marker",
-        regex: r#""type"\s*:\s*"service_account""#,
-        description: "GCP service-account JSON marker",
-    },
+    // NOTE: a previous draft included a `gcp_service_account_marker`
+    // pattern matching `"type": "service_account"`. Dropped in PR #70
+    // review as a high-false-positive pattern (matches any docs or
+    // transcripts that discuss GCP service accounts). The real
+    // credential inside a service-account JSON file is the embedded
+    // private key, which the `private_key_pem_header` pattern catches.
     TokenPattern {
         name: "private_key_pem_header",
         regex: r"-----BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----",

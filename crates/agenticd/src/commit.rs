@@ -376,6 +376,50 @@ mod tests {
         );
     }
 
+    // Audit-criterion failure mode for ADR-0013: a CommitInput whose
+    // `prompts` map contains a value with an embedded secret (AWS
+    // access key in this case) must be rejected by the scanner pre-hook
+    // on the `store.put(&Object::Blob(..))` call path, not just on
+    // `put_raw`. Daemon-level integration test — exercises the full
+    // commit::execute orchestration; only phases 3–4 should fire (no
+    // memory, no MCP) and the staging step should error out.
+    #[tokio::test]
+    async fn execute_rejects_commit_whose_prompts_contain_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state(dir.path()).await;
+
+        let mut prompts = std::collections::BTreeMap::new();
+        prompts.insert(
+            "system.md".to_string(),
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE".to_string(),
+        );
+        let input = CommitInput {
+            message: "should be rejected".to_string(),
+            author: Some("tester".to_string()),
+            code_sha: Some("deadbeef".to_string()),
+            branch: Some("main".to_string()),
+            prompts,
+            mcp_servers: Vec::new(),
+            model: Some("anthropic:claude-opus:2026-05-01".to_string()),
+            no_memory: true,
+        };
+
+        let err = execute(state.clone(), input, None)
+            .await
+            .expect_err("commit with a secret in a prompt must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("secret") || msg.contains("SecretDetected"),
+            "error chain should mention SecretDetected; got: {msg}"
+        );
+
+        // No HEAD should have been published on the failure path.
+        assert!(
+            state.refs.read_head().unwrap().is_none(),
+            "HEAD must not be published when staging fails on a secret"
+        );
+    }
+
     // assemble_inputs is a pure function — no I/O, no async. Verifies
     // the wire→core fold preserves all dimensions, defaults author to
     // "unknown" when CommitInput.author is None, encodes prompt

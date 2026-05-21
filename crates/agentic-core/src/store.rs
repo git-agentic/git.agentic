@@ -82,6 +82,22 @@ impl FsObjectStore {
 
 impl ObjectStore for FsObjectStore {
     fn put(&self, object: &Object) -> Result<Hash> {
+        // Scanner pre-hook (ADR-0013). Every user-controlled blob
+        // (prompts, tools, model, intent, plan, transcript, evals) is
+        // staged via `store.put(&Object::Blob(..))`, so the scanner
+        // must run here too — not only in `put_raw`. Trees and Commits
+        // contain hashes + metadata, not user data, so they are
+        // skipped.
+        if let Object::Blob(blob) = object {
+            let hits = self.scanner.scan(&blob.bytes);
+            if !hits.is_empty() {
+                let h = object.hash();
+                if !self.allowlist.contains(&h) {
+                    return Err(Error::SecretDetected { hits });
+                }
+            }
+        }
+
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let path = self.path_for(&hash);
@@ -216,6 +232,43 @@ mod tests {
             .expect("allowlisted blob should put cleanly");
         assert_eq!(hash, h);
         assert!(store.has(&h));
+    }
+
+    #[test]
+    fn put_rejects_blob_object_with_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let bytes = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec();
+        let obj = Object::Blob(Blob::new(bytes.clone()));
+        match store.put(&obj) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected, got {other:?}"),
+        }
+        // Confirm no object was written.
+        let h = Hash::of(&bytes);
+        assert!(!store.has(&h));
+    }
+
+    #[test]
+    fn put_raw_rejects_blob_with_high_entropy_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        // 30 base64-ish chars with high entropy — same shape as the
+        // entropy_detector_catches_high_entropy_run unit test in scanner.rs.
+        let blob = b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+        match store.put_raw(crate::ObjectKind::Blob, blob) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits
+                    .iter()
+                    .any(|h| h.kind == crate::scanner::HitKind::HighEntropy));
+            }
+            other => panic!("expected SecretDetected (HighEntropy), got {other:?}"),
+        }
     }
 
     #[test]

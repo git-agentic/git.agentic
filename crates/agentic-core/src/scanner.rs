@@ -103,10 +103,14 @@ pub struct Scanner {
 impl Scanner {
     pub fn new() -> Self {
         let patterns: Vec<&str> = PATTERNS.iter().map(|p| p.regex).collect();
+        // INVARIANT: PATTERNS contains only string literals that compile as
+        // valid Rust regex. Verified by the per-pattern unit tests below
+        // (scanner_catches_*) which exercise each pattern's compilation.
         let regex_set =
             RegexSet::new(&patterns).expect("PATTERNS must compile (covered by unit tests)");
         let regexes = PATTERNS
             .iter()
+            // INVARIANT: same as above — every PATTERN entry compiles.
             .map(|p| Regex::new(p.regex).expect("PATTERN must compile"))
             .collect();
         let pattern_names = PATTERNS.iter().map(|p| p.name).collect();
@@ -151,13 +155,7 @@ impl Scanner {
         hits
     }
 
-    fn maybe_emit_entropy_hit(
-        &self,
-        bytes: &[u8],
-        start: usize,
-        end: usize,
-        hits: &mut Vec<Hit>,
-    ) {
+    fn maybe_emit_entropy_hit(&self, bytes: &[u8], start: usize, end: usize, hits: &mut Vec<Hit>) {
         let len = end - start;
         if len < MIN_RUN_LENGTH {
             return;
@@ -245,13 +243,42 @@ mod tests {
     }
 
     #[test]
-    fn scanner_catches_gcp_service_account_marker() {
+    fn scanner_catches_openai_key() {
         let s = Scanner::new();
-        let blob = br#"{"type": "service_account", "project_id": "x"}"#;
+        // sk- + 48 chars
+        let blob = b"key: sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let hits = s.scan(blob);
+        assert!(
+            hits.iter()
+                .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "openai_api_key")),
+            "should catch OpenAI key; got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn scanner_catches_stripe_live_key() {
+        let s = Scanner::new();
+        let blob = b"STRIPE_KEY=sk_live_AAAAAAAAAAAAAAAAAAAAAAAA";
         let hits = s.scan(blob);
         assert!(hits
             .iter()
-            .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "gcp_service_account_marker")));
+            .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "stripe_live_key")));
+    }
+
+    #[test]
+    fn scanner_reports_all_hits_in_a_multi_secret_blob() {
+        let s = Scanner::new();
+        let blob = b"first ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa then AKIAIOSFODNN7EXAMPLE";
+        let hits = s.scan(blob);
+        let pat_names: Vec<&str> = hits
+            .iter()
+            .filter_map(|h| match &h.kind {
+                HitKind::Pattern(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(pat_names.contains(&"github_pat"));
+        assert!(pat_names.contains(&"aws_access_key_id"));
     }
 
     #[test]
@@ -319,10 +346,46 @@ mod tests {
 
     #[test]
     fn allowlist_missing_file_yields_empty() {
-        let al = Allowlist::load_from_path(std::path::Path::new(
-            "/nonexistent/scanner-allowlist.toml",
-        ))
-        .unwrap();
+        let al =
+            Allowlist::load_from_path(std::path::Path::new("/nonexistent/scanner-allowlist.toml"))
+                .unwrap();
         assert_eq!(al.len(), 0);
+    }
+
+    #[test]
+    fn allowlist_rejects_malformed_toml() {
+        let bad = "this is not valid TOML [{{}}}}";
+        match Allowlist::from_toml(bad) {
+            Err(AllowlistError::Toml(_)) => {}
+            other => panic!("expected Toml error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_rejects_malformed_blob_hash() {
+        let bad = r#"
+            [[ignore]]
+            blob_hash = "not-a-valid-hash"
+        "#;
+        match Allowlist::from_toml(bad) {
+            Err(AllowlistError::Hash(_)) => {}
+            other => panic!("expected Hash error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_contains_returns_false_for_non_matching_hash() {
+        let h_a = Hash::of(b"blob A");
+        let h_b = Hash::of(b"blob B");
+        let toml_text = format!(
+            r#"
+            [[ignore]]
+            blob_hash = "{}"
+        "#,
+            h_a.to_hex()
+        );
+        let al = Allowlist::from_toml(&toml_text).unwrap();
+        assert!(al.contains(&h_a));
+        assert!(!al.contains(&h_b));
     }
 }
