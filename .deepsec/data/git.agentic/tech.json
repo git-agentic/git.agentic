@@ -1,0 +1,11 @@
+{
+  "tags": [
+    "github-actions",
+    "rust"
+  ],
+  "sentinels": [
+    "Cargo.toml"
+  ],
+  "detectedAt": "2026-05-20T14:24:29.039Z",
+  "rootPath": "/Users/toni/Developer/Codento/git.agentic"
+}
