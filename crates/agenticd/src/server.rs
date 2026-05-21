@@ -10,19 +10,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agentic_core::commit::{stage_and_commit, walk_log, CommitInputs};
+use agentic_core::commit::walk_log;
 use agentic_core::diff as diff_mod;
-use agentic_core::refs::{HeadRef, Refs};
-use agentic_core::{Hash, Object, ObjectKind, ObjectStore};
+use agentic_core::refs::Refs;
+use agentic_core::{Object, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame, write_frame};
-use agentic_proto::{CommitInput, CommitOutput, DiffOutput, Envelope, LogEntry, Request, Response};
+use agentic_proto::{DiffOutput, Envelope, LogEntry, Request, Response};
 use anyhow::{anyhow, Context};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-use crate::mcp::{fingerprint_all, McpServerSpec};
+use crate::mcp::McpServerSpec;
 
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
@@ -173,7 +173,7 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
             // and the next queued waiter wakes up and starts 2PC inside a
             // LocalSet that is about to abort it.
             state.check_shutdown()?;
-            let out = handle_commit(state.as_ref(), input).await?;
+            let out = crate::commit::execute(Arc::clone(&state), input).await?;
             Ok(Response::Commit(out))
         }
 
@@ -316,117 +316,8 @@ fn handle_diff(state: &DaemonState, from: &str, to: &str) -> anyhow::Result<Diff
     })
 }
 
-async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Result<CommitOutput> {
-    let head = state.refs.read_head()?;
-    let branch = input.branch.clone().unwrap_or_else(|| match &head {
-        Some(HeadRef::Branch(b)) => b.clone(),
-        _ => "main".to_string(),
-    });
-
-    // Audit B7: on a first-ever commit (head.is_none()), the old code wrote
-    // `HEAD -> refs/heads/<branch>` HERE — before any staging step. If
-    // staging failed or the process was killed before `stage_and_commit`
-    // returned, HEAD would point at a branch ref that was never published —
-    // a phantom HEAD that the startup reconciler (lifecycle.rs) can't
-    // recover without a commit blob to read the parent from. We now defer
-    // the HEAD write to AFTER stage_and_commit succeeds, so HEAD is only
-    // published once a commit blob exists and the branch ref has been
-    // pointed at it. Tracks whether we need to write HEAD on the success
-    // path below.
-    let needs_head_write = head.is_none();
-
-    let parent: Option<Hash> = state.refs.read_branch(&branch)?;
-
-    // ADR-0002 Decision 3, Step 1: stage memory before any other blob.
-    // We capture a snapshot, persist its manifest as a raw object, and
-    // thread the manifest hash + schema version into the Commit.
-    let (memory_snapshot, schema_version) = if input.no_memory {
-        (None, None)
-    } else if let Some(memory) = state.memory.as_ref().map(Arc::clone) {
-        let adapter = memory.lock_owned().await;
-        let handle = adapter.snapshot().await.context("taking memory snapshot")?;
-        let manifest_bytes = handle.manifest.to_canonical_bytes();
-        let manifest_hash = state
-            .store
-            .put_raw(ObjectKind::Tree, &manifest_bytes)
-            .context("persisting segment manifest")?;
-        (Some(manifest_hash), Some(handle.schema_version))
-    } else {
-        (None, None)
-    };
-
-    // ADR-0002 Decision 3, Step 1 (continued): stage tools. Fingerprint
-    // each configured MCP server in turn, collect the canonical manifest
-    // bytes keyed by server name, and let `stage_and_commit` build the
-    // tools Tree downstream. A per-server failure is surfaced as an
-    // error so the operator sees it; if the call returned partial
-    // success and we silently dropped a server, the resulting tools-tree
-    // hash would be wrong relative to the supposed commit state.
-    let tools = if state.mcp_servers.is_empty() {
-        Default::default()
-    } else {
-        let fingerprints = fingerprint_all(&state.http, &state.mcp_servers).await;
-        let mut tools_map = std::collections::BTreeMap::new();
-        for (spec, result) in state.mcp_servers.iter().zip(fingerprints) {
-            let fp = result.with_context(|| format!("fingerprinting MCP server {}", spec.name))?;
-            tools_map.insert(fp.name, fp.canonical_manifest);
-        }
-        tools_map
-    };
-
-    let prompts = input
-        .prompts
-        .into_iter()
-        .map(|(name, body)| (name, body.into_bytes()))
-        .collect();
-
-    let inputs = CommitInputs {
-        author: input.author.unwrap_or_else(|| "unknown".to_string()),
-        message: input.message,
-        parent,
-        code_sha: input.code_sha,
-        prompts,
-        tools,
-        model: input.model,
-        memory_snapshot,
-        schema_version,
-        intent: None,
-        plan: None,
-        transcript: None,
-        evals: None,
-        cost_cents: 0,
-    };
-
-    let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)?;
-
-    // B7 fix: HEAD is published only after stage_and_commit returns Ok.
-    // By this point the commit blob is in the store and the branch ref
-    // points at it; HEAD can safely chase the symbolic ref and resolve
-    // to a real commit.
-    //
-    // If the HEAD write itself fails (extremely rare — it's one atomic
-    // file rename — but possible under filesystem ENOSPC or permission
-    // change), we deliberately do NOT propagate the error. The commit
-    // is already durable on the branch ref. Failing the response would
-    // tell the client "your commit didn't happen" and a naive retry
-    // would create a duplicate commit on top of the one we just made.
-    // Instead, log loudly: HEAD is operator-recoverable metadata, the
-    // commit history is the source of truth. (Copilot review on PR #50.)
-    if needs_head_write {
-        if let Err(e) = state.refs.write_head_symbolic(&branch) {
-            tracing::error!(
-                error = %e,
-                branch = %branch,
-                commit_hash = %out.commit_hash,
-                "commit succeeded on branch ref but HEAD write failed; \
-                 HEAD remains uninitialised. Operator can fix with: \
-                 `echo 'ref: refs/heads/<branch>' > .agentic/HEAD`"
-            );
-        }
-    }
-
-    Ok(CommitOutput {
-        commit_hash: out.commit_hash.to_hex(),
-        branch: out.branch,
-    })
-}
+// `handle_commit` has been extracted into `crate::commit::execute` —
+// the dispatch arm above calls it directly. See `commit.rs` for the
+// phased orchestration (snapshot_memory → fingerprint_tools →
+// assemble_inputs → stage_and_commit_with_now → publish_head).
+// Audit §A3 / §S2.
