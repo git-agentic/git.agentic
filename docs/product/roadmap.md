@@ -214,3 +214,39 @@ If at the **end of week 12** zero design partners are using the tool weekly in t
 - Authentication, RBAC, audit log. → post-seed.
 
 Everything outside this list is a distraction.
+
+---
+
+## v1.1 — what opens 2026-08-12
+
+Detailed plan in [`docs/product/v1.1-plan.md`](./v1.1-plan.md). Governing ADRs: [ADR-0006](../adr/0006-objectstore-backend-trait.md) (`ObjectStore` backend trait), [ADR-0007](../adr/0007-ephemeral-branches-agent-run-primitive.md) (ephemeral branches as a primitive).
+
+**This is the slice of v1.1 driven by the Code.Storage assessment and the hardening-sprint rollover items.** It is not the full v1.1; broader items (Mem0 / Zep / Letta memory backends, CrewAI / AutoGen / LlamaIndex framework integrations, web UI, hosted SaaS) live behind the same trait/contract surfaces and get their own plans when a design partner pulls.
+
+**The hard scope rule from v1.0 carries over:** nothing in v1.1 is permitted to compromise the broken-prompt demo, and the demo continues to run against `FsObjectStore` with no environment-variable changes from the v1.0 quickstart.
+
+### Three workstreams
+
+| # | Workstream | Governing ADR | Estimated effort | Key gate |
+|---|---|---|---|---|
+| W1.1 | **Storage backend matrix** — `delete` + `list_prefix` + async trait variant; production-readiness validation for GCS; S3 or `ManagedGitStore` adapter (design-partner-driven). | [ADR-0006](../adr/0006-objectstore-backend-trait.md) | 4–5 weeks | Broken-prompt demo continues to pass with `FsObjectStore` default. |
+| W1.2 | **Ephemeral branches as a primitive** — `refs/ephemeral/<namespace>/<id>` ref layout; `agentic promote`, `agentic ephemeral seal\|discard\|retain\|list`; TTL GC; rehome ADR-0005's `executor/<session_id>`. | [ADR-0007](../adr/0007-ephemeral-branches-agent-run-primitive.md) | 3–4 weeks | ADR-0005 Executor integration tests pass post-refactor, no SDK surface change. |
+| W1.3 | **Hardening rollover** — blob-level GC; `agentic init` snapshot-capability hard guard in production mode (ADR-0002 Decision 4 follow-through); v1.1 benchmark suite; doc pass on `executor-sidecar.md`. | (ops / hardening) | 2–3 weeks | v1.0 perf numbers from `snapshot-model.md` §9 must not regress. |
+
+### Timeline shape (12-week budget, same cadence as v1.0)
+
+```
+2026-08-11   v1.0 ships (broken-prompt demo, three design partners)
+2026-08-12   v1.1 opens. No celebratory pause.
+2026-08-25   W1.1.1, W1.1.2, W1.2.1, W1.2.2 done in parallel.
+2026-09-15   W1.2.3–W1.2.6 (promote + ephemeral CLI + Executor rehome). W1.3.1 (blob GC).
+2026-10-06   W1.1.3 (GCS production-readiness). W1.2.7. W1.3.2–W1.3.4.
+2026-10-27   W1.1.4 (S3) OR W1.1.5 (first ManagedGitStore adapter), design-partner-driven.
+2026-11-10   v1.1 ship target.
+```
+
+This is a sizing exercise, not a commitment. The actual schedule will be set after v1.0 ships and real design-partner feedback drives priorities. The Code.Storage assessment is the proximate cause for ADR-0006 and ADR-0007; v1.1 does **not** adopt Code.Storage (or any managed-Git provider) as the substrate — only as one candidate among several behind the `ObjectStore` trait, opt-in, never on the demo path.
+
+### v1.2+ (deferred again, not in this plan)
+
+Mem0 / Zep / Letta adapters, CrewAI / AutoGen / LlamaIndex integrations, web UI / agent-PR review primitive, hosted SaaS, per-hunk attestation, multi-agent commit graphs. These live in the same `Out of scope` discipline this section sits below. They open after v1.1 ships, with separate plans.
