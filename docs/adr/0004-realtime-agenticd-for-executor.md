@@ -9,7 +9,7 @@
 
 ## Context
 
-ADR-0003 Decision 1 commits the the first platform-partner integration as the first non-LangGraph integration target in v1.0.
+ADR-0003 Decision 1 commits the first platform-partner integration as the first non-LangGraph integration target in v1.0.
 ADR-0003 Decision 2 (as revised) commits to **real-time atomic integration** rather than the originally-considered layered/offline manifest-export path.
 This ADR answers the question that revision raises: how does `agenticd` actually attach to a Cloud Run worker that runs one ticket and dies?
 
@@ -59,7 +59,7 @@ Atomic rollback is the contract; silently degrading to manifest-export breaks th
 If the sidecar process dies mid-session, the worker:
 
 1. Receives an IPC error on the next checkpoint write.
-2. Marks the the ticket dispatcher ticket as failed with a structured error pointing at the agentic-side incident (sidecar exit code, last successful checkpoint hash).
+2. Marks the dispatcher ticket as failed with a structured error pointing at the agentic-side incident (sidecar exit code, last successful checkpoint hash).
 3. Exits non-zero. Cloud Run's restart policy applies as for any other worker failure.
 
 This is loud-fail by design.
@@ -91,7 +91,7 @@ Subsequent platform integrations inherit the GCS backend without re-litigation.
 
 **Negative:**
 
-- Two-process Cloud Run packaging (worker + sidecar) is more operational complexity than the Executor would otherwise have. the platform partner's deploy pipeline must absorb that.
+- Two-process Cloud Run packaging (worker + sidecar) is more operational complexity than the Executor would otherwise have. The platform partner's deploy pipeline must absorb that.
 - Per-checkpoint GCS write is a real latency cost. If the Claude Agent SDK fires checkpoints aggressively, per-ticket runtime grows by the cumulative write time.
 - The Coding worker becomes a hard dependency on a sidecar that didn't exist when ADR-0003 was first drafted. Failure modes (sidecar OOM, sidecar crash on flush, partial-checkpoint recovery on instance restart) need explicit testing.
 
@@ -104,4 +104,4 @@ Subsequent platform integrations inherit the GCS backend without re-litigation.
 See also:
 [ADR-0001](0001-architecture-foundations.md) Decisions 9 (CLI-first) and 10 (self-hosted, no SaaS in MVP),
 [ADR-0002](0002-substrate-and-supercommit.md) Decision 6 (storage layer must stay swappable — this ADR exercises that swap),
-[ADR-0003](0003-<partner>-executor-integration.md) Decision 2 (the atomic contract this ADR makes implementable).
+[ADR-0003](0003-claude-agent-sdk-integration.md) Decision 2 (the atomic contract this ADR makes implementable).

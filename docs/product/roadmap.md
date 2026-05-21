@@ -166,7 +166,7 @@ This roadmap is organized around a single criterion: **at the end of each week, 
 
 ## Executor integration workstream (per ADR-0003 and ADR-0004)
 
-ADR-0003 commits the the first platform-partner integration as the first non-LangGraph integration target in v1.0, with **atomic real-time integration via a co-located sidecar `agenticd`** (ADR-0004). This is the largest MVP scope add since the foundational ADRs. The roadmap must absorb it; if it threatens the broken-prompt demo, the documented escape hatch is to revert to the originally-drafted manifest-export shape (ADR-0003 Decision 2's earlier framing).
+ADR-0003 commits the first platform-partner integration as the first non-LangGraph integration target in v1.0, with **atomic real-time integration via a co-located sidecar `agenticd`** (ADR-0004). This is the largest MVP scope add since the foundational ADRs. The roadmap must absorb it; if it threatens the broken-prompt demo, the documented escape hatch is to revert to the originally-drafted manifest-export shape (ADR-0003 Decision 2's earlier framing).
 
 Touch points across the existing weeks:
 

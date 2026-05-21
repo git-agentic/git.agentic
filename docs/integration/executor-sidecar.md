@@ -1,7 +1,7 @@
-# the first platform-partner integration — sidecar `agenticd` integration
+# Platform-partner integration — sidecar `agenticd` integration
 
 **Status:** Draft. Implements [ADR-0004](../adr/0004-realtime-agenticd-for-executor.md).
-**Audience:** the first platform-partner integration / Coding-worker authors wiring `agenticd` into a Cloud Run instance.
+**Audience:** Platform-partner integrators / Coding-worker authors wiring `agenticd` into a Cloud Run instance.
 
 ## Topology
 

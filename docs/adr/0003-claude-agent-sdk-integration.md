@@ -1,4 +1,4 @@
-# ADR-0003: the first platform-partner integration as First Non-LangGraph Integration Target
+# ADR-0003: Claude Agent SDK as First Non-LangGraph Integration Target
 
 **Status:** Accepted
 **Date:** 2026-05-20
@@ -12,8 +12,8 @@ Other frameworks were explicitly deferred to v1.1, "via the same SDK contract."
 
 Three things have changed since that decision was taken.
 
-First, the platform partner's internal **Executor** (sketched in `(internal partner design doc)`) is the most concrete agent-runtime use case we have line-of-sight to.
-It is two Cloud Run services — a dispatcher that polls the dispatcher's MCP for ready tickets, and a Coding worker that runs one ticket per scale-to-zero instance against a sandboxed repo checkout, opens a PR, and posts the result back to the ticket dispatcher through the dispatcher's MCP.
+First, the platform partner's internal coding-execution service (sketched in an internal partner design doc, not in this repo) is the most concrete agent-runtime use case we have line-of-sight to.
+It is two Cloud Run services — a dispatcher that polls the ticket dispatcher's MCP for ready tickets, and a Coding worker that runs one ticket per scale-to-zero instance against a sandboxed repo checkout, opens a PR, and posts the result back through the same MCP.
 
 Second, the Executor's primary harness is the **Claude Agent SDK**, not LangGraph.
 The reasoning in `EXECUTOR.md` §4 is explicit and well-argued: only the Claude Agent SDK gives both benchmark-quality harness behavior and the programmatic surface (per-ticket MCP wiring, streamed tool/result events, checkpoint/resume, per-run model swap) the orchestration needs.
@@ -32,10 +32,10 @@ The Executor is the first piece of evidence that stateful coding-agent teams are
 
 ## Decision
 
-### Decision 1 — the first platform-partner integration is the first non-LangGraph integration target, in v1.0
+### Decision 1 — The Claude Agent SDK is the first non-LangGraph integration target, in v1.0
 
 ADR-0001 Decision 7 is amended.
-MVP framework support is now **LangGraph plus the Claude Agent SDK (via the the first platform-partner integration)**.
+MVP framework support is now **LangGraph plus the Claude Agent SDK (via the first platform-partner integration)**.
 All other frameworks remain deferred to v1.1 via the same SDK contract.
 
 This is a deliberate scope add to the 12-week MVP. The cost is justified because:
@@ -97,7 +97,7 @@ The Agent-SDK manifest path is comparatively shallow — it is essentially a str
 
 - The "framework-neutral SDK contract" claim from ADR-0001 Decision 7 gets tested against a second framework before v1.0 ships, not after. If the contract is wrong, we discover it on a friendly first integrator.
 - The Executor integration reaches **parity with the LangGraph integration on atomic rollback**. The platform-led story is the full product, not a degraded subset.
-- the platform partner has a concrete first-party integration to point at when talking to the next platform partner — one that demonstrates atomic, not one with a caveat.
+- The platform partner has a concrete first-party integration to point at when talking to the next platform partner — one that demonstrates atomic, not one with a caveat.
 - The Executor's harness × model matrix becomes a real-world stress test of `agentic diff` and `agentic rollback` against runs we did not architect for.
 - The GCS-backed `ObjectStore` implementation (ADR-0004 Decision 5), originally anticipated as v2+ under ADR-0002 Decision 6, lands in v1.0 as a side-effect. Subsequent platform integrations inherit it without re-litigation.
 - Resolves the in-repo strategic-tension flag (LangGraph-team MVP vs. platform-led GTM) constructively: the demo discipline runs on LangGraph; the platform-style integration runs on the Claude Agent SDK with the same product surface; both through the same SDK contract.
@@ -119,4 +119,4 @@ See also:
 [ADR-0001](0001-architecture-foundations.md) (amended Decision 7),
 [ADR-0002](0002-substrate-and-supercommit.md) (the Commit object as platform API contract, and Decision 6's swappable storage layer exercised by ADR-0004 Decision 5),
 [ADR-0004](0004-realtime-agenticd-for-executor.md) (the sidecar topology that makes Decision 2 implementable),
-and `(internal partner design doc)` (the platform-partner integration design sketch this ADR responds to).
+and the internal partner design sketch this ADR responds to (not in this repo).
