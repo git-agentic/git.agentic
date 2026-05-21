@@ -228,7 +228,7 @@ for server in servers { fs.push(fingerprint_one(server, sem.clone())); }
 let prints: Vec<_> = fs.try_collect().await?;
 ```
 
-<a name="a8"></a>**A8 — Reverse-migration outer transaction + memory-restore guard fix + wire `accept_data_loss`**
+<a name="a8"></a>**A8 — Reverse-migration outer transaction + memory-restore guard fix + wire `accept_data_loss`** — **DONE 2026-05-21** (issue [#37](https://github.com/git-agentic/git.agentic/issues/37), branch `fix/a8-reverse-migration-tx-and-restore-guard`).
 *Addresses:* [B8](#b8), [B9](#b9), [B10](#b10), [R4](#r4), [R5](#r5). *Principle:* SRP. *Effort:* S. *Must ship pre-v1.0.*
 
 ```rust
@@ -239,6 +239,14 @@ pub async fn run_reverse(conn:&mut PgConnection, migs:&[Migration]) -> Result<()
 }
 fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 ```
+
+**Shipped shape** (see [docs/plans/a8-reverse-migration/](../plans/a8-reverse-migration/) for the full plan and rejected alternatives):
+
+- **B8** atomicity threads a single `sqlx::Transaction` through `PostgresAdapter::begin_reverse_tx()` + `apply_down_migration_tx(tx, name, sql)`. The audit pseudocode above as written would NOT have delivered atomicity — `apply_down_migration` opened its own `self.pool.begin()` (a separate Postgres session). Caught by junior-developer in planning Round 1 ([J1](../plans/a8-reverse-migration/artifacts/implementation-iteration-history.md#r1)).
+- **B9** is fixed by **rejecting** Commits with `memory_snapshot=Some, schema_version=None` at validation time, not by attempting to restore. Rationale: server-side commit production always yields both `Some` together or both `None` together, so the mixed shape is unreachable in v1.0; loud rejection resolves "silent skip" without changing the `MemoryAdapter` trait contract. User-decided ([D-1](../plans/a8-reverse-migration/artifacts/implementation-decision-log.md#d-1-q2-resolution--memory_snapshotsome-schema_versionnone-commits-are-rejected-as-malformed)) after specialist escalation.
+- **B10** wires `accept_data_loss` through `load_steps` → `check_irreversible`. When `true`, IRREVERSIBLE-marked down.sql is loaded and executed; the v1.1 bounded-rollback path (ADR-0002 D5) stays unimplemented and `--accept-data-loss` does NOT trigger it.
+
+**Tests landed:** AC3a/AC3b unit tests in `crates/agenticd/src/migrate.rs`; AC1 + AC3c integration tests + happy-path regression in `crates/agenticd/tests/reverse_migration.rs` (real Postgres, gated by `#[ignore]`); AC2 unit tests in `crates/agenticd/src/rollback.rs`. Full workspace `cargo test` + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check` green.
 
 <a name="a9"></a>**A9 — Defer: `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — blocked by ADR-0005; single backend today (Rule-of-Three fails).
 
@@ -278,7 +286,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 |---|---|---|---|---|
 | A1 | Quiesce trigger poller during memory restore | (TBD) | `must-fix-v1.0` | `v1.0` |
 | A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | (TBD) | `must-fix-v1.0` | `v1.0` |
-| A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | (TBD) | `must-fix-v1.0` | `v1.0` |
+| A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | (TBD) | `hardening-sprint` | — |
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | (TBD) | `hardening-sprint` | — |
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | (TBD) | `hardening-sprint` | — |
