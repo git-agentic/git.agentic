@@ -98,6 +98,22 @@ impl DaemonState {
             .context("building HTTP client")?;
 
         if !mcp_servers.is_empty() {
+            // Reject duplicate MCP server names at startup. The commit-time
+            // tools tree is keyed by `spec.name`; a duplicate would silently
+            // overwrite on `BTreeMap::insert`, producing a tools-tree hash
+            // that doesn't match the configured server set. Loud refusal at
+            // startup beats silent corruption per commit.
+            let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            for spec in &mcp_servers {
+                if !seen.insert(spec.name.as_str()) {
+                    return Err(anyhow::anyhow!(
+                        "duplicate MCP server name {:?} in --mcp spec; \
+                         each configured server must have a unique name \
+                         (the tools tree is keyed by it)",
+                        spec.name
+                    ));
+                }
+            }
             tracing::info!(count = mcp_servers.len(), "MCP fingerprinting attached");
         }
 

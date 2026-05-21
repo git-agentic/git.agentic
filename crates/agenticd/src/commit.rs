@@ -164,15 +164,31 @@ async fn snapshot_memory(
 /// manifest bytes keyed by server name. A per-server failure is
 /// propagated — partial success would corrupt the tools-tree hash
 /// relative to the supposed commit state.
+///
+/// The map is keyed by the *configured* `spec.name`, not by
+/// `fp.name`. Today these are equal because `fingerprint_one`
+/// carries `spec.name` verbatim into `McpFingerprint.name`, but
+/// keying on `spec.name` here makes the layering explicit: the
+/// commit-tree key is what the operator configured, regardless of
+/// what the server declares about itself. Duplicate `spec.name`
+/// would silently overwrite at insert time — `DaemonState::open`
+/// rejects duplicates at startup so this can't happen at runtime.
 async fn fingerprint_tools(state: &Arc<DaemonState>) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     if state.mcp_servers.is_empty() {
         return Ok(BTreeMap::new());
     }
     let fingerprints = fingerprint_all(&state.http, &state.mcp_servers).await;
+    anyhow::ensure!(
+        fingerprints.len() == state.mcp_servers.len(),
+        "fingerprint_all returned {} result(s) for {} configured MCP server(s); \
+         a non-1:1 contract would silently misattribute fingerprints",
+        fingerprints.len(),
+        state.mcp_servers.len()
+    );
     let mut tools_map = BTreeMap::new();
     for (spec, result) in state.mcp_servers.iter().zip(fingerprints) {
         let fp = result.with_context(|| format!("fingerprinting MCP server {}", spec.name))?;
-        tools_map.insert(fp.name, fp.canonical_manifest);
+        tools_map.insert(spec.name.clone(), fp.canonical_manifest);
     }
     Ok(tools_map)
 }
@@ -564,12 +580,14 @@ mod tests {
                 "id": 1,
                 "result": {"tools": []}
             })))
+            .expect(1)
             .mount(&ok_srv)
             .await;
         let fail_srv = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .expect(1)
             .mount(&fail_srv)
             .await;
 
@@ -592,22 +610,26 @@ mod tests {
             .await
             .expect_err("a 500 from one MCP server must fail the whole phase");
         let chain = format!("{err:#}");
+        // Match the exact prefix produced by fingerprint_one's HTTP-error
+        // path so an unrelated reqwest/tokio error message containing the
+        // English word "failing" cannot satisfy this assertion.
         assert!(
-            chain.contains("failing"),
-            "error chain must name the failing server; got: {chain}"
+            chain.contains("MCP server failing"),
+            "error chain must name the failing server via the \
+             'MCP server <name>' prefix; got: {chain}"
         );
     }
 
-    // Issue #53 (2/2): the tools map must be keyed by configured server
-    // name and each key must point at the canonical bytes returned by
-    // *that server's* URL. Today this holds because `fingerprint_all`
-    // preserves input order and `fingerprint_one` carries `spec.name`
-    // verbatim into `McpFingerprint.name`. A future refactor that
-    // reorders or de-correlates either of those would misattribute
-    // fingerprints; this test catches that by giving each mock server a
-    // payload that mentions its own name.
+    // Issue #53 (2/2): each key in the tools map must point at the
+    // canonical bytes returned by *that server's* URL. The map is keyed
+    // by `spec.name`; the test gives each mock server a payload that
+    // mentions its own URL identity, then asserts each configured name
+    // resolves to the correct server's bytes (and *not* the other
+    // server's). Catches a future regression where `fingerprint_all`
+    // reorders results, the call site stops using `spec.name`, or the
+    // index-zip drifts.
     #[tokio::test]
-    async fn fingerprint_tools_keys_by_server_name_in_order() {
+    async fn fingerprint_tools_attributes_payload_to_its_server() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let dir = tempfile::tempdir().unwrap();
@@ -620,6 +642,7 @@ mod tests {
                 "id": 1,
                 "result": {"tools": [{"name": "from-srv-a"}]}
             })))
+            .expect(1)
             .mount(&srv_a)
             .await;
         let srv_b = MockServer::start().await;
@@ -630,6 +653,7 @@ mod tests {
                 "id": 1,
                 "result": {"tools": [{"name": "from-srv-b"}]}
             })))
+            .expect(1)
             .mount(&srv_b)
             .await;
 
@@ -673,6 +697,51 @@ mod tests {
         assert!(
             !bravo_str.contains("from-srv-a"),
             "bravo must not be attributed srv_a's payload"
+        );
+    }
+
+    // Issue #53 / PR #72 re-review: `tools_map.insert(spec.name, ...)`
+    // would silently overwrite on duplicate keys, producing a one-entry
+    // tools tree committed as if complete. The fix lives at startup —
+    // `DaemonState::open` refuses to construct a state with duplicate
+    // MCP server names. This test pins that loud-refusal contract so a
+    // future change to the validation can't quietly delete it.
+    #[tokio::test]
+    async fn daemon_state_refuses_duplicate_mcp_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        // `DaemonState` does not impl `Debug` (it holds an `Arc<dyn ObjectStore>`),
+        // so we can't use `.expect_err` here.
+        let result = DaemonState::open(
+            dir.path().to_path_buf(),
+            agentic_dir,
+            store,
+            None,
+            Vec::new(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "dupe".to_string(),
+                    url: "http://example.invalid/a".to_string(),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "dupe".to_string(),
+                    url: "http://example.invalid/b".to_string(),
+                },
+            ],
+            Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("duplicate MCP server name must be refused at startup"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("duplicate MCP server name") && chain.contains("dupe"),
+            "error must name the duplicate; got: {chain}"
         );
     }
 
