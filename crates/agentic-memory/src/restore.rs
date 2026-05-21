@@ -28,13 +28,47 @@ use sqlx::{Arguments, Executor, PgPool, Postgres};
 
 use crate::postgres::TrackedTable;
 use crate::segment::{Segment, SegmentManifest};
+use crate::triggers::QuiesceToken;
 use crate::{Error, Result};
 
+/// Proof that the trigger poller is paused for the duration of a restore.
+///
+/// Created by [`crate::postgres::PostgresAdapter::begin_restore`] and
+/// threaded into [`restore_manifest`]. While alive, no row written to
+/// `agentic_change_log` is forwarded to the streamer; dropping the guard
+/// releases the poller. See audit
+/// [§A1](../../../../docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1)
+/// and the planning notes in
+/// [`docs/plans/`](../../../../docs/plans/) for the design rationale.
+pub struct RestoreGuard {
+    /// Held for the lifetime of the guard; drop releases the poller pause.
+    #[allow(dead_code)]
+    token: QuiesceToken,
+}
+
+impl RestoreGuard {
+    pub(crate) fn new(token: QuiesceToken) -> Self {
+        Self { token }
+    }
+}
+
 /// Restore the database state captured by `manifest` into `pool`.
+///
+/// The caller MUST hold a [`RestoreGuard`] (obtained from
+/// [`crate::postgres::PostgresAdapter::begin_restore`]) for the duration of
+/// this call. The guard proves the trigger poller is paused, which is
+/// load-bearing for correctness: this function rewrites table state via
+/// TRUNCATE + INSERT, both of which fire user triggers and populate
+/// `agentic_change_log`. If the poller drained those entries to the
+/// streamer the post-restore snapshot would diverge from actual table
+/// state. We TRUNCATE `agentic_change_log` inside the restore transaction
+/// to drop both pre-existing entries (which referred to pre-restore table
+/// state) and entries from this restore's own INSERTs.
 ///
 /// `tables` bounds which tables we touch even if the manifest happens to
 /// reference others. `store` resolves segment hashes to canonical bytes.
 pub async fn restore_manifest<S: ObjectStore + ?Sized>(
+    _guard: &RestoreGuard,
     pool: &PgPool,
     store: &S,
     manifest: &SegmentManifest,
@@ -77,6 +111,17 @@ pub async fn restore_manifest<S: ObjectStore + ?Sized>(
             }
         }
     }
+
+    // Wipe agentic_change_log inside the same transaction. This drops:
+    //   1. Pre-existing entries written before begin_restore() — they
+    //      referred to pre-restore table state the TRUNCATE above wiped.
+    //   2. Entries written by this restore's own INSERTs above — they
+    //      describe the manifest, not a real user write; the streamer
+    //      must not see them or the next snapshot doubles the restored
+    //      state.
+    // The caller's RestoreGuard ensures the poller is paused throughout;
+    // it will see an empty change_log when it resumes after the commit.
+    tx.execute("TRUNCATE public.agentic_change_log").await?;
 
     tx.commit().await?;
     Ok(())

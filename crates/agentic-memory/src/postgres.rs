@@ -23,9 +23,10 @@ use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
 use crate::adapter::{MemoryAdapter, SnapshotHandle};
+use crate::restore::RestoreGuard;
 use crate::segment::{Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::streamer::{self, StreamerHandle};
-use crate::triggers;
+use crate::triggers::{self, Quiesceable};
 use crate::{Error, Result};
 
 /// Postgres `pg_advisory_lock` key for the snapshot-coordination lock.
@@ -54,6 +55,11 @@ pub struct PgConfig {
     pub segment_target_bytes: usize,
     /// Logical replication slot name. One per repo.
     pub replication_slot: String,
+    /// How often the trigger poller wakes up to drain `agentic_change_log`.
+    /// Defaults to [`triggers::DEFAULT_POLL_INTERVAL`] (100 ms). Tests can
+    /// extend this to prevent the poller from draining writes between
+    /// setup steps.
+    pub poll_interval: std::time::Duration,
 }
 
 impl PgConfig {
@@ -63,6 +69,7 @@ impl PgConfig {
             tables,
             segment_target_bytes: DEFAULT_SEGMENT_TARGET_BYTES,
             replication_slot: "agentic_slot".into(),
+            poll_interval: triggers::DEFAULT_POLL_INTERVAL,
         }
     }
 }
@@ -78,12 +85,14 @@ pub struct PostgresAdapter {
     /// Streamer handle. Set after `init()`; `snapshot()` goes through
     /// `streamer.take_snapshot` to produce O(delta)-sized manifests.
     streamer: Option<StreamerHandle>,
-    /// Streamer + poller tasks. Held so they stay alive for the
-    /// adapter's lifetime; dropped when the adapter is dropped.
+    /// Streamer task handle. Held so it stays alive for the adapter's
+    /// lifetime; dropped when the adapter is dropped.
     #[allow(dead_code)]
     streamer_join: Option<JoinHandle<()>>,
-    #[allow(dead_code)]
-    poller_join: Option<JoinHandle<()>>,
+    /// Trigger-poller handle. Exposes [`triggers::Quiesceable`] so the
+    /// rollback path can pause draining for the duration of a restore.
+    /// Held for the adapter's lifetime.
+    poller_handle: Option<triggers::PollerHandle>,
 }
 
 impl PostgresAdapter {
@@ -96,7 +105,7 @@ impl PostgresAdapter {
             logical_decoding_available: false,
             streamer: None,
             streamer_join: None,
-            poller_join: None,
+            poller_handle: None,
         })
     }
 
@@ -322,16 +331,16 @@ impl MemoryAdapter for PostgresAdapter {
         );
         handle.seed_sealed(baseline.entries).await?;
 
-        let poller_join = triggers::spawn_poller(
+        let poller_handle = triggers::spawn_poller(
             self.pool.clone(),
             handle.clone(),
-            triggers::DEFAULT_POLL_INTERVAL,
+            self.cfg.poll_interval,
             self.cfg.tables.clone(),
         );
 
         self.streamer = Some(handle);
         self.streamer_join = Some(streamer_join);
-        self.poller_join = Some(poller_join);
+        self.poller_handle = Some(poller_handle);
         Ok(())
     }
 
@@ -406,25 +415,13 @@ impl MemoryAdapter for PostgresAdapter {
     }
 
     async fn restore(&self, target: &SnapshotHandle) -> Result<()> {
-        // Schema-version gate: the migration runner lands in a follow-up.
-        // For Chunk C-part-2 we fail loudly if schema versions diverge,
-        // matching ADR-0002 Decision 5's "destructive migration"
-        // honesty — the operator must hand-write the reverse before
-        // rollback can proceed.
-        let live = self.current_schema_version_inner().await?;
-        if live != target.schema_version {
-            return Err(Error::SchemaMismatch {
-                live,
-                target: target.schema_version.clone(),
-            });
-        }
-        crate::restore::restore_manifest(
-            &self.pool,
-            self.store.as_ref(),
-            &target.manifest,
-            &self.cfg.tables,
-        )
-        .await
+        // The trait method is the convenience entry-point: it pauses the
+        // trigger poller via `begin_restore`, then delegates to the
+        // guard-taking method. Callers that need to make the quiesce
+        // window explicit (e.g. `agenticd`'s rollback path) call
+        // `begin_restore` + `restore_with_guard` directly.
+        let guard = self.begin_restore().await?;
+        self.restore_with_guard(&guard, target).await
     }
 
     async fn current_schema_version(&self) -> Result<String> {
@@ -433,6 +430,54 @@ impl MemoryAdapter for PostgresAdapter {
 }
 
 impl PostgresAdapter {
+    /// Begin a restore window. Returns a [`RestoreGuard`] whose presence
+    /// proves the trigger poller is paused; the poller resumes when the
+    /// guard is dropped.
+    ///
+    /// Audit anchor:
+    /// [§A1](../../../../docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1).
+    /// Errors if the adapter has not been initialised (no poller running).
+    pub async fn begin_restore(&self) -> Result<RestoreGuard> {
+        let poller = self.poller_handle.as_ref().ok_or_else(|| {
+            Error::Backend(
+                "begin_restore called before init() — no trigger poller is running".into(),
+            )
+        })?;
+        let token = poller.pause().await;
+        Ok(RestoreGuard::new(token))
+    }
+
+    /// Restore the snapshot into the user's database while holding a
+    /// [`RestoreGuard`]. The schema-version gate fires first, then the
+    /// manifest replay runs inside a transaction that also wipes
+    /// `agentic_change_log` (see [`crate::restore::restore_manifest`]).
+    ///
+    /// Callers in a rollback path use this method directly so the quiesce
+    /// window is visible at the call site; other callers can use the
+    /// [`MemoryAdapter::restore`] trait method, which wraps `begin_restore`
+    /// + `restore_with_guard` for convenience.
+    pub async fn restore_with_guard(
+        &self,
+        guard: &RestoreGuard,
+        target: &SnapshotHandle,
+    ) -> Result<()> {
+        let live = self.current_schema_version_inner().await?;
+        if live != target.schema_version {
+            return Err(Error::SchemaMismatch {
+                live,
+                target: target.schema_version.clone(),
+            });
+        }
+        crate::restore::restore_manifest(
+            guard,
+            &self.pool,
+            self.store.as_ref(),
+            &target.manifest,
+            &self.cfg.tables,
+        )
+        .await
+    }
+
     /// Return migration names applied after `target_name`, ordered from
     /// most-recent to least-recent (i.e. the order they must be reversed).
     ///
