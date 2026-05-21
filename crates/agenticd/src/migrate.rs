@@ -101,12 +101,15 @@ pub fn load_steps(
     Ok(steps)
 }
 
-/// Execute `steps` against the live database, in order.
+/// Execute `steps` against the live database, in order, as one atomic
+/// Postgres transaction.
 ///
-/// Each step runs its SQL and removes the migration record from
-/// `agentic_migrations` in a single transaction (see
-/// `PostgresAdapter::apply_down_migration`). On any error the function
-/// returns immediately; steps already completed are not rolled back.
+/// All steps run on the same connection — `PostgresAdapter::begin_reverse_tx`
+/// opens the outer transaction and each step is executed via
+/// `apply_down_migration_tx`. On any error the outer transaction is dropped
+/// without committing and every step rolls back: the schema and the
+/// `agentic_migrations` bookkeeping return to the pre-call state. Only after
+/// the loop completes successfully is the outer transaction committed.
 ///
 /// The caller must hold a lock on the `PostgresAdapter` for the duration of
 /// this call. Do not hold the lock while calling `load_steps` — that function
@@ -115,13 +118,23 @@ pub async fn run_reverse(
     adapter: &PostgresAdapter,
     steps: Vec<MigrationStep>,
 ) -> anyhow::Result<()> {
-    for step in steps {
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let mut tx = adapter
+        .begin_reverse_tx()
+        .await
+        .context("opening outer transaction for reverse-migration sequence")?;
+    for step in &steps {
         adapter
-            .apply_down_migration(&step.name, &step.sql)
+            .apply_down_migration_tx(&mut tx, &step.name, &step.sql)
             .await
             .with_context(|| format!("applying reverse migration {:?}", step.name))?;
-        tracing::info!(migration = %step.name, "reverse migration applied");
+        tracing::info!(migration = %step.name, "reverse migration applied (in outer tx)");
     }
+    tx.commit()
+        .await
+        .context("committing reverse-migration sequence")?;
     Ok(())
 }
 
@@ -205,24 +218,17 @@ mod tests {
 
     #[test]
     fn irreversible_rejects_marker_with_suffix() {
-        let err = check_irreversible(
-            "003_x",
-            "-- IRREVERSIBLE: column data was discarded",
-            false,
-        )
-        .unwrap_err();
+        let err = check_irreversible("003_x", "-- IRREVERSIBLE: column data was discarded", false)
+            .unwrap_err();
         assert!(err.to_string().contains("IRREVERSIBLE"), "{err}");
     }
 
     // AC3a — accept_data_loss=true bypasses the IRREVERSIBLE check
     #[test]
     fn irreversible_bypassed_when_accept_data_loss_true() {
-        assert!(check_irreversible(
-            "002_drop_data",
-            "-- IRREVERSIBLE\nDROP TABLE data;",
-            true
-        )
-        .is_ok());
+        assert!(
+            check_irreversible("002_drop_data", "-- IRREVERSIBLE\nDROP TABLE data;", true).is_ok()
+        );
         assert!(check_irreversible(
             "003_x",
             "-- IRREVERSIBLE: column data was discarded\nUPDATE t SET c = NULL;",
