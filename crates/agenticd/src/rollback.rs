@@ -113,8 +113,14 @@ pub async fn execute(
                 "reverse schema migrations: {live_schema} → {target_schema}"
             ));
             // Phase 2: synchronous filesystem I/O — no lock held.
-            let steps = migrate::load_steps(state.refs.agentic_dir(), &migration_names)
-                .context("loading reverse migration files")?;
+            // `accept_data_loss` is forwarded here so `check_irreversible` can
+            // honor the operator's opt-in for IRREVERSIBLE-marked migrations.
+            let steps = migrate::load_steps(
+                state.refs.agentic_dir(),
+                &migration_names,
+                args.accept_data_loss,
+            )
+            .context("loading reverse migration files")?;
 
             // Phase 3: execute migrations — re-acquire lock.
             if !args.dry_run {
@@ -213,8 +219,6 @@ pub async fn execute(
         evals: None,
         cost_cents: 0,
     };
-    let _ = args.accept_data_loss; // reserved for the migration runner
-
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)
         .context("forward-recording rollback commit")?;
     plan.push(format!(
