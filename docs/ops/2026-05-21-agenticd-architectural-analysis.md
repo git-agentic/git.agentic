@@ -311,14 +311,41 @@ impl ObjectStore for GcsObjectStore {
 *Addresses:* [B6](#b6), [B13](#b13), [B14](#b14), [R7](#r7). *Principle:* ISP + LSP. *Effort:* S after wire-shape decision.
 **Wire-protocol shape decision deferred to ADR-0010** — needs ADR for backward compat across SDK/CLI/daemon versions.
 
-<a name="a7"></a>**A7 — Parallelise MCP fingerprinting with `FuturesUnordered` + semaphore**
+<a name="a7"></a>**A7 — Parallelise MCP fingerprinting** — **DONE 2026-05-21** (issue [#42](https://github.com/git-agentic/git.agentic/issues/42)).
 *Addresses:* [B1](#b1), [C3](#c3), [R9](#r9). *Effort:* S.
+
+**Originally proposed** (`FuturesUnordered` + explicit semaphore):
 
 ```rust
 let mut fs = FuturesUnordered::new();
 for server in servers { fs.push(fingerprint_one(server, sem.clone())); }
 let prints: Vec<_> = fs.try_collect().await?;
 ```
+
+**Shipped shape** — `futures::stream::iter(...).buffered(N)`:
+
+```rust
+const FINGERPRINT_CONCURRENCY: usize = 8;
+
+pub async fn fingerprint_all(
+    client: &reqwest::Client,
+    servers: &[McpServerSpec],
+) -> Vec<Result<McpFingerprint, anyhow::Error>> {
+    stream::iter(servers.iter().map(|spec| fingerprint_one(client, spec)))
+        .buffered(FINGERPRINT_CONCURRENCY)
+        .collect()
+        .await
+}
+```
+
+**Why `buffered` not `FuturesUnordered`:** `buffered` preserves input order, which `commit::fingerprint_tools`'s `zip(state.mcp_servers.iter(), fingerprints)` depends on for correct per-server error attribution. `FuturesUnordered` yields completion order, which would silently misattribute the wrapped `with_context(|| format!("fingerprinting MCP server {}", spec.name))` to the wrong server. Concurrency is bounded by the `buffered(N)` capacity — no separate `Semaphore` needed. Per-server return shape (`Vec<Result<..., anyhow::Error>>`) and the 10s per-server `fingerprint_one` timeout are unchanged.
+
+**Tests landed** (`crates/agenticd/src/mcp.rs#tests`):
+
+- `fingerprint_all_runs_servers_in_parallel` — AC for §A7. Spawns 3 hand-rolled `tokio::net::TcpListener` fakes, each sleeping 1s before replying. Sequential would have taken ≥ 3s; the test asserts total wall time < 2.5s. (Audit pseudocode said 5s × 3 / ≤ 6s; reduced to 1s × 3 / ≤ 2.5s to keep CI fast while preserving the parallel-vs-serial signal — documented in the test comment.)
+- `fingerprint_all_preserves_input_order` — guards against future drift to `buffer_unordered`. Slow-then-fast server pair; asserts `results[0].name == "slow"` regardless of completion order.
+
+A proper `wiremock`-backed test fixture for the broader MCP test gaps (per-server error propagation, payload-keyed-by-name) is filed separately as [issue #53](https://github.com/git-agentic/git.agentic/issues/53). The dep-free TCP-listener fixture used here covers the two A7-specific behaviours (parallelism + ordering) without pulling in the broader infrastructure.
 
 <a name="a8"></a>**A8 — Reverse-migration outer transaction + memory-restore guard fix + wire `accept_data_loss`** — **DONE 2026-05-21** (issue [#37](https://github.com/git-agentic/git.agentic/issues/37), branch `fix/a8-reverse-migration-tx-and-restore-guard`).
 *Addresses:* [B8](#b8), [B9](#b9), [B10](#b10), [R4](#r4), [R5](#r5). *Principle:* SRP. *Effort:* S. *Must ship pre-v1.0.*
@@ -383,7 +410,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | [#39](https://github.com/git-agentic/git.agentic/issues/39) **DONE** | `hardening-sprint` | — |
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | (TBD) | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope (blocked by ADR-0010) | (TBD) | `hardening-sprint` | — |
-| A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | (TBD) | `hardening-sprint` | — |
+| A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | (TBD) | `v1.1` | — |
 | A11 | `Diff` atomicity (blocked by ADR-0007) | (TBD) | `v1.1` | — |
