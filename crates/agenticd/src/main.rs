@@ -3,12 +3,6 @@
 //! Long-lived Rust process. Listens on a Unix domain socket for SDK and
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
-mod mcp;
-mod migrate;
-mod objstore;
-mod rollback;
-mod server;
-
 use agentic_memory::postgres::TrackedTable;
 use anyhow::{anyhow, Context};
 use clap::Parser;
@@ -16,9 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 
-use crate::mcp::parse_mcp_spec;
-use crate::objstore::ObjectStoreSpec;
-use crate::server::{handle_connection, DaemonState};
+use agenticd::mcp::parse_mcp_spec;
+use agenticd::objstore::ObjectStoreSpec;
+use agenticd::server::{handle_connection, DaemonState};
 
 fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
     spec.iter()
