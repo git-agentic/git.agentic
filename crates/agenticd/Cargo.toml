@@ -25,8 +25,8 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile = "3.10"
 sqlx.workspace = true
-chrono.workspace = true
