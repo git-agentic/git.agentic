@@ -84,8 +84,30 @@ pub async fn execute_with_now(
     let inputs = assemble_inputs(input, parent, memory_snapshot, schema_version, tools);
 
     // -- Phase 4: stage + commit + ref update (agentic-core) ------------
-    let out = stage_and_commit_with_now(state.store.as_ref(), &state.refs, &branch, inputs, now)
-        .with_context(|| format!("2PC staging on branch {branch:?}"))?;
+    //
+    // `stage_and_commit_with_now` is fully synchronous and, under
+    // GcsObjectStore, blocks the calling thread on every put/put_raw.
+    // Wrap the whole 2PC sequence in spawn_blocking so the LocalSet
+    // thread stays free for other connections during the staging
+    // window. The closure owns its captures (Arc<DaemonState> clone,
+    // CommitInputs, branch name) so it can be `Send + 'static`.
+    // Audit §A5 / B2 / C1 / R3.
+    let out = {
+        let state_for_staging = Arc::clone(&state);
+        let branch_owned = branch.clone();
+        tokio::task::spawn_blocking(move || {
+            stage_and_commit_with_now(
+                state_for_staging.store.as_ref(),
+                &state_for_staging.refs,
+                &branch_owned,
+                inputs,
+                now,
+            )
+        })
+        .await
+        .with_context(|| format!("spawn_blocking join error during 2PC on branch {branch:?}"))?
+        .with_context(|| format!("2PC staging on branch {branch:?}"))?
+    };
 
     // -- Phase 5: publish HEAD on first commit --------------------------
     publish_head(&state, &branch, &out.commit_hash, needs_head_write);
@@ -115,10 +137,13 @@ async fn snapshot_memory(
     let adapter = memory.lock_owned().await;
     let handle = adapter.snapshot().await.context("taking memory snapshot")?;
     let manifest_bytes = handle.manifest.to_canonical_bytes();
-    let manifest_hash = state
-        .store
-        .put_raw(ObjectKind::Tree, &manifest_bytes)
-        .context("persisting segment manifest")?;
+    // Wrap the put_raw in spawn_blocking — under GcsObjectStore this is
+    // a blocking HTTP PUT that would otherwise freeze the LocalSet
+    // thread. Audit §A5 / B3 / R3.
+    let manifest_hash =
+        crate::store_async::put_raw(Arc::clone(&state.store), ObjectKind::Tree, manifest_bytes)
+            .await
+            .context("persisting segment manifest")?;
     Ok((Some(manifest_hash), Some(handle.schema_version)))
 }
 
