@@ -263,7 +263,7 @@ None unresolved. Specialist handoff requests from R1:
 
 ## Deferred (YAGNI)
 
-Each item deferred under the rule at `(internal YAGNI rule)`. Source: test-engineer R1 ledger + project-manager synthesis sweep.
+Each item deferred under (internal YAGNI rule). Source: test-engineer R1 ledger + project-manager synthesis sweep.
 
 | Item | Failure | Resolution | Source |
 |---|---|---|---|
