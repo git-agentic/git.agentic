@@ -1,7 +1,8 @@
 # ADR-0013: Secret Scanner as a `put_raw` Pre-Hook
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-21
+**Amended:** 2026-05-21 (Decision 4: allowlist scope is BLAKE3, not SHA-256 — matches the merged PR-3 implementation, which reuses `agentic-core::Hash` for system consistency and avoids a `sha2` dependency)
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-009 (the secret scanner advertised in `CLAUDE.md` / `AGENTS.md` / `docs/architecture/overview.md` / `docs/product/competitive-brief-entire.md` is not implemented in code today).
 **Relates to:** [ADR-0001](./0001-architecture-foundations.md) Decision 6 ("Apache 2.0, batteries-included by default"), [ADR-0002](./0002-substrate-and-supercommit.md) Decision 3 (2PC staging order) and Decision 6 (storage abstraction), [ADR-0011](./0011-objectstore-async-trait-shape.md) (the trait this hook will follow into v1.1).
@@ -41,7 +42,7 @@ The constraints:
 | 1 | **The scanner lives in `crates/agentic-core::scanner` and runs as a pre-hook inside `agentic-core::store::put_raw`.** Every backend (`FsObjectStore`, `GcsObjectStore`, future variants) inherits the check without per-backend modification. | The lowest layer with the right object identity. Putting the hook here means the daemon, the SDK, and any future direct consumer of the object store all get the same enforcement. |
 | 2 | **Detection strategy is pattern + entropy.** A curated `Vec<TokenPattern>` of high-precision regexes runs in a single `regex::RegexSet` pass; a Shannon-entropy heuristic flags contiguous runs ≥ 20 chars from the base64 alphabet with entropy > 4.5 bits/char. | The literal CLAUDE.md / overview claim is "matched secret patterns or high-entropy substrings". Patterns alone miss custom token formats; entropy alone has too many false positives. Both together with a tight allowlist is the operating point. |
 | 3 | **Hits return `Error::SecretDetected { hits: Vec<Hit> }` and the put never reaches the backend.** No override flag in v1.0. | The "hard-rejects" language commits us. An override would be the kind of escape hatch operators turn on and forget. If a fix-the-input loop is too painful in practice, that's the v1.1 conversation. |
-| 4 | **Allowlist is blob-SHA256-scoped, loaded from `.agentic/scanner-allowlist.toml` at daemon startup.** Each entry whitelists exactly one blob's content hash — not a pattern, not a regex. | Hash-scoped allowlist cannot accidentally whitelist similar future content. Adding "this specific test fixture is OK" stays scoped to that fixture. The cost is verbosity, paid by the operator who hits the allowlist (which should be rare). |
+| 4 | **Allowlist is blob-hash-scoped (BLAKE3), loaded from `.agentic/scanner-allowlist.toml` at daemon startup.** Each entry whitelists exactly one blob's content hash — not a pattern, not a regex. The hash is BLAKE3 via `agentic-core::Hash` (same hash as the rest of the object store), serialized as 64 hex chars in the `blob_hash` TOML field. | Hash-scoped allowlist cannot accidentally whitelist similar future content. Adding "this specific test fixture is OK" stays scoped to that fixture. The cost is verbosity, paid by the operator who hits the allowlist (which should be rare). Reusing the system's existing BLAKE3 hash keeps operators on one hash function and avoids pulling in `sha2`. |
 | 5 | **Pattern set lives in `crates/agentic-core::scanner_patterns` as a `const &[TokenPattern]` array.** Each entry has `name`, `regex`, `description`. Patterns are reviewed at PR-time, not at runtime. | Patterns are part of the trust contract. A runtime-loaded pattern file would invite a "load this PCRE from disk" footgun. Compile-time patterns let the type system enforce reviewable change. |
 | 6 | **Failure-injection tests at the put_raw boundary.** On scanner reject, the assertion is `store.has(hash) == false` AND no backend-side write was attempted. | Per [ADR-0002](./0002-substrate-and-supercommit.md) Decision 3, every 2PC boundary needs failure-injection tests. The scanner adds a new boundary at the entry to `put_raw`; this gets the same discipline. |
 | 7 | **Out of scope for v1.0:** streaming-blob scanning, regex-based allowlist patterns, operator-supplied custom patterns, scan-on-read. | Streaming is a v2+ concern (large blobs > 100 MiB per ADR-0011 D4). Regex allowlist invites the same footgun as runtime-loaded patterns. Custom patterns are a v1.1+ feature behind an explicit ADR. Scan-on-read is YAGNI — the put boundary is where secrets land. |
@@ -109,37 +110,41 @@ There is **no `--allow-secrets-this-once` override flag in v1.0.** Three reasons
 
 1. The four tracked doc files explicitly say "hard-rejects". An override would walk back the language.
 2. Override flags accumulate trust debt. Once shipped, they get used in CI, in cron jobs, and in scripts. Removing them later is harder than not adding them.
-3. The legitimate "this specific blob is OK" case has a better fit: blob-SHA256 allowlist (Decision 4). It scopes the exception to the exact content, not to the act of writing.
+3. The legitimate "this specific blob is OK" case has a better fit: blob-hash allowlist (Decision 4). It scopes the exception to the exact content, not to the act of writing.
 
 If operator pain from hard rejection turns out to be too high (e.g., dozens of false positives per day in a real platform-partner deployment), the v1.1 conversation is whether to widen the allowlist mechanism, tighten the patterns, or both. Not whether to add an override.
 
-### Decision 4 — Blob-SHA256-scoped allowlist
+### Decision 4 — Blob-hash-scoped allowlist (BLAKE3)
 
 The allowlist file is TOML at `.agentic/scanner-allowlist.toml`:
 
 ```toml
-# Each entry whitelists exactly one blob's SHA256.
+# Each entry whitelists exactly one blob's BLAKE3 content hash (64 hex
+# chars), the same hash used elsewhere in the object store via
+# `agentic-core::Hash`.
 # Add an entry only when the scanner rejected a blob that is genuinely
 # safe (test fixture, public test key, documented constant in a regex
 # fixture, etc.) and you have inspected the bytes manually.
 
 [[ignore]]
-blob_sha256 = "9f4e1c8e1234567890abcdef1234567890abcdef1234567890abcdef12345678"
+blob_hash = "9f4e1c8e1234567890abcdef1234567890abcdef1234567890abcdef12345678"
 reason = "anthropic-style test fixture in agentic-cli tests"
 added_by = "toni"
 added_date = "2026-05-21"
 
 [[ignore]]
-blob_sha256 = "deadbeefcafe..."
+blob_hash = "deadbeefcafe..."
 reason = "..."
 ```
 
 At daemon startup the file is parsed into a `BTreeSet<Hash>` and held in `Arc<Allowlist>`. The scanner consults it when computing the final reject decision:
 
 1. Run patterns + entropy in one pass.
-2. Compute the blob's SHA256.
-3. If any hits AND the blob's SHA256 is in the allowlist, return success with no hits.
+2. Compute the blob's BLAKE3 hash (`Hash::of(bytes)`).
+3. If any hits AND the blob's hash is in the allowlist, return success with no hits.
 4. Otherwise return success with the hit list or, if the hit list is empty, success with no hits.
+
+**Amendment 2026-05-21:** an earlier draft of this decision specified SHA-256. The merged PR-3 implementation uses BLAKE3 via `agentic-core::Hash` so operators deal with one content-hash function across the system (object store, refs, allowlist) and `sha2` does not need to enter the daemon's dependency tree. The TOML field is `blob_hash`, not `blob_sha256`.
 
 Each allowlist entry whitelists exactly one blob. Adding "this specific test fixture is OK" cannot accidentally whitelist similar future content with a slightly different shape. The verbosity (one entry per allowed blob) is the deliberate cost — it forces an operator to look at each entry, understand what they're allowing, and document the reason.
 
@@ -180,7 +185,7 @@ Per [ADR-0002](./0002-substrate-and-supercommit.md) Decision 3, every 2PC bounda
 1. **Pattern hit, FsObjectStore.** `put_raw(kind, &[..token..])` returns `Err(Error::SecretDetected)` and `store.has(hash)` is `false`. No file appears on disk.
 2. **Pattern hit, GcsObjectStore (mocked via `httpmock`).** Same assertion, plus: no HTTP POST was issued to the mock GCS endpoint. The scanner short-circuits before the network round-trip.
 3. **Entropy hit, FsObjectStore.** A synthetic 24-character base64-shaped blob with > 4.5 bits/char produces `HitKind::HighEntropy` and rejects identically.
-4. **Allowlist suppression.** A blob that would hit a pattern, but whose SHA256 is in a fixture allowlist, succeeds. `store.has(hash)` is `true`.
+4. **Allowlist suppression.** A blob that would hit a pattern, but whose BLAKE3 hash is in a fixture allowlist, succeeds. `store.has(hash)` is `true`.
 5. **Multi-hit reporting.** A blob containing both a GitHub PAT and an AWS key produces two `Hit` entries in the error. The operator sees both.
 6. **Empty allowlist behaviour.** Daemon starts with no allowlist file. All patterns + entropy still fire. `tracing::debug!` line "no allowlist file at {path}" is observable.
 
@@ -200,7 +205,7 @@ The test crate is `crates/agentic-core/src/scanner.rs::tests` for the unit-level
 - TM-009 closes. The four tracked doc files become honest: a scanner exists in code that matches the contract they describe.
 - Operator trust surface tightens. A platform-partner integrator reading [`CLAUDE.md`](../../CLAUDE.md) §"What not to do" sees a guarantee they can verify by running the test suite.
 - The scanner lives at the storage layer, so the SDK and the CLI both inherit it without per-consumer code paths.
-- Blob-SHA256 allowlist is verbose but auditable. A future operator reading the file can determine, for each allowed blob, why it's allowed.
+- Blob-hash allowlist is verbose but auditable. A future operator reading the file can determine, for each allowed blob, why it's allowed.
 - Compile-time pattern set keeps the pattern surface part of the trust contract reviewed at PR time, not at runtime.
 
 **Negative:**
