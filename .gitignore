@@ -40,7 +40,10 @@ Thumbs.db
 .claude/
 .entire/
 .codex/
+.cursor/
+.opencode/
+.pi/
 
-# Cursor — per-user IDE state. Shared configs (e.g. .cursor/rules/*.mdc,
-# .cursor/mcp.json) are tracked; runtime hook state is not.
-.cursor/hooks/state/
+# One-off scratch prompts pasted into the working tree for execution.
+# Not long-term reference material; should not be tracked.
+PROMPT-*.md
