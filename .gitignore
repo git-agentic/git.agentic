@@ -32,37 +32,14 @@ Thumbs.db
 .env.local
 
 # ---------------------------------------------------------------------------
-# Agent-harness runtime state
-#
-# Per-user or per-session state from the local agent harnesses. The
-# project-shared shape stays tracked (OPENWOLF.md, cerebrum.md, config.json,
-# identity.md, reframe-frameworks.md, hooks/*.js, hooks/package.json,
-# .claude/rules/openwolf.md, .claude/settings.json, AGENTS.md) — those
-# define the protocol every contributor sees. Anything below is local.
+# Agent-harness state — entirely per-user / per-session, not tracked.
 # ---------------------------------------------------------------------------
 
-# OpenWolf — auto-rebuilt or per-session state
-.wolf/anatomy.md
-.wolf/buglog.json
-.wolf/memory.md
-.wolf/token-ledger.json
-.wolf/cron-manifest.json
-.wolf/cron-state.json
-.wolf/daemon.log
-.wolf/designqc-report.json
-.wolf/designqc-captures/
-.wolf/suggestions.json
-.wolf/hooks/_session.json
-
-# Claude Code — per-user runtime
-.claude/agents/
-.claude/logs/
-.claude/metadata/
-.claude/tmp/
-
-# Other agent harnesses — per-user state
-.codex/
+.wolf/
+.deepsec/
+.claude/
 .entire/
+.codex/
 
 # Cursor — per-user IDE state. Shared configs (e.g. .cursor/rules/*.mdc,
 # .cursor/mcp.json) are tracked; runtime hook state is not.
