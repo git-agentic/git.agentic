@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentic_core::scanner::Allowlist;
 use agentic_core::{FsObjectStore, GcsObjectStore, ObjectStore};
 use anyhow::{anyhow, Context};
 
@@ -85,11 +86,16 @@ impl ObjectStoreSpec {
     }
 
     /// Open the parsed spec into a live trait object.
-    pub fn open(self) -> anyhow::Result<Arc<dyn ObjectStore + Send + Sync>> {
+    ///
+    /// `allowlist` is threaded into the constructed store via
+    /// `with_allowlist`, wiring ADR-0013's secret scanner with the
+    /// blob-hash exceptions loaded at startup.
+    pub fn open(self, allowlist: Allowlist) -> anyhow::Result<Arc<dyn ObjectStore + Send + Sync>> {
         match self {
             Self::Fs { root } => {
                 let store = FsObjectStore::open(&root)
-                    .with_context(|| format!("opening fs object store at {}", root.display()))?;
+                    .with_context(|| format!("opening fs object store at {}", root.display()))?
+                    .with_allowlist(allowlist);
                 Ok(Arc::new(store))
             }
             Self::Gcs {
@@ -101,7 +107,8 @@ impl ObjectStoreSpec {
                 let bearer = std::env::var(TOKEN_ENV).ok();
                 let store =
                     GcsObjectStore::new(bucket.clone(), prefix, &cache_dir, endpoint, bearer)
-                        .with_context(|| format!("opening gcs object store {bucket}"))?;
+                        .with_context(|| format!("opening gcs object store {bucket}"))?
+                        .with_allowlist(allowlist);
                 Ok(Arc::new(store))
             }
         }
