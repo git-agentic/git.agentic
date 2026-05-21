@@ -135,9 +135,15 @@ async fn main() -> anyhow::Result<()> {
     // the same `commit_lock` that `handle_commit` / `handle_rollback`
     // hold — guaranteeing no commit is mid-2PC when the process exits.
     // Audit §A2 / R2 / C2.
-    let lifecycle = Lifecycle::new(state.commit_lock.clone());
+    //
+    // The lifecycle SHARES the shutdown token with DaemonState so the
+    // handlers' `state.check_shutdown()` calls see the same signal
+    // raised by SIGTERM. Without this, drain would release the lock
+    // and a queued waiter would start 2PC inside an exiting LocalSet
+    // (Copilot review on PR #50, second pass).
+    let lifecycle = Lifecycle::new(state.commit_lock.clone(), state.shutdown.clone());
     lifecycle.install_signal_handlers();
-    let shutdown = lifecycle.shutdown_token();
+    let shutdown = state.shutdown.clone();
 
     // Connections are handled on the local task set — no Send bound required,
     // which avoids HRTB issues with sqlx 0.7 async fn signatures. The daemon
