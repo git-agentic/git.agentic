@@ -3,6 +3,7 @@
 //! Long-lived Rust process. Listens on a Unix domain socket for SDK and
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
+use agentic_core::refs::Refs;
 use agentic_memory::postgres::TrackedTable;
 use anyhow::{anyhow, Context};
 use clap::Parser;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 
+use agenticd::lifecycle::{reconcile_refs_on_startup, Lifecycle};
 use agenticd::mcp::parse_mcp_spec;
 use agenticd::objstore::ObjectStoreSpec;
 use agenticd::server::{handle_connection, DaemonState};
@@ -84,6 +86,36 @@ async fn main() -> anyhow::Result<()> {
         .open()
         .context("opening object store")?;
     tracing::info!(spec = %args.object_store, "object store ready");
+
+    // Resolve the socket path AND remove any stale socket file before
+    // any path that can return Err — including the reconciler below.
+    // Without this, an early-exit (reconciler failure, DaemonState::open
+    // failure, etc.) would leave a stale socket lying around and clients
+    // / health checks would see ECONNREFUSED on connect instead of the
+    // honest ENOENT. (Copilot review on PR #50, third pass.)
+    let socket_path = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket parent directory {}", parent.display()))?;
+    }
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+    }
+
+    // Startup ref reconciliation (audit §A2 / R2). Runs before binding the
+    // socket so a corrupted repo never gets traffic — operator sees the
+    // error and intervenes.
+    {
+        let refs = Refs::open(&agentic_dir).context("opening refs at startup")?;
+        reconcile_refs_on_startup(&refs, store.as_ref())
+            .await
+            .context("startup ref reconciliation")?;
+    }
+
     let state = Arc::new(
         DaemonState::open(
             args.repo.clone(),
@@ -96,17 +128,6 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
 
-    let socket_path = args
-        .socket
-        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
-
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
 
@@ -116,28 +137,67 @@ async fn main() -> anyhow::Result<()> {
         "agenticd listening"
     );
 
+    // Lifecycle: SIGTERM/SIGINT triggers graceful shutdown; the accept
+    // loop watches the shutdown token via tokio::select! and breaks out
+    // when raised. After the loop exits, `lifecycle.drain()` blocks on
+    // the same `commit_lock` that `handle_commit` / `handle_rollback`
+    // hold — guaranteeing no commit is mid-2PC when the process exits.
+    // Audit §A2 / R2 / C2.
+    //
+    // The lifecycle SHARES the shutdown token with DaemonState so the
+    // handlers' `state.check_shutdown()` calls see the same signal
+    // raised by SIGTERM. Without this, drain would release the lock
+    // and a queued waiter would start 2PC inside an exiting LocalSet
+    // (Copilot review on PR #50, second pass).
+    let lifecycle = Lifecycle::new(state.commit_lock.clone(), state.shutdown.clone());
+    lifecycle.install_signal_handlers();
+    let shutdown = state.shutdown.clone();
+
     // Connections are handled on the local task set — no Send bound required,
     // which avoids HRTB issues with sqlx 0.7 async fn signatures. The daemon
     // is a local Unix-socket server so single-threaded cooperative scheduling
     // is the right execution model anyway.
+    //
+    // The drain step MUST run inside `run_until` so the LocalSet keeps
+    // driving any in-flight `spawn_local` commit/rollback task — those
+    // tasks hold `commit_lock`, and if the LocalSet stops being polled
+    // the drain would deadlock waiting on a lock no task can release.
+    // (Spotted by Copilot review on PR #50.)
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
             loop {
-                let (sock, _addr) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
-                        continue;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("shutdown signal received; closing accept loop");
+                        break;
                     }
-                };
-                let state = state.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(e) = handle_connection(state, sock).await {
-                        tracing::warn!(error = %format!("{e:#}"), "connection error");
+                    accept = listener.accept() => {
+                        let (sock, _addr) = match accept {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "accept failed");
+                                continue;
+                            }
+                        };
+                        let state = state.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = handle_connection(state, sock).await {
+                                tracing::warn!(error = %format!("{e:#}"), "connection error");
+                            }
+                        });
                     }
-                });
+                }
             }
+            // Wait for any in-flight commit/rollback to complete its 2PC
+            // sequence before the process exits. ADR-0002 Decision 3
+            // promises atomic commits; this drain step is what makes that
+            // promise survive operator-driven shutdowns (docker stop,
+            // kubectl rollout, systemctl restart).
+            lifecycle.drain().await;
         })
-        .await
+        .await;
+
+    tracing::info!("agenticd shutdown complete");
+    Ok(())
 }

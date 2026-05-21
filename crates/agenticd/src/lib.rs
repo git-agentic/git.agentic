@@ -8,6 +8,7 @@
 //! needs are re-exported. The public surface here is **not** stable across
 //! versions — treat it as the daemon's internal API.
 
+pub mod lifecycle;
 pub mod mcp;
 pub mod migrate;
 pub mod objstore;

@@ -38,6 +38,12 @@ pub struct DaemonState {
     /// Serialises every write-path request. Per ADR-0001 the daemon does
     /// one commit at a time.
     pub commit_lock: Arc<Mutex<()>>,
+    /// Shutdown signal shared with [`crate::lifecycle::Lifecycle`]. Set
+    /// when SIGTERM/SIGINT fires. Write-path handlers check this BEFORE
+    /// and AFTER acquiring `commit_lock` so a commit that's queued at
+    /// shutdown bails out instead of starting a 2PC sequence the
+    /// LocalSet is about to abort. Audit §A2 / PR #50 follow-up review.
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// Optional memory backend. When present, every commit takes a memory
     /// snapshot under the commit lock and threads its manifest hash into
     /// the Commit's `memory_snapshot` dimension.
@@ -94,10 +100,24 @@ impl DaemonState {
             store,
             refs,
             commit_lock: Arc::new(Mutex::new(())),
+            shutdown: tokio_util::sync::CancellationToken::new(),
             memory,
             mcp_servers,
             http,
         })
+    }
+
+    /// Returns `Err` if shutdown has been signalled. Write-path handlers
+    /// call this on entry (before queuing on `commit_lock`) and again
+    /// after acquiring the lock — the second check catches the race
+    /// where shutdown fired while the handler waited in the lock's queue.
+    pub fn check_shutdown(&self) -> anyhow::Result<()> {
+        if self.shutdown.is_cancelled() {
+            return Err(anyhow::anyhow!(
+                "daemon is shutting down; refusing new write-path work"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -143,7 +163,16 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
         }
 
         Request::Commit(input) => {
+            // Early bail-out: skip the queue entirely if shutdown already
+            // fired. Otherwise this request would queue on commit_lock and
+            // then race with `Lifecycle::drain` for the in-flight 2PC.
+            state.check_shutdown()?;
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
+            // Re-check after acquire: shutdown may have fired while we
+            // waited in the queue. Without this, drain releases the lock
+            // and the next queued waiter wakes up and starts 2PC inside a
+            // LocalSet that is about to abort it.
+            state.check_shutdown()?;
             let out = handle_commit(state.as_ref(), input).await?;
             Ok(Response::Commit(out))
         }
@@ -211,7 +240,11 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
             dry_run,
             accept_data_loss,
         } => {
+            // Same shutdown discipline as Commit — bail out before queuing
+            // and re-check after acquiring the lock.
+            state.check_shutdown()?;
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
+            state.check_shutdown()?;
             let repo_root = state.repo_root.clone();
             let out = crate::rollback::execute(
                 Arc::clone(&state),
@@ -290,9 +323,17 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         _ => "main".to_string(),
     });
 
-    if head.is_none() {
-        state.refs.write_head_symbolic(&branch)?;
-    }
+    // Audit B7: on a first-ever commit (head.is_none()), the old code wrote
+    // `HEAD -> refs/heads/<branch>` HERE — before any staging step. If
+    // staging failed or the process was killed before `stage_and_commit`
+    // returned, HEAD would point at a branch ref that was never published —
+    // a phantom HEAD that the startup reconciler (lifecycle.rs) can't
+    // recover without a commit blob to read the parent from. We now defer
+    // the HEAD write to AFTER stage_and_commit succeeds, so HEAD is only
+    // published once a commit blob exists and the branch ref has been
+    // pointed at it. Tracks whether we need to write HEAD on the success
+    // path below.
+    let needs_head_write = head.is_none();
 
     let parent: Option<Hash> = state.refs.read_branch(&branch)?;
 
@@ -357,6 +398,33 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
     };
 
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)?;
+
+    // B7 fix: HEAD is published only after stage_and_commit returns Ok.
+    // By this point the commit blob is in the store and the branch ref
+    // points at it; HEAD can safely chase the symbolic ref and resolve
+    // to a real commit.
+    //
+    // If the HEAD write itself fails (extremely rare — it's one atomic
+    // file rename — but possible under filesystem ENOSPC or permission
+    // change), we deliberately do NOT propagate the error. The commit
+    // is already durable on the branch ref. Failing the response would
+    // tell the client "your commit didn't happen" and a naive retry
+    // would create a duplicate commit on top of the one we just made.
+    // Instead, log loudly: HEAD is operator-recoverable metadata, the
+    // commit history is the source of truth. (Copilot review on PR #50.)
+    if needs_head_write {
+        if let Err(e) = state.refs.write_head_symbolic(&branch) {
+            tracing::error!(
+                error = %e,
+                branch = %branch,
+                commit_hash = %out.commit_hash,
+                "commit succeeded on branch ref but HEAD write failed; \
+                 HEAD remains uninitialised. Operator can fix with: \
+                 `echo 'ref: refs/heads/<branch>' > .agentic/HEAD`"
+            );
+        }
+    }
+
     Ok(CommitOutput {
         commit_hash: out.commit_hash.to_hex(),
         branch: out.branch,
