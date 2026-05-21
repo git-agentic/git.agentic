@@ -143,9 +143,18 @@ pub async fn handle_connection(
         let correlation_id = envelope.correlation_id.clone();
         let response = match dispatch(Arc::clone(&state), envelope.payload, peer_uid).await {
             Ok(r) => r,
-            Err(e) => Response::Error {
-                message: format!("{e:#}"),
-            },
+            Err(e) => {
+                tracing::warn!(
+                    target: "agenticd::dispatch",
+                    error = %format!("{e:#}"),
+                    peer_uid = ?peer_uid,
+                    correlation_id = %correlation_id,
+                    "dispatch returned error"
+                );
+                Response::Error {
+                    message: format!("{e:#}"),
+                }
+            }
         };
         let reply = Envelope {
             correlation_id,

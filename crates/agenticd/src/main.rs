@@ -224,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
                         let (sock, _addr) = match accept {
                             Ok(pair) => pair,
                             Err(e) => {
-                                tracing::warn!(error = %e, "accept failed");
+                                tracing::warn!(target: "agenticd::accept", error = %e, "accept failed");
                                 continue;
                             }
                         };
@@ -232,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
                         let cred = match sock.peer_cred() {
                             Ok(c) => c,
                             Err(e) => {
-                                tracing::warn!(error = %e, "peer_cred() failed; closing connection");
+                                tracing::warn!(target: "agenticd::accept", error = %e, "peer_cred() failed; closing connection");
                                 continue;
                             }
                         };
@@ -259,15 +259,20 @@ async fn main() -> anyhow::Result<()> {
                         // Under --insecure-allow-any-uid we deliberately do
                         // NOT attest commits with the connection's UID; the
                         // UID has no security meaning in that mode.
-                        let carried_uid = match &*state.peer_auth {
-                            PeerAuthPolicy::InsecureAllowAny => None,
-                            PeerAuthPolicy::Allowlist(_) => Some(peer_uid),
-                        };
+                        // Centralised on PeerAuthPolicy::attestation_for so
+                        // the "insecure mode suppresses attestation"
+                        // invariant lives in one place.
+                        let carried_uid = state.peer_auth.attestation_for(peer_uid);
 
                         let state = state.clone();
                         tokio::task::spawn_local(async move {
                             if let Err(e) = handle_connection(state, sock, carried_uid).await {
-                                tracing::warn!(error = %format!("{e:#}"), "connection error");
+                                tracing::warn!(
+                                    target: "agenticd::accept",
+                                    error = %format!("{e:#}"),
+                                    peer_uid = ?carried_uid,
+                                    "connection error",
+                                );
                             }
                         });
                     }
