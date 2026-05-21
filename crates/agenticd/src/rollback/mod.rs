@@ -6,8 +6,10 @@
 //!   2. If the target's `schema_version` differs from the live database's,
 //!      run reverse SQL migrations via `crate::migrate` to align the schema.
 //!   3. Restore memory: load the target's SegmentManifest, hand it to
-//!      `MemoryAdapter::restore` which TRUNCATEs each tracked table and
-//!      re-INSERTs from the captured segments inside one transaction.
+//!      `PostgresAdapter::restore_with_guard` which TRUNCATEs each tracked
+//!      table and re-INSERTs from the captured segments inside one
+//!      transaction. The poller is paused for the whole window
+//!      (audit §A1).
 //!   4. Write prompt blobs back to disk under `<repo>/prompts/`. Any
 //!      prompt file on disk that isn't in the target tree is removed.
 //!   5. Tools / model: noted in the plan but not pushed to disk in MVP.
@@ -16,21 +18,37 @@
 //!   6. Forward-record: create a new Commit C' whose dimensions match
 //!      target A but whose parent is the current branch tip C. Update
 //!      the branch ref to C'. History preserves the rollback action.
+//!
+//! Audit §S3 / §A4: this module replaces the previous monolithic
+//! `rollback.rs`. The three responsibilities now live in
+//! sibling files:
+//!
+//! * `loaders.rs` — typed `ObjectStore` readers (Commit, Tree, Blob,
+//!   SegmentManifest).
+//! * `writeback.rs` — FS write-back (`restore_prompts`, `sweep_orphans`)
+//!   and Commit-tree readers (`read_text_blobs`, `read_model_text`).
+//! * this file (`mod.rs`) — phase orchestration: validate the target
+//!   shape, run schema migrations, restore memory, restore prompts,
+//!   forward-record.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+mod loaders;
+mod writeback;
+
+use std::path::PathBuf;
 
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
-use agentic_core::{Blob, Commit, Hash, Object, ObjectKind, Tree};
+use agentic_core::{Commit, Hash};
 use agentic_memory::adapter::SnapshotHandle;
-use agentic_memory::segment::SegmentManifest;
 use agentic_memory::MemoryAdapter;
-use agentic_proto::RollbackOutput;
 use anyhow::{anyhow, Context};
 
 use crate::migrate;
 use crate::server::DaemonState;
+use agentic_proto::RollbackOutput;
+
+use loaders::{load_commit, load_manifest};
+use writeback::{read_model_text, read_text_blobs, restore_prompts};
 
 pub struct RollbackArgs {
     pub target: String,
@@ -80,18 +98,28 @@ pub async fn execute(
         ));
     }
 
-    // -- Schema migrations ---------------------------------------------------
+    // -- Schema migrations + memory restore ----------------------------------
     // The MutexGuard is released before any filesystem I/O so the daemon
-    // stays responsive and the future remains Send (no &adapter across awaits
-    // in separate async fns).
+    // stays responsive and the future remains Send (no &adapter across
+    // awaits in separate async fns).
     if let Some(ref target_schema) = target.schema_version {
         let memory: std::sync::Arc<tokio::sync::Mutex<agentic_memory::postgres::PostgresAdapter>> =
             std::sync::Arc::clone(state.memory.as_ref().ok_or_else(|| {
                 anyhow!("target commit has a schema_version but no memory backend is attached")
             })?);
 
-        // Phase 1: query DB for live schema version and pending migration names.
-        // Guard is dropped at the end of this block.
+        // Phase 1: query DB for live schema version and pending migration
+        // names. Guard is dropped at the end of this block.
+        //
+        // NOTE: the live-vs-target comparison here is a planning step
+        // (decides whether migrations are needed and how many), not a
+        // duplicate of the gate that `PostgresAdapter::restore_with_guard`
+        // performs against the post-migration live state (audit §S5).
+        // After A8 wrapped the reverse-migration sequence in an outer
+        // transaction, partial failures don't leave intermediate live
+        // versions, so the two checks no longer raise inconsistent error
+        // types — `migrate::run_reverse` returns its own context-wrapped
+        // error and `restore_with_guard` only runs on success.
         let (live_schema, migration_names) = {
             let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
             let live = adapter
@@ -114,7 +142,7 @@ pub async fn execute(
                 "reverse schema migrations: {live_schema} → {target_schema}"
             ));
             // Phase 2: synchronous filesystem I/O — no lock held.
-            // `accept_data_loss` is forwarded here so `check_irreversible` can
+            // `accept_data_loss` is forwarded so `check_irreversible` can
             // honor the operator's opt-in for IRREVERSIBLE-marked migrations.
             let steps = migrate::load_steps(
                 state.refs.agentic_dir(),
@@ -211,8 +239,8 @@ pub async fn execute(
     // Build a fresh Commit whose dimensions match the target but whose
     // parent is the current branch tip. History shows C → C' even though
     // C' contains A's state.
-    let prompts_payload = read_prompts_for_commit(&state, &target)?;
-    let tools_payload = read_tools_for_commit(&state, &target)?;
+    let prompts_payload = read_text_blobs(&state, target.prompts)?;
+    let tools_payload = read_text_blobs(&state, target.tools)?;
     let model_text = read_model_text(&state, &target)?;
 
     let inputs = CommitInputs {
@@ -275,120 +303,6 @@ fn validate_target_shape(target: &Commit, target_hash: &Hash) -> anyhow::Result<
         ));
     }
     Ok(())
-}
-
-fn load_commit(state: &DaemonState, hash: &Hash) -> anyhow::Result<Commit> {
-    match state.store.get(hash)? {
-        Object::Commit(c) => Ok(*c),
-        other => Err(anyhow!(
-            "expected commit at {}, got {:?}",
-            hash,
-            other.kind()
-        )),
-    }
-}
-
-fn load_tree(state: &DaemonState, hash: &Hash) -> anyhow::Result<Tree> {
-    match state.store.get(hash)? {
-        Object::Tree(t) => Ok(t),
-        other => Err(anyhow!("expected tree at {}, got {:?}", hash, other.kind())),
-    }
-}
-
-fn load_blob(state: &DaemonState, hash: &Hash) -> anyhow::Result<Blob> {
-    match state.store.get(hash)? {
-        Object::Blob(b) => Ok(b),
-        other => Err(anyhow!("expected blob at {}, got {:?}", hash, other.kind())),
-    }
-}
-
-fn load_manifest(state: &DaemonState, hash: &Hash) -> anyhow::Result<SegmentManifest> {
-    let bytes = state.store.get_raw(hash)?;
-    let manifest: SegmentManifest =
-        serde_json::from_slice(&bytes).with_context(|| format!("decoding manifest {hash}"))?;
-    Ok(manifest)
-}
-
-/// Write target prompts back to `<repo>/prompts/`. Files present on disk
-/// but not in the target tree are removed so the working set matches.
-fn restore_prompts(state: &DaemonState, repo: &Path, prompts_hash: &Hash) -> anyhow::Result<()> {
-    let dir = repo.join("prompts");
-    std::fs::create_dir_all(&dir)?;
-
-    let tree = load_tree(state, prompts_hash)?;
-    let mut wanted: BTreeSet<PathBuf> = BTreeSet::new();
-    for (name, r) in &tree.entries {
-        let path = dir.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let blob = load_blob(state, &r.hash)?;
-        std::fs::write(&path, &blob.bytes)
-            .with_context(|| format!("writing {}", path.display()))?;
-        wanted.insert(path);
-    }
-
-    sweep_orphans(&dir, &dir, &wanted)?;
-    Ok(())
-}
-
-fn sweep_orphans(root: &Path, here: &Path, wanted: &BTreeSet<PathBuf>) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(here)? {
-        let entry = entry?;
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            sweep_orphans(root, &path, wanted)?;
-            if path != root && std::fs::read_dir(&path)?.next().is_none() {
-                let _ = std::fs::remove_dir(&path);
-            }
-        } else if ft.is_file() && !wanted.contains(&path) {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("removing orphan prompt {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn read_prompts_for_commit(
-    state: &DaemonState,
-    target: &Commit,
-) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
-    let Some(hash) = target.prompts else {
-        return Ok(BTreeMap::new());
-    };
-    tree_to_map(state, &hash)
-}
-
-fn read_tools_for_commit(
-    state: &DaemonState,
-    target: &Commit,
-) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
-    let Some(hash) = target.tools else {
-        return Ok(BTreeMap::new());
-    };
-    tree_to_map(state, &hash)
-}
-
-fn tree_to_map(state: &DaemonState, hash: &Hash) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
-    let tree = load_tree(state, hash)?;
-    let mut out = BTreeMap::new();
-    for (name, r) in tree.entries {
-        if r.kind != ObjectKind::Blob {
-            return Err(anyhow!("non-blob entry {name} in tree {hash}"));
-        }
-        let blob = load_blob(state, &r.hash)?;
-        out.insert(name, blob.bytes);
-    }
-    Ok(out)
-}
-
-fn read_model_text(state: &DaemonState, target: &Commit) -> anyhow::Result<Option<String>> {
-    let Some(hash) = target.model else {
-        return Ok(None);
-    };
-    let blob = load_blob(state, &hash)?;
-    Ok(Some(String::from_utf8_lossy(&blob.bytes).into_owned()))
 }
 
 #[cfg(test)]
