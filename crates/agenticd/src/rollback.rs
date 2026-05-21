@@ -49,6 +49,7 @@ pub async fn execute(
         .resolve(&args.target)?
         .ok_or_else(|| anyhow!("ref not found: {}", args.target))?;
     let target = load_commit(&state, &target_hash)?;
+    validate_target_shape(&target, &target_hash)?;
 
     let mut plan: Vec<String> = Vec::new();
 
@@ -234,6 +235,37 @@ pub async fn execute(
     })
 }
 
+/// Reject target Commits whose `(memory_snapshot, schema_version)` pair is
+/// in a shape the daemon should not have produced.
+///
+/// Audit B9 found that rollback silently skipped the memory restore branch
+/// when `target.memory_snapshot.is_some()` and `target.schema_version.is_none()`
+/// because the outer `if let Some(ref target_schema)` gated both the schema
+/// migration and the memory-restore branches together. The commit-write code
+/// path (`crates/agenticd/src/server.rs`) only produces commits with both
+/// fields `Some` together or both `None` together — the mixed state is
+/// unreachable through v1.0's normal write paths. Rather than silently
+/// skipping (the bug) or pretending to restore with a fabricated
+/// `schema_version` (option ii in source.md §Q2), we reject the state loudly
+/// and direct the operator to file a v1.1 issue if they reached it through a
+/// custom SDK or a legacy commit.
+///
+/// See `docs/plans/a8-reverse-migration/artifacts/implementation-decision-log.md#d-1`
+/// for the full rationale and rejected alternatives.
+fn validate_target_shape(target: &Commit, target_hash: &Hash) -> anyhow::Result<()> {
+    if target.memory_snapshot.is_some() && target.schema_version.is_none() {
+        return Err(anyhow!(
+            "target commit {} has memory_snapshot but no schema_version; \
+             this state should not be reachable through normal commit-write paths \
+             (see ADR-0002 and docs/plans/a8-reverse-migration/source.md §Q2). \
+             Refusing rollback. If you reached this through a custom SDK or a \
+             legacy commit, please file a v1.1 issue.",
+            target_hash.short()
+        ));
+    }
+    Ok(())
+}
+
 fn load_commit(state: &DaemonState, hash: &Hash) -> anyhow::Result<Commit> {
     match state.store.get(hash)? {
         Object::Commit(c) => Ok(*c),
@@ -346,4 +378,74 @@ fn read_model_text(state: &DaemonState, target: &Commit) -> anyhow::Result<Optio
     };
     let blob = load_blob(state, &hash)?;
     Ok(Some(String::from_utf8_lossy(&blob.bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_hash() -> Hash {
+        // Any concrete Hash works for shape validation — the validator
+        // doesn't read the object store.
+        Hash::of(b"a8-test-fixture")
+    }
+
+    fn commit_with(memory_snapshot: Option<Hash>, schema_version: Option<String>) -> Commit {
+        Commit {
+            parent: None,
+            author: "test".into(),
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+            message: "test".into(),
+            code_sha: None,
+            prompts: None,
+            tools: None,
+            model: None,
+            memory_snapshot,
+            schema_version,
+            intent: None,
+            plan: None,
+            transcript: None,
+            evals: None,
+            cost_cents: 0,
+            signatures: Vec::new(),
+        }
+    }
+
+    // AC2 — the malformed (memory_snapshot=Some, schema_version=None) shape
+    // is rejected loudly. See docs/plans/a8-reverse-migration/source.md §Q2.
+    #[test]
+    fn validate_rejects_memory_without_schema() {
+        let target = commit_with(Some(empty_hash()), None);
+        let err = validate_target_shape(&target, &empty_hash()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory_snapshot but no schema_version"),
+            "error message should name the contradiction; got: {msg}"
+        );
+        assert!(
+            msg.contains("Q2") || msg.contains("v1.1"),
+            "error message should point at the planning rationale / v1.1 work item; got: {msg}"
+        );
+    }
+
+    // Sanity / regression: every other shape passes the validation.
+    #[test]
+    fn validate_accepts_both_some() {
+        let target = commit_with(Some(empty_hash()), Some("003_add_embeddings".into()));
+        assert!(validate_target_shape(&target, &empty_hash()).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_both_none() {
+        let target = commit_with(None, None);
+        assert!(validate_target_shape(&target, &empty_hash()).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_schema_without_memory() {
+        // This shape is what a code-only commit with a schema baseline looks
+        // like; rollback to it is well-defined (no memory restore needed).
+        let target = commit_with(None, Some("002_baseline".into()));
+        assert!(validate_target_shape(&target, &empty_hash()).is_ok());
+    }
 }
