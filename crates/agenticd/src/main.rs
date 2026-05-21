@@ -87,6 +87,25 @@ async fn main() -> anyhow::Result<()> {
         .context("opening object store")?;
     tracing::info!(spec = %args.object_store, "object store ready");
 
+    // Resolve the socket path AND remove any stale socket file before
+    // any path that can return Err — including the reconciler below.
+    // Without this, an early-exit (reconciler failure, DaemonState::open
+    // failure, etc.) would leave a stale socket lying around and clients
+    // / health checks would see ECONNREFUSED on connect instead of the
+    // honest ENOENT. (Copilot review on PR #50, third pass.)
+    let socket_path = args
+        .socket
+        .clone()
+        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket parent directory {}", parent.display()))?;
+    }
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)
+            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+    }
+
     // Startup ref reconciliation (audit §A2 / R2). Runs before binding the
     // socket so a corrupted repo never gets traffic — operator sees the
     // error and intervenes.
@@ -109,17 +128,6 @@ async fn main() -> anyhow::Result<()> {
         .await?,
     );
 
-    let socket_path = args
-        .socket
-        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
-
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
-    }
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
 
