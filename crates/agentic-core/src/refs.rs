@@ -108,6 +108,34 @@ impl Refs {
         Ok(Some(hash))
     }
 
+    /// List all branch names that have a ref file under `refs/heads/`.
+    /// Returns them in arbitrary order; callers that need determinism
+    /// should sort. Used by the startup ref-reconciler in
+    /// `agenticd::lifecycle::reconcile_refs_on_startup` to find branch
+    /// refs whose tip hash needs to be verified against the object store.
+    pub fn list_branches(&self) -> Result<Vec<String>> {
+        let dir = self.agentic_dir.join("refs").join("heads");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut branches = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            // `write_atomic` leaves `.tmp` files only mid-write; skip them
+            // in case we race a concurrent writer.
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".tmp") {
+                    continue;
+                }
+                branches.push(name.to_string());
+            }
+        }
+        Ok(branches)
+    }
+
     /// Resolve a ref name. Accepts `"HEAD"`, a branch name, or a raw hex hash.
     pub fn resolve(&self, name: &str) -> Result<Option<Hash>> {
         if name == "HEAD" {
@@ -163,6 +191,18 @@ mod tests {
         assert!(refs.read_branch("main").unwrap().is_none());
         refs.write_branch("main", &h).unwrap();
         assert_eq!(refs.read_branch("main").unwrap(), Some(h));
+    }
+
+    #[test]
+    fn list_branches_returns_existing_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        assert!(refs.list_branches().unwrap().is_empty());
+        refs.write_branch("main", &Hash::of(b"m")).unwrap();
+        refs.write_branch("feature", &Hash::of(b"f")).unwrap();
+        let mut branches = refs.list_branches().unwrap();
+        branches.sort();
+        assert_eq!(branches, vec!["feature".to_string(), "main".to_string()]);
     }
 
     #[test]

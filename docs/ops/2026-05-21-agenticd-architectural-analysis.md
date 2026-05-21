@@ -171,7 +171,7 @@ drop(guard); // poller resumes
 
 **Tests landed:** `crates/agentic-memory/tests/integration.rs::ac1_writes_during_restore_are_reverted` — 100 INSERTs accumulate in `agentic_change_log` (with the poller on a 60s interval so it can't drain); `adapter.restore(&handle_A)` pauses the poller, restores the baseline, truncates the log inside its tx, and releases the poller; a post-restore snapshot manifest matches the baseline (no leaked rows in the streamer view) and `agentic_change_log` is empty. Run serial (`--test-threads=1`) because `public.agentic_change_log` is shared across schemas by design.
 
-<a name="a2"></a>**A2 — New `crates/agenticd/src/lifecycle.rs`: SIGTERM, commit_lock drain, startup ref reconciliation**
+<a name="a2"></a>**A2 — New `crates/agenticd/src/lifecycle.rs`: SIGTERM, commit_lock drain, startup ref reconciliation** — **DONE 2026-05-21** (issue [#36](https://github.com/git-agentic/git.agentic/issues/36)).
 *Addresses:* [C2](#c2), [B7](#b7), [R2](#r2). *Principle:* SRP + DIP. *Effort:* M.
 
 ```rust
@@ -182,6 +182,26 @@ impl Lifecycle {
 }
 pub async fn reconcile_refs_on_startup(repo: &Repo, store: &dyn ObjectStore) -> Result<()>;
 ```
+
+**Shipped shape:**
+
+- `crates/agenticd/src/lifecycle.rs` houses `Lifecycle { shutdown: CancellationToken, commit_lock: Arc<Mutex<()>> }` plus `install_signal_handlers()`, `shutdown_token()`, and `drain(&self)`. The drain method takes `&self` rather than `self` so the binary can call it after the accept loop exits without consuming the lifecycle prematurely.
+- `tokio-util` (workspace dep) provides `CancellationToken`. SIGTERM and SIGINT both raise the same shutdown token on Unix; Ctrl+C raises it on non-Unix.
+- The accept loop in `main.rs` is now `tokio::select! { _ = shutdown.cancelled() => break, accept = listener.accept() => { ... } }`. After the loop exits, `lifecycle.drain().await` blocks on the same `commit_lock` that `handle_commit` and `handle_rollback` hold while running their 2PC sequences — so the daemon never exits while a partial commit is in flight (ADR-0002 D3 atomicity guarantee preserved under operator-driven shutdowns).
+- **B7 fix lives at the call site, not in the reconciler**: `server::handle_commit` no longer writes `HEAD -> refs/heads/<branch>` upfront on a first-ever commit. The `needs_head_write` flag is computed up front; the `write_head_symbolic` call moves to after `stage_and_commit` returns Ok. This closes the "phantom HEAD" window structurally — HEAD is published only once a commit blob exists and its branch ref has been pointed at it.
+- **Startup reconciler is defence-in-depth, not magic recovery.** `reconcile_refs_on_startup(refs, store)` runs before the socket is bound. It scans every branch ref under `<agentic_dir>/refs/heads/`, verifies each tip hash exists in the object store, and returns `Err` listing every broken branch when any fails. The reconciler deliberately does NOT silently "rewind one parent back" (the audit pseudocode wording): without the commit blob in the store, the parent hash can't be read, and a non-malicious crash usually leaves the branch ref pointing at the previous (valid) tip — the orphan is just the in-progress commit blob. Loud detection + operator intervention is safer for v1.0 than auto-mutation.
+- **New helper in agentic-core:** `Refs::list_branches() -> Result<Vec<String>>` reads `<agentic_dir>/refs/heads/` and returns the branch names (skipping `.tmp` files left by interrupted atomic writes).
+
+**Tests landed:** 7 unit tests in `crates/agenticd/src/lifecycle.rs#cfg(test)`:
+- `reconcile_passes_on_fresh_repo` — no branches, no error.
+- `reconcile_passes_when_branch_tip_is_in_store` — happy path.
+- `reconcile_rejects_branch_ref_with_missing_tip` — AC for issue #36: a branch ref pointing at a hash not in the store is detected and surfaced.
+- `reconcile_lists_every_broken_branch` — multi-branch reporting; healthy branches are not flagged.
+- `drain_returns_immediately_when_no_commit_in_flight` — drain is a no-op on idle daemon.
+- `drain_waits_for_in_flight_commit_to_finish` — drain blocks until the commit_lock releases (the ADR-0002 D3 promise under shutdown).
+- `shutdown_token_initially_not_cancelled` — sanity for the token's initial state.
+
+Plus `list_branches_returns_existing_names` in `agentic-core::refs#tests`.
 
 <a name="a3"></a>**A3 — Extract `handle_commit` into `crates/agenticd/src/commit.rs` with named 2PC phases**
 *Addresses:* [S2](#s2), [B4](#b4) (cheap fix via injected `now_fn`), [B5](#b5), [B7](#b7) partially. *Principle:* SRP + OCP. *Effort:* M.
@@ -295,7 +315,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | Rec | Title | Issue | Label | Milestone |
 |---|---|---|---|---|
 | A1 | Quiesce trigger poller during memory restore | [#35](https://github.com/git-agentic/git.agentic/issues/35) **DONE** | `must-fix-v1.0` | `v1.0` |
-| A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | (TBD) | `must-fix-v1.0` | `v1.0` |
+| A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | [#36](https://github.com/git-agentic/git.agentic/issues/36) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | (TBD) | `hardening-sprint` | — |
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | (TBD) | `hardening-sprint` | — |

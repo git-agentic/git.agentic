@@ -3,6 +3,7 @@
 //! Long-lived Rust process. Listens on a Unix domain socket for SDK and
 //! CLI requests, owns the object store, and orchestrates snapshots.
 
+use agentic_core::refs::Refs;
 use agentic_memory::postgres::TrackedTable;
 use anyhow::{anyhow, Context};
 use clap::Parser;
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 
+use agenticd::lifecycle::{reconcile_refs_on_startup, Lifecycle};
 use agenticd::mcp::parse_mcp_spec;
 use agenticd::objstore::ObjectStoreSpec;
 use agenticd::server::{handle_connection, DaemonState};
@@ -84,6 +86,17 @@ async fn main() -> anyhow::Result<()> {
         .open()
         .context("opening object store")?;
     tracing::info!(spec = %args.object_store, "object store ready");
+
+    // Startup ref reconciliation (audit §A2 / R2). Runs before binding the
+    // socket so a corrupted repo never gets traffic — operator sees the
+    // error and intervenes.
+    {
+        let refs = Refs::open(&agentic_dir).context("opening refs at startup")?;
+        reconcile_refs_on_startup(&refs, store.as_ref())
+            .await
+            .context("startup ref reconciliation")?;
+    }
+
     let state = Arc::new(
         DaemonState::open(
             args.repo.clone(),
@@ -116,6 +129,16 @@ async fn main() -> anyhow::Result<()> {
         "agenticd listening"
     );
 
+    // Lifecycle: SIGTERM/SIGINT triggers graceful shutdown; the accept
+    // loop watches the shutdown token via tokio::select! and breaks out
+    // when raised. After the loop exits, `lifecycle.drain()` blocks on
+    // the same `commit_lock` that `handle_commit` / `handle_rollback`
+    // hold — guaranteeing no commit is mid-2PC when the process exits.
+    // Audit §A2 / R2 / C2.
+    let lifecycle = Lifecycle::new(state.commit_lock.clone());
+    lifecycle.install_signal_handlers();
+    let shutdown = lifecycle.shutdown_token();
+
     // Connections are handled on the local task set — no Send bound required,
     // which avoids HRTB issues with sqlx 0.7 async fn signatures. The daemon
     // is a local Unix-socket server so single-threaded cooperative scheduling
@@ -124,20 +147,36 @@ async fn main() -> anyhow::Result<()> {
     local
         .run_until(async move {
             loop {
-                let (sock, _addr) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
-                        continue;
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("shutdown signal received; closing accept loop");
+                        break;
                     }
-                };
-                let state = state.clone();
-                tokio::task::spawn_local(async move {
-                    if let Err(e) = handle_connection(state, sock).await {
-                        tracing::warn!(error = %format!("{e:#}"), "connection error");
+                    accept = listener.accept() => {
+                        let (sock, _addr) = match accept {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "accept failed");
+                                continue;
+                            }
+                        };
+                        let state = state.clone();
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = handle_connection(state, sock).await {
+                                tracing::warn!(error = %format!("{e:#}"), "connection error");
+                            }
+                        });
                     }
-                });
+                }
             }
         })
-        .await
+        .await;
+
+    // Wait for any in-flight commit to complete its 2PC sequence before
+    // the process exits. ADR-0002 Decision 3 promises atomic commits;
+    // this drain step is what makes that promise survive operator-driven
+    // shutdowns (docker stop, kubectl rollout, systemctl restart).
+    lifecycle.drain().await;
+    tracing::info!("agenticd shutdown complete");
+    Ok(())
 }

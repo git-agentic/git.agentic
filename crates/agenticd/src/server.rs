@@ -290,9 +290,17 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
         _ => "main".to_string(),
     });
 
-    if head.is_none() {
-        state.refs.write_head_symbolic(&branch)?;
-    }
+    // Audit B7: on a first-ever commit (head.is_none()), the old code wrote
+    // `HEAD -> refs/heads/<branch>` HERE — before any staging step. If
+    // staging failed or the process was killed before `stage_and_commit`
+    // returned, HEAD would point at a branch ref that was never published —
+    // a phantom HEAD that the startup reconciler (lifecycle.rs) can't
+    // recover without a commit blob to read the parent from. We now defer
+    // the HEAD write to AFTER stage_and_commit succeeds, so HEAD is only
+    // published once a commit blob exists and the branch ref has been
+    // pointed at it. Tracks whether we need to write HEAD on the success
+    // path below.
+    let needs_head_write = head.is_none();
 
     let parent: Option<Hash> = state.refs.read_branch(&branch)?;
 
@@ -357,6 +365,15 @@ async fn handle_commit(state: &DaemonState, input: CommitInput) -> anyhow::Resul
     };
 
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)?;
+
+    // B7 fix: HEAD is published only after stage_and_commit returns Ok.
+    // By this point the commit blob is in the store and the branch ref
+    // points at it; HEAD can safely chase the symbolic ref and resolve
+    // to a real commit.
+    if needs_head_write {
+        state.refs.write_head_symbolic(&branch)?;
+    }
+
     Ok(CommitOutput {
         commit_hash: out.commit_hash.to_hex(),
         branch: out.branch,
