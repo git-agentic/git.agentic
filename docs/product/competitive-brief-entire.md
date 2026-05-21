@@ -58,7 +58,7 @@ These are choices Entire and git.agentic *both* make, which is useful: when two 
 - **Agent metadata on a separate ref / store, never on the active branch.** Entire: `entire/checkpoints/v1`. Us: `.agentic/objects/` content-addressed store + refs under `.agentic/refs/`. Same principle.
 - **No commits on the user's branch.** Entire: explicit non-goal. Us: same — `agentic commit` writes the Commit object to our store and updates `.agentic/refs/heads/<name>`, never `git commit`.
 - **Manual-commit strategy.** Entire seals checkpoints on `git commit`. Our `AgenticSessionStore` ([ADR-0005](../adr/0005-sessionstore-amendment-to-adr-0004.md)) snapshots on `SessionStore.append` per turn or per frame, but the `agentic commit` gesture is also manual. Neither tool auto-commits the user's intent.
-- **Best-effort secret redaction at write.** Entire's `redact/` package; our daemon's high-entropy scanner per `CLAUDE.md` §"What not to do". Both call it best-effort. That framing is the honest one.
+- **Best-effort secret redaction at write.** Entire's `redact/` package; our daemon's pattern + entropy scanner is specified by [ADR-0013](../adr/0013-secret-scanner.md) and ships in v1.0 (PR-3 of the hardening sprint). Both will be best-effort. That framing is the honest one.
 - **Worktrees + concurrent sessions are first-class.** Both treat them as required, not nice-to-have.
 
 The convergent evidence does *not* establish our wedge. It establishes that the table-stakes plumbing is settling into a convention. Useful for design partners who've used Entire — the metaphors map cleanly.

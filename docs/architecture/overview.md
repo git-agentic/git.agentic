@@ -209,7 +209,7 @@ Total wall-clock target: < 5s for typical rollbacks.
 
 ## 6. Security model (MVP)
 
-The daemon runs as the same user as the application. There is no authentication on the socket beyond filesystem permissions. The object store is unencrypted at rest. Secrets are *never* committed (the daemon scans every blob it would write for high-entropy strings matching common token patterns and refuses to write them).
+The daemon runs as the same user as the application. There is no authentication on the socket beyond filesystem permissions. The object store is unencrypted at rest. Secrets are not yet machine-rejected: [ADR-0013](../adr/0013-secret-scanner.md) specifies a `put_raw`-time pattern + entropy scanner that will hard-reject matched blobs with a typed `SecretDetected` error; the implementation lands in PR-3 of the v1.0 hardening sprint. Until it does, operators must not commit secrets to prompts or memory.
 
 Post-MVP, we add:
 

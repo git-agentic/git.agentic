@@ -47,7 +47,7 @@ pub struct TrackedTable {
 }
 
 /// Configuration passed to `PostgresAdapter::connect`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgConfig {
     pub url: String,
     pub tables: Vec<TrackedTable>,
@@ -72,6 +72,35 @@ impl PgConfig {
             poll_interval: triggers::DEFAULT_POLL_INTERVAL,
         }
     }
+}
+
+impl std::fmt::Debug for PgConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConfig")
+            .field("url", &redact_password_in_url(&self.url))
+            .field("tables", &self.tables)
+            .field("segment_target_bytes", &self.segment_target_bytes)
+            .field("replication_slot", &self.replication_slot)
+            .field("poll_interval", &self.poll_interval)
+            .finish()
+    }
+}
+
+/// Replace the password segment of a Postgres URL with `***` for safe
+/// formatting in logs and error chains. Falls back to a fully-redacted
+/// placeholder if the URL cannot be parsed — fail-secure.
+fn redact_password_in_url(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<redacted: unparseable url>".to_string();
+    };
+    let Some((userinfo, hostpart)) = rest.split_once('@') else {
+        return raw.to_string();
+    };
+    let userinfo_redacted = match userinfo.split_once(':') {
+        Some((user, _password)) => format!("{user}:***"),
+        None => userinfo.to_string(),
+    };
+    format!("{scheme}://{userinfo_redacted}@{hostpart}")
 }
 
 pub struct PostgresAdapter {
@@ -686,5 +715,47 @@ mod tests {
             "\"public\".\"episodes\""
         );
         assert_eq!(quote_qualified("episodes"), "\"episodes\"");
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn pgconfig_debug_redacts_password() {
+        let cfg = PgConfig::new(
+            "postgres://agentic:super-secret-pw@localhost:54322/agentic",
+            Vec::new(),
+        );
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("super-secret-pw"),
+            "Debug output must redact the password; got: {dbg}"
+        );
+        assert!(
+            dbg.contains("***"),
+            "Debug output must mark the redacted segment with ***; got: {dbg}"
+        );
+        // Sanity: other URL pieces remain visible so debugging is still useful.
+        assert!(
+            dbg.contains("localhost") && dbg.contains("agentic"),
+            "Debug output should preserve host and db name; got: {dbg}"
+        );
+    }
+
+    #[test]
+    fn pgconfig_debug_handles_url_without_password() {
+        let cfg = PgConfig::new("postgres://agentic@localhost:54322/agentic", Vec::new());
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("localhost"));
+        assert!(!dbg.contains("***"));
+    }
+
+    #[test]
+    fn pgconfig_debug_handles_malformed_url() {
+        let cfg = PgConfig::new("not-a-valid-url", Vec::new());
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("not-a-valid-url"));
     }
 }
