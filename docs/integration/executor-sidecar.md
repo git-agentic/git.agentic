@@ -1,7 +1,7 @@
-# Codento Executor — sidecar `agenticd` integration
+# Platform-partner integration — sidecar `agenticd` integration
 
 **Status:** Draft. Implements [ADR-0004](../adr/0004-realtime-agenticd-for-executor.md).
-**Audience:** Codento Executor / Coding-worker authors wiring `agenticd` into a Cloud Run instance.
+**Audience:** Platform-partner integrators / Coding-worker authors wiring `agenticd` into a Cloud Run instance.
 
 ## Topology
 
@@ -24,20 +24,20 @@ spec:
       containerConcurrency: 1
       containers:
         - name: worker
-          image: gcr.io/codento/coding-worker:<tag>
+          image: gcr.io/<your-registry>/coding-worker:<tag>
           env:
             - { name: AGENTICD_SOCKET, value: /shared/agenticd.sock }
           volumeMounts:
             - { name: shared, mountPath: /shared }
         - name: agenticd
-          image: gcr.io/codento/agenticd-sidecar:<tag>
+          image: gcr.io/<your-registry>/agenticd-sidecar:<tag>
           args:
             - --repo
             - /shared/work
             - --socket
             - /shared/agenticd.sock
             - --object-store
-            - gcs://codento-exec-sessions/<tenant>
+            - gcs://<your-bucket>/<tenant>
           env:
             - name: AGENTIC_GCS_TOKEN
               valueFrom: { secretKeyRef: { name: gcs-bearer, key: token } }
