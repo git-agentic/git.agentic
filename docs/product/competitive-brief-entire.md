@@ -81,7 +81,7 @@ Entire's auto-summary (intent / outcome / learnings / friction / open items) gen
 
 ### 3. Multi-agent hook installer matrix
 
-Entire ships hooks for seven agents and the install layout (`entire enable --agent <name>` → write to `.claude/settings.json` | `.codex/hooks.json` | `.cursor/hooks.json` | `.gemini/settings.json` | `.opencode/plugins/entire.ts` | `.factory/settings.json` | `.github/hooks/entire.json`) is the right shape. We don't need that breadth in v1.0 ([ADR-0003](../adr/0003-<partner>-executor-integration.md) commits us to LangGraph + Claude Agent SDK only), but the layout is what `agentic enable --agent <name>` should look like when CrewAI / AutoGen / Cursor / Gemini integrations land. Borrow the file-location matrix and CLI verb shape; don't borrow the implementation.
+Entire ships hooks for seven agents and the install layout (`entire enable --agent <name>` → write to `.claude/settings.json` | `.codex/hooks.json` | `.cursor/hooks.json` | `.gemini/settings.json` | `.opencode/plugins/entire.ts` | `.factory/settings.json` | `.github/hooks/entire.json`) is the right shape. We don't need that breadth in v1.0 ([ADR-0003](../adr/0003-claude-agent-sdk-integration.md) commits us to LangGraph + Claude Agent SDK only), but the layout is what `agentic enable --agent <name>` should look like when CrewAI / AutoGen / Cursor / Gemini integrations land. Borrow the file-location matrix and CLI verb shape; don't borrow the implementation.
 
 → Tracked in [`v1.1-plan.md`](v1.1-plan.md) §Workstream 4 (new), gated on a second framework integration being design-partner-pulled.
 
@@ -89,7 +89,7 @@ Entire ships hooks for seven agents and the install layout (`entire enable --age
 
 - **Their positioning.** "Searchable record of how code was written" is the audit/compliance/onboarding axis. That is not our axis and chasing it would dilute the wedge. Our axis is *recovery*, full stop. The demo is the discipline.
 - **Their summarization-as-a-product-surface framing.** Their `entire checkpoint explain` is a first-class CLI command; the summary is a feature you go look at. For us the summary is *content of the Commit object*, retrievable via `agentic show <commit>` like any other field. We don't add a new top-level verb for it. (ADR-0009 enforces this.)
-- **The breadth of agent hooks in v1.0.** Seven agents is great when shipping multi-agent capture is the product. For us it would be scope creep dressed as parity. v1.1, design-partner-pulled, behind the framework-neutral SDK contract per [ADR-0003 Decision 3](../adr/0003-<partner>-executor-integration.md).
+- **The breadth of agent hooks in v1.0.** Seven agents is great when shipping multi-agent capture is the product. For us it would be scope creep dressed as parity. v1.1, design-partner-pulled, behind the framework-neutral SDK contract per [ADR-0003 Decision 3](../adr/0003-claude-agent-sdk-integration.md).
 - **Auto-summarization on every commit by default.** Entire defaults to off (`strategy_options.summarize.enabled: false`). We should do the same — opt-in per-repo, honest about the LLM call cost and the transcript-egress privacy implication. ADR-0009 §Decision 4.
 
 ## OpenWolf (for the record, since it was bundled with the ask)
@@ -125,4 +125,4 @@ The only thing in OpenWolf adjacent to our work is the **anatomy map** pattern �
 - [entireio/cli](https://github.com/entireio/cli) — README + commands reference (fetched 2026-05-21).
 - [entire.io](https://entire.io) — product site.
 - [OpenWolf](https://openwolf.com) — for contrast; not a competitor.
-- Internal: [ADR-0002](../adr/0002-substrate-and-supercommit.md) (extended Commit object as platform API), [ADR-0003](../adr/0003-<partner>-executor-integration.md) (framework-neutral SDK contract), [ADR-0006](../adr/0006-objectstore-backend-trait.md) (ObjectStore trait), [`demo-scenario.md`](demo-scenario.md) (the discipline).
+- Internal: [ADR-0002](../adr/0002-substrate-and-supercommit.md) (extended Commit object as platform API), [ADR-0003](../adr/0003-claude-agent-sdk-integration.md) (framework-neutral SDK contract), [ADR-0006](../adr/0006-objectstore-backend-trait.md) (ObjectStore trait), [`demo-scenario.md`](demo-scenario.md) (the discipline).
