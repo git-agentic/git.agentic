@@ -93,6 +93,7 @@ pub enum AllowlistError {
 }
 
 /// Compiled scanner. Construct once per ObjectStore; reuse across puts.
+#[derive(Debug)]
 pub struct Scanner {
     regex_set: RegexSet,
     regexes: Vec<Regex>,

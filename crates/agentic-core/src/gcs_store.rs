@@ -38,10 +38,12 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
+use crate::scanner::{Allowlist, Scanner};
 use crate::store::ObjectStore;
 use crate::{Error, Result};
 
@@ -68,6 +70,8 @@ pub struct GcsObjectStore {
     endpoint: String,
     bearer_token: Option<String>,
     client: reqwest::blocking::Client,
+    scanner: Arc<Scanner>,
+    allowlist: Arc<Allowlist>,
 }
 
 impl GcsObjectStore {
@@ -91,7 +95,16 @@ impl GcsObjectStore {
             endpoint: endpoint.unwrap_or_else(|| DEFAULT_GCS_ENDPOINT.to_string()),
             bearer_token,
             client,
+            scanner: Arc::new(Scanner::new()),
+            allowlist: Arc::new(Allowlist::empty()),
         })
+    }
+
+    /// Replace the allowlist on this store. Builder-style so callers can
+    /// chain `GcsObjectStore::new(...)?.with_allowlist(al)`.
+    pub fn with_allowlist(mut self, allowlist: Allowlist) -> Self {
+        self.allowlist = Arc::new(allowlist);
+        self
     }
 
     // ---------- naming + caching -------------------------------------------
@@ -268,6 +281,17 @@ impl ObjectStore for GcsObjectStore {
     }
 
     fn put_raw(&self, _kind: ObjectKind, bytes: &[u8]) -> Result<Hash> {
+        // Scanner pre-hook (ADR-0013). Reject before any compression /
+        // network I/O — by the time we'd hit GCS the secret has already
+        // left the daemon's address space.
+        let hits = self.scanner.scan(bytes);
+        if !hits.is_empty() {
+            let h = Hash::of(bytes);
+            if !self.allowlist.contains(&h) {
+                return Err(Error::SecretDetected { hits });
+            }
+        }
+
         let hash = Hash::of(bytes);
         let compressed = zstd::stream::encode_all(bytes, 3)?;
         self.cache_write_compressed(&hash, &compressed)?;

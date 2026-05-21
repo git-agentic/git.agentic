@@ -11,9 +11,11 @@
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
+use crate::scanner::{Allowlist, Scanner};
 use crate::{Error, Result};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The store contract. MVP implementer is `FsObjectStore`; future
 /// implementers include S3, GCS, and a network-replicated store.
@@ -31,13 +33,26 @@ pub trait ObjectStore: Send + Sync {
 /// Local-filesystem object store. The MVP implementation.
 pub struct FsObjectStore {
     root: PathBuf,
+    scanner: Arc<Scanner>,
+    allowlist: Arc<Allowlist>,
 }
 
 impl FsObjectStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            scanner: Arc::new(Scanner::new()),
+            allowlist: Arc::new(Allowlist::empty()),
+        })
+    }
+
+    /// Replace the allowlist on this store. Builder-style so callers can
+    /// chain `FsObjectStore::open(root)?.with_allowlist(al)`.
+    pub fn with_allowlist(mut self, allowlist: Allowlist) -> Self {
+        self.allowlist = Arc::new(allowlist);
+        self
     }
 
     fn path_for(&self, hash: &Hash) -> PathBuf {
@@ -77,6 +92,18 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn put_raw(&self, _kind: ObjectKind, bytes: &[u8]) -> Result<Hash> {
+        // Scanner pre-hook (ADR-0013). Reject blobs with high-precision
+        // pattern matches or high-entropy runs unless the blob's hash is
+        // in the configured allowlist. The reject happens BEFORE any
+        // bytes touch disk.
+        let hits = self.scanner.scan(bytes);
+        if !hits.is_empty() {
+            let h = Hash::of(bytes);
+            if !self.allowlist.contains(&h) {
+                return Err(Error::SecretDetected { hits });
+            }
+        }
+
         let hash = Hash::of(bytes);
         let path = self.path_for(&hash);
         if !path.exists() {
@@ -149,5 +176,57 @@ mod tests {
             Err(Error::NotFound(h2)) => assert_eq!(h, h2),
             _ => panic!("expected NotFound"),
         }
+    }
+
+    #[test]
+    fn put_raw_rejects_blob_with_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let blob = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld";
+        match store.put_raw(ObjectKind::Blob, blob) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected, got {other:?}"),
+        }
+        // Confirm no object was written.
+        let h = Hash::of(blob);
+        assert!(!store.has(&h));
+    }
+
+    #[test]
+    fn put_raw_allowlist_suppresses_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld";
+        let h = Hash::of(blob);
+        let toml_text = format!(
+            r#"
+            [[ignore]]
+            blob_hash = "{}"
+        "#,
+            h.to_hex()
+        );
+        let al = crate::scanner::Allowlist::from_toml(&toml_text).unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap().with_allowlist(al);
+        let hash = store
+            .put_raw(ObjectKind::Blob, blob)
+            .expect("allowlisted blob should put cleanly");
+        assert_eq!(hash, h);
+        assert!(store.has(&h));
+    }
+
+    #[test]
+    fn put_raw_clean_blob_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let blob = b"normal-looking content";
+        let h = store
+            .put_raw(ObjectKind::Blob, blob)
+            .expect("clean blob should put");
+        assert_eq!(h, Hash::of(blob));
+        assert!(store.has(&h));
     }
 }
