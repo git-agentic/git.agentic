@@ -61,6 +61,7 @@ pub struct RollbackArgs {
 pub async fn execute(
     state: std::sync::Arc<DaemonState>,
     args: RollbackArgs,
+    peer_uid: Option<u32>,
 ) -> anyhow::Result<RollbackOutput> {
     let target_hash = state
         .refs
@@ -258,6 +259,7 @@ pub async fn execute(
         transcript: None,
         evals: None,
         cost_cents: 0,
+        peer_uid,
     };
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)
         .context("forward-recording rollback commit")?;
@@ -333,6 +335,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             signatures: Vec::new(),
+            peer_uid: None,
         }
     }
 

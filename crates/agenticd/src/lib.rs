@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod migrate;
 pub mod objstore;
+pub mod peer_auth;
 pub mod rollback;
 pub mod server;
 pub(crate) mod store_async;

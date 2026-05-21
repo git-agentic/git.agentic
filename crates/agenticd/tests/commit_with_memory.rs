@@ -120,11 +120,16 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
             .user_agent("agenticd-test")
             .build()
             .unwrap(),
+        peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
     });
 
-    let out = commit::execute(Arc::clone(&state), commit_input_with_memory("with-memory"))
-        .await
-        .expect("commit with memory should succeed");
+    let out = commit::execute(
+        Arc::clone(&state),
+        commit_input_with_memory("with-memory"),
+        None,
+    )
+    .await
+    .expect("commit with memory should succeed");
 
     // Read the commit blob back and inspect its memory_snapshot field —
     // the dimension `snapshot_memory` is supposed to populate via

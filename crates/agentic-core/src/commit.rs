@@ -64,6 +64,11 @@ pub struct CommitInputs {
     pub transcript: Option<Vec<u8>>,
     pub evals: Option<Vec<u8>>,
     pub cost_cents: u32,
+
+    /// UID of the daemon's socket peer; propagated into `Commit::peer_uid`.
+    /// `None` when the daemon is running under `--insecure-allow-any-uid`
+    /// or when commits originate from non-socket paths (e.g. unit tests).
+    pub peer_uid: Option<u32>,
 }
 
 /// Outputs of a successful commit.
@@ -130,6 +135,7 @@ pub fn stage_and_commit_with_now<S: ObjectStore + ?Sized>(
         evals: evals_hash,
         cost_cents: inputs.cost_cents,
         signatures: Vec::new(),
+        peer_uid: inputs.peer_uid,
     };
 
     // -- Step 3: write the Commit blob to the object store ---------------
@@ -239,6 +245,7 @@ mod tests {
             transcript: None,
             evals: None,
             cost_cents: 0,
+            peer_uid: None,
         }
     }
 
@@ -344,6 +351,7 @@ mod tests {
             transcript: None,
             evals: None,
             cost_cents: 0,
+            peer_uid: None,
         };
 
         let a = stage_and_commit_with_now(&store_a, &refs_a, "main", inputs(), fixed_now).unwrap();
@@ -382,6 +390,7 @@ mod tests {
             transcript: None,
             evals: None,
             cost_cents: 0,
+            peer_uid: None,
         };
 
         let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
