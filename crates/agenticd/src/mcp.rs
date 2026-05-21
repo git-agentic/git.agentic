@@ -15,7 +15,14 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+
+/// Maximum concurrent `fingerprint_one` calls inside `fingerprint_all`.
+/// Keeps a slow-but-many MCP fleet from saturating the local outbound
+/// HTTP connection pool while still letting independent servers run in
+/// parallel. Audit §A7 / B1 / C3 / R9.
+const FINGERPRINT_CONCURRENCY: usize = 8;
 
 /// One server to fingerprint on each commit. The `name` is purely a
 /// commit-tree key — it has no relationship to the MCP server's internal
@@ -63,15 +70,23 @@ pub struct McpFingerprint {
 
 /// Fingerprint every server in `servers`. Errors are returned per-server
 /// so a failed server doesn't drop the others.
+///
+/// Audit §A7 / §B1 / §C3 / §R9: pre-A7 this loop was sequential, so
+/// `handle_commit` held `commit_lock` for up to `N × 10s` on a slow MCP
+/// fleet (10s is the per-server timeout in `fingerprint_one`). With
+/// `futures::stream::iter(...).buffered(FINGERPRINT_CONCURRENCY)` the
+/// total wall time becomes `max(per-server)` rather than `sum`, and the
+/// output order remains the input order — preserved on purpose so
+/// `commit::fingerprint_tools`'s `zip(state.mcp_servers.iter(), fingerprints)`
+/// still attributes per-server errors to the correct server name.
 pub async fn fingerprint_all(
     client: &reqwest::Client,
     servers: &[McpServerSpec],
 ) -> Vec<Result<McpFingerprint, anyhow::Error>> {
-    let mut out = Vec::with_capacity(servers.len());
-    for spec in servers {
-        out.push(fingerprint_one(client, spec).await);
-    }
-    out
+    stream::iter(servers.iter().map(|spec| fingerprint_one(client, spec)))
+        .buffered(FINGERPRINT_CONCURRENCY)
+        .collect()
+        .await
 }
 
 /// Hit one MCP server's `tools/list` and return canonicalized bytes.
@@ -217,5 +232,148 @@ mod tests {
         assert!(parse_mcp_spec(&["no-equals-sign".into()]).is_err());
         assert!(parse_mcp_spec(&["=http://x".into()]).is_err());
         assert!(parse_mcp_spec(&["name=".into()]).is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Audit §A7 — parallelisation tests.
+    //
+    // A hand-rolled minimal HTTP server avoids pulling in `wiremock`
+    // (issue #53 will add a proper mock fixture for the broader MCP
+    // test gaps). Each fake responds to any single POST after sleeping
+    // for `delay` and returns a fixed `tools/list` JSON-RPC payload.
+    // ---------------------------------------------------------------
+
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a fake MCP server on an ephemeral 127.0.0.1 port. Accepts
+    /// `n_requests` connections, sleeps `delay` per request, replies
+    /// with a fixed `tools/list` JSON-RPC result. The task exits after
+    /// `n_requests` accepts so test teardown is clean.
+    async fn spawn_slow_mcp_server(
+        delay: Duration,
+        n_requests: usize,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            for _ in 0..n_requests {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                // Read whatever the client sent — we don't actually
+                // need the body, just drain enough to avoid the client
+                // blocking on its own write.
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+                tokio::time::sleep(delay).await;
+                let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(headers.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, handle)
+    }
+
+    /// AC for issue #42 / audit §A7: three servers each delaying
+    /// `delay` should finish in roughly `delay`, not `3 × delay`.
+    /// Audit's pseudocode said 5s per server; we use 1s to keep CI
+    /// fast while still leaving headroom between the parallel and
+    /// serial bounds (serial = 3s, parallel ≈ 1s + scheduler slack).
+    #[tokio::test]
+    async fn fingerprint_all_runs_servers_in_parallel() {
+        let delay = Duration::from_millis(1000);
+        let (addr1, h1) = spawn_slow_mcp_server(delay, 1).await;
+        let (addr2, h2) = spawn_slow_mcp_server(delay, 1).await;
+        let (addr3, h3) = spawn_slow_mcp_server(delay, 1).await;
+        let servers = vec![
+            McpServerSpec {
+                name: "a".into(),
+                url: format!("http://{addr1}/"),
+            },
+            McpServerSpec {
+                name: "b".into(),
+                url: format!("http://{addr2}/"),
+            },
+            McpServerSpec {
+                name: "c".into(),
+                url: format!("http://{addr3}/"),
+            },
+        ];
+
+        let client = reqwest::Client::new();
+        let start = std::time::Instant::now();
+        let results = fingerprint_all(&client, &servers).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.is_ok()),
+            "all servers should fingerprint cleanly; errors: {:?}",
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .collect::<Vec<_>>()
+        );
+        // Generous upper bound: the serial pre-A7 path would have
+        // taken >= 3 × 1s = 3s. Parallel path takes ~1s + scheduling
+        // slack; 2.5s gives plenty of headroom on a loaded runner
+        // without making the test flake-prone.
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "parallel fingerprinting of 3 servers each delaying {delay:?} should complete < 2.5s; took {elapsed:?}"
+        );
+
+        // Clean up.
+        let _ = tokio::time::timeout(Duration::from_secs(1), h1).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), h2).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), h3).await;
+    }
+
+    /// Output ordering: `buffered(N)` preserves input order even when
+    /// inner futures complete out of order, so callers can `zip` with
+    /// the input `servers` slice and still get correct attribution.
+    /// `commit::fingerprint_tools` relies on this for per-server error
+    /// messages. (Test-analyzer review pattern from PR #52 / issue #53
+    /// — the cheaper, dep-free part of that test gap is covered here.)
+    #[tokio::test]
+    async fn fingerprint_all_preserves_input_order() {
+        // Server 0 is SLOW (300ms), server 1 is FAST (no delay). If
+        // the implementation used `buffer_unordered` instead of
+        // `buffered`, the fast server would land in results[0] and
+        // this assertion would fail.
+        let (addr_slow, h_slow) = spawn_slow_mcp_server(Duration::from_millis(300), 1).await;
+        let (addr_fast, h_fast) = spawn_slow_mcp_server(Duration::ZERO, 1).await;
+        let servers = vec![
+            McpServerSpec {
+                name: "slow".into(),
+                url: format!("http://{addr_slow}/"),
+            },
+            McpServerSpec {
+                name: "fast".into(),
+                url: format!("http://{addr_fast}/"),
+            },
+        ];
+
+        let client = reqwest::Client::new();
+        let results = fingerprint_all(&client, &servers).await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].as_ref().unwrap().name,
+            "slow",
+            "results[0] must match servers[0] regardless of completion order"
+        );
+        assert_eq!(results[1].as_ref().unwrap().name, "fast");
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), h_slow).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), h_fast).await;
     }
 }
