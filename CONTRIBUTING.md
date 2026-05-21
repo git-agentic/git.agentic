@@ -1,6 +1,6 @@
 # Contributing to git.agentic
 
-`git.agentic` is in pre-MVP scaffolding (May–August 2026). The bar for the next twelve weeks is **demo-readiness**, not feature breadth. Contributions are welcome but scoped tightly.
+`git.agentic` is in its MVP hardening sprint (May–August 2026). MVP code is complete on `main`; the remaining work is verification, performance numbers, and the broken-prompt demo running cleanly from `git clone`. The bar for the next weeks is **demo-readiness**, not feature breadth. Contributions are welcome but scoped tightly.
 
 ## What we will merge right now
 
@@ -61,8 +61,8 @@ For any change that affects the architecture — adding a new crate, changing th
 
 ## Reporting security issues
 
-For anything that looks like a vulnerability (especially in the daemon's filesystem handling or in the secret-scanning logic), email Toni at toni.bergholm@gmail.com rather than opening a public issue.
+See [`SECURITY.md`](SECURITY.md) — please do not open public issues for vulnerabilities.
 
 ## Code of conduct
 
-Be kind. Disagree about ideas, not about people. The MVP is small enough that we will resolve any conflict by talking; if that fails, project lead has final say.
+This project follows the Contributor Covenant 2.1. See [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Report violations to toni@git-agentic.com.
