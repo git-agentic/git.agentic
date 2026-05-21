@@ -224,6 +224,8 @@ pub async fn execute(ctx: CommitCtx<'_>, req: CommitRequest) -> Result<CommitId>
 <a name="a4"></a>**A4 — Split `rollback.rs` into `mod.rs` (orchestration), `loaders.rs` (typed object readers), `writeback.rs` (FS prompts/tools)** — **DONE 2026-05-21** (issue [#39](https://github.com/git-agentic/git.agentic/issues/39)).
 *Addresses:* [S3](#s3), [S7](#s7), [R11](#r11), [R6](#r6) (drop the duplicate guard). *Principle:* SRP + High Cohesion. *Effort:* S.
 
+**Originally proposed** (kept for historical record; the shipped shape below differs in three ways noted in "Shipped shape"):
+
 ```rust
 // crates/agenticd/src/rollback/loaders.rs
 pub async fn load_commit(s: &dyn ObjectStore, id: &Hash) -> Result<Commit>;
@@ -231,6 +233,20 @@ pub async fn load_tree  (s: &dyn ObjectStore, id: &Hash) -> Result<Tree>;
 pub async fn load_blob  (s: &dyn ObjectStore, id: &Hash) -> Result<Bytes>;
 // crates/agenticd/src/rollback/writeback.rs
 pub async fn read_text_blobs(commit: &Commit, field: TreeField) -> Result<Vec<(PathBuf,String)>>;
+```
+
+**Shipped signatures** (differ from the proposal: loaders are sync `pub(super)` taking `&DaemonState` instead of async public on `&dyn ObjectStore`; `read_text_blobs` takes an `Option<Hash>` instead of a `TreeField` enum — see "Shipped shape" below for why):
+
+```rust
+// crates/agenticd/src/rollback/loaders.rs
+pub(super) fn load_commit  (state: &DaemonState, hash: &Hash) -> Result<Commit>;
+pub(super) fn load_tree    (state: &DaemonState, hash: &Hash) -> Result<Tree>;
+pub(super) fn load_blob    (state: &DaemonState, hash: &Hash) -> Result<Blob>;
+pub(super) fn load_manifest(state: &DaemonState, hash: &Hash) -> Result<SegmentManifest>;
+// crates/agenticd/src/rollback/writeback.rs
+pub(super) fn restore_prompts  (state: &DaemonState, repo: &Path, prompts_hash: &Hash) -> Result<()>;
+pub(super) fn read_text_blobs  (state: &DaemonState, hash: Option<Hash>) -> Result<BTreeMap<String, Vec<u8>>>;
+pub(super) fn read_model_text  (state: &DaemonState, target: &Commit) -> Result<Option<String>>;
 ```
 
 **Shipped shape:**
