@@ -29,16 +29,18 @@ use crate::server::DaemonState;
 /// but not in the target tree are removed so the working set matches.
 ///
 /// Path safety: each tree entry name is validated via
-/// [`validate_tree_entry_name`] before joining with the prompts directory,
-/// rejecting absolute paths and `..` components. The daemon trusts Tree
-/// objects (they were content-addressed by a prior commit), but a
-/// malicious or corrupted Tree must not be allowed to escape the
-/// prompts directory — that's a write-anywhere primitive otherwise.
+/// [`validate_tree_entry_name`] before being joined with the prompts directory,
+/// rejecting absolute paths and `..` components. Content-addressing guarantees
+/// the stored bytes match what was committed, but it does not prevent a
+/// compromised commit-write path from storing adversarial names — so
+/// validation is required unconditionally.
 ///
-/// Symlinks are also handled defensively: if the resolved destination
-/// already exists as a symlink, we unlink it before writing so the
-/// write lands on a fresh regular file and can't be redirected outside
-/// the prompts directory. (Copilot review on PR #51.)
+/// Symlinks and races are handled defensively by [`write_blob_safely`]:
+/// if the destination already exists as a symlink we unlink it first
+/// (so the write lands on a fresh regular file and can't be redirected
+/// outside the prompts directory), and the actual write is done as
+/// write-to-temp + atomic rename so a concurrent attacker can't plant a
+/// symlink between the unlink and the write. (Copilot review on PR #51.)
 pub(super) fn restore_prompts(
     state: &DaemonState,
     repo: &Path,
@@ -55,24 +57,52 @@ pub(super) fn restore_prompts(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // If something exists at the destination already and it's a
-        // symlink, unlink it before writing — std::fs::write follows
-        // symlinks, which would let an attacker-pre-planted link
-        // redirect the write outside the prompts directory.
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() {
-                std::fs::remove_file(&path).with_context(|| {
-                    format!("removing pre-existing symlink at {}", path.display())
-                })?;
-            }
-        }
         let blob = load_blob(state, &r.hash)?;
-        std::fs::write(&path, &blob.bytes)
-            .with_context(|| format!("writing {}", path.display()))?;
+        write_blob_safely(&path, &blob.bytes)?;
         wanted.insert(path);
     }
 
     sweep_orphans(&dir, &dir, &wanted)?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` safely:
+///
+/// 1. If `path` already exists as a symlink, unlink it. Any other
+///    `symlink_metadata` error (besides `NotFound`) propagates — we
+///    must not silently proceed if e.g. permissions deny inspection
+///    of the destination, since the attack we're defending against
+///    is a redirected write. Only `NotFound` is benign (the file
+///    doesn't exist yet, which is the common case).
+/// 2. Write the new bytes to a sibling `.tmp` file, then atomically
+///    `rename(2)` it over `path`. This closes the TOCTOU window
+///    between the symlink unlink and the regular file write: even if
+///    an attacker re-plants a symlink at `path` between steps, the
+///    rename replaces it as a regular file (it doesn't follow links).
+///
+/// Mirrors `agentic-core::store::FsObjectStore::write_at`'s
+/// temp-then-rename pattern. (Copilot review on PR #51, second pass.)
+fn write_blob_safely(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("removing pre-existing symlink at {}", path.display()))?;
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "checking for symlink at {} before prompt write",
+                    path.display()
+                )
+            });
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing temp file {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -118,7 +148,18 @@ fn sweep_orphans(root: &Path, here: &Path, wanted: &BTreeSet<PathBuf>) -> anyhow
         if ft.is_dir() {
             sweep_orphans(root, &path, wanted)?;
             if path != root && std::fs::read_dir(&path)?.next().is_none() {
-                let _ = std::fs::remove_dir(&path);
+                // remove_dir can race a concurrent writer (or fail if the
+                // directory got something new since the read_dir check);
+                // log + continue rather than silently swallowing or
+                // failing the whole rollback. The next rollback will try
+                // again. (Copilot review on PR #51, second pass.)
+                if let Err(e) = std::fs::remove_dir(&path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "could not remove empty orphan directory; will retry on next rollback"
+                    );
+                }
             }
         } else if !wanted.contains(&path) {
             // Files, symlinks, FIFOs, sockets — anything that isn't a
@@ -169,7 +210,14 @@ pub(super) fn read_model_text(
         return Ok(None);
     };
     let blob = load_blob(state, &hash)?;
-    Ok(Some(String::from_utf8_lossy(&blob.bytes).into_owned()))
+    // Reject invalid UTF-8 loudly rather than silently replacing the
+    // offending bytes with U+FFFD — a non-UTF-8 model blob is a
+    // corruption signal we want to surface to the operator, not
+    // silently corrupt by lossy decoding into the forward-record
+    // Commit. (Copilot review on PR #51, second pass.)
+    String::from_utf8(blob.bytes)
+        .with_context(|| format!("model blob at {hash} contains invalid UTF-8"))
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -237,5 +285,92 @@ mod tests {
             !orphan_link.exists() && std::fs::symlink_metadata(&orphan_link).is_err(),
             "orphan symlink should have been removed"
         );
+    }
+
+    // The pre-write symlink guard: if `<repo>/prompts/system.md` is
+    // already a symlink pointing outside the dir, `write_blob_safely`
+    // must unlink it and write a regular file at the destination —
+    // never follow the symlink. The outside target must remain
+    // untouched. This is the writeback path's primary defence against
+    // a pre-planted-symlink redirected-write attack. (Copilot review on
+    // PR #51, second pass.)
+    #[cfg(unix)]
+    #[test]
+    fn write_blob_safely_unlinks_pre_existing_symlink_and_writes_regular_file() {
+        use std::os::unix::fs::symlink;
+        let prompts_tmp = tempfile::tempdir().unwrap();
+        let outside_tmp = tempfile::tempdir().unwrap();
+        let outside_target = outside_tmp.path().join("secret.txt");
+        std::fs::write(
+            &outside_target,
+            b"outside content - must not be overwritten",
+        )
+        .unwrap();
+
+        // Pre-plant a malicious symlink at the destination.
+        let dest = prompts_tmp.path().join("system.md");
+        symlink(&outside_target, &dest).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "pre-condition: dest must start as a symlink"
+        );
+
+        // Write the new blob.
+        write_blob_safely(&dest, b"restored prompt content").unwrap();
+
+        // The symlink is gone; dest is now a regular file with the new
+        // bytes.
+        let meta = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.file_type().is_file(), "dest should be a regular file");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "dest must no longer be a symlink"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"restored prompt content",
+            "dest should contain the new blob bytes"
+        );
+
+        // The original symlink target outside the prompts directory
+        // must NOT have been overwritten.
+        assert_eq!(
+            std::fs::read(&outside_target).unwrap(),
+            b"outside content - must not be overwritten",
+            "outside target must be untouched"
+        );
+
+        // No leftover temp file in the prompts dir.
+        let tmp_path = dest.with_extension("tmp");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should have been renamed away"
+        );
+    }
+
+    #[test]
+    fn write_blob_safely_creates_new_file_when_dest_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("new.md");
+        assert!(!dest.exists());
+        write_blob_safely(&dest, b"hello").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_blob_safely_replaces_regular_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("existing.md");
+        std::fs::write(&dest, b"old content").unwrap();
+        write_blob_safely(&dest, b"new content").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+        // Regular file (not turned into anything weird).
+        assert!(std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_file());
     }
 }
