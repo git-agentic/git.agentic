@@ -252,6 +252,16 @@ mod tests {
     /// no MCP servers, no MCP HTTP traffic. Suitable for unit tests of
     /// the commit orchestrator that don't exercise phases 1 or 2.
     async fn make_state(repo: &std::path::Path) -> Arc<DaemonState> {
+        make_state_with_mcp(repo, Vec::new()).await
+    }
+
+    /// As `make_state`, but with a configured MCP server list. Used by
+    /// the `fingerprint_tools` tests below that point at `wiremock`
+    /// servers and exercise phase 2 end-to-end.
+    async fn make_state_with_mcp(
+        repo: &std::path::Path,
+        mcp_servers: Vec<crate::mcp::McpServerSpec>,
+    ) -> Arc<DaemonState> {
         let agentic_dir = repo.join(".agentic");
         std::fs::create_dir_all(&agentic_dir).unwrap();
         let store: Arc<dyn ObjectStore + Send + Sync> =
@@ -263,7 +273,7 @@ mod tests {
                 store,
                 None,       // no postgres
                 Vec::new(), // no tracked tables
-                Vec::new(), // no MCP servers
+                mcp_servers,
                 Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
             )
             .await
@@ -528,6 +538,142 @@ mod tests {
         let head = state.refs.read_head().unwrap();
         assert!(matches!(head, Some(HeadRef::Branch(b)) if b == "feature-x"));
         assert!(state.refs.read_branch("feature-x").unwrap().is_some());
+    }
+
+    // Issue #53 (1/2): a single failing MCP server must propagate as an
+    // Err out of `fingerprint_tools` — partial success would corrupt
+    // the tools-tree hash relative to the supposed commit state. The
+    // current implementation enforces this with an early `?` on the
+    // zipped `Result`; this test would fail under a hypothetical
+    // refactor to `Vec<Result<_>>` / partition-collect that silently
+    // dropped per-server errors.
+    #[tokio::test]
+    async fn fingerprint_tools_propagates_per_server_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+
+        // ok_srv responds with a valid JSON-RPC tools/list payload.
+        // fail_srv responds with HTTP 500 — mcp::fingerprint_one turns
+        // this into an Err with the server name embedded in the chain.
+        let ok_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": []}
+            })))
+            .mount(&ok_srv)
+            .await;
+        let fail_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .mount(&fail_srv)
+            .await;
+
+        let state = make_state_with_mcp(
+            dir.path(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "ok".to_string(),
+                    url: format!("{}/", ok_srv.uri()),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "failing".to_string(),
+                    url: format!("{}/", fail_srv.uri()),
+                },
+            ],
+        )
+        .await;
+
+        let err = fingerprint_tools(&state)
+            .await
+            .expect_err("a 500 from one MCP server must fail the whole phase");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("failing"),
+            "error chain must name the failing server; got: {chain}"
+        );
+    }
+
+    // Issue #53 (2/2): the tools map must be keyed by configured server
+    // name and each key must point at the canonical bytes returned by
+    // *that server's* URL. Today this holds because `fingerprint_all`
+    // preserves input order and `fingerprint_one` carries `spec.name`
+    // verbatim into `McpFingerprint.name`. A future refactor that
+    // reorders or de-correlates either of those would misattribute
+    // fingerprints; this test catches that by giving each mock server a
+    // payload that mentions its own name.
+    #[tokio::test]
+    async fn fingerprint_tools_keys_by_server_name_in_order() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+
+        let srv_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [{"name": "from-srv-a"}]}
+            })))
+            .mount(&srv_a)
+            .await;
+        let srv_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [{"name": "from-srv-b"}]}
+            })))
+            .mount(&srv_b)
+            .await;
+
+        let state = make_state_with_mcp(
+            dir.path(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "alpha".to_string(),
+                    url: format!("{}/", srv_a.uri()),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "bravo".to_string(),
+                    url: format!("{}/", srv_b.uri()),
+                },
+            ],
+        )
+        .await;
+
+        let tools = fingerprint_tools(&state)
+            .await
+            .expect("both servers returned 200 — phase must succeed");
+        assert_eq!(tools.len(), 2, "expected one entry per configured server");
+
+        let alpha_bytes = tools.get("alpha").expect("missing key 'alpha'");
+        let bravo_bytes = tools.get("bravo").expect("missing key 'bravo'");
+        let alpha_str = std::str::from_utf8(alpha_bytes).unwrap();
+        let bravo_str = std::str::from_utf8(bravo_bytes).unwrap();
+        assert!(
+            alpha_str.contains("from-srv-a"),
+            "'alpha' must hold the payload served by srv_a; got: {alpha_str}"
+        );
+        assert!(
+            bravo_str.contains("from-srv-b"),
+            "'bravo' must hold the payload served by srv_b; got: {bravo_str}"
+        );
+        // And explicitly assert the misattribution case is not present.
+        assert!(
+            !alpha_str.contains("from-srv-b"),
+            "alpha must not be attributed srv_b's payload"
+        );
+        assert!(
+            !bravo_str.contains("from-srv-a"),
+            "bravo must not be attributed srv_a's payload"
+        );
     }
 
     // Branch inference: when CommitInput.branch is None and HEAD is
