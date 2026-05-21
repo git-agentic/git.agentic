@@ -1,4 +1,4 @@
-# Sidecar agenticd for the Codento Executor (ADR-0004).
+# Sidecar agenticd for the first platform-partner integration (ADR-0004).
 # Build (from repo root):
 #   docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .
 

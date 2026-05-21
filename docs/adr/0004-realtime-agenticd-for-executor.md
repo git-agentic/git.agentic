@@ -9,7 +9,7 @@
 
 ## Context
 
-ADR-0003 Decision 1 commits the Codento Executor as the first non-LangGraph integration target in v1.0.
+ADR-0003 Decision 1 commits the first platform-partner integration as the first non-LangGraph integration target in v1.0.
 ADR-0003 Decision 2 (as revised) commits to **real-time atomic integration** rather than the originally-considered layered/offline manifest-export path.
 This ADR answers the question that revision raises: how does `agenticd` actually attach to a Cloud Run worker that runs one ticket and dies?
 
@@ -30,7 +30,7 @@ This ADR picks the sidecar.
 The worker speaks to it over a Unix domain socket — the same `agentic-proto` wire used by the LangGraph integration.
 There is no network surface; communication is intra-instance only.
 
-This matches ADR-0001 Decision 10's "self-hosted, no SaaS, no multi-tenant" posture: the daemon runs inside infrastructure the user already operates (Codento's Cloud Run service for the Executor), not as a hosted service we run.
+This matches ADR-0001 Decision 10's "self-hosted, no SaaS, no multi-tenant" posture: the daemon runs inside infrastructure the user already operates (the platform partner's Cloud Run service for the Executor), not as a hosted service we run.
 
 ### Decision 2 — No network auth in v1.0
 
@@ -59,7 +59,7 @@ Atomic rollback is the contract; silently degrading to manifest-export breaks th
 If the sidecar process dies mid-session, the worker:
 
 1. Receives an IPC error on the next checkpoint write.
-2. Marks the Flux ticket as failed with a structured error pointing at the agentic-side incident (sidecar exit code, last successful checkpoint hash).
+2. Marks the dispatcher ticket as failed with a structured error pointing at the agentic-side incident (sidecar exit code, last successful checkpoint hash).
 3. Exits non-zero. Cloud Run's restart policy applies as for any other worker failure.
 
 This is loud-fail by design.
@@ -91,7 +91,7 @@ Subsequent platform integrations inherit the GCS backend without re-litigation.
 
 **Negative:**
 
-- Two-process Cloud Run packaging (worker + sidecar) is more operational complexity than the Executor would otherwise have. Codento's deploy pipeline must absorb that.
+- Two-process Cloud Run packaging (worker + sidecar) is more operational complexity than the Executor would otherwise have. The platform partner's deploy pipeline must absorb that.
 - Per-checkpoint GCS write is a real latency cost. If the Claude Agent SDK fires checkpoints aggressively, per-ticket runtime grows by the cumulative write time.
 - The Coding worker becomes a hard dependency on a sidecar that didn't exist when ADR-0003 was first drafted. Failure modes (sidecar OOM, sidecar crash on flush, partial-checkpoint recovery on instance restart) need explicit testing.
 
@@ -99,9 +99,9 @@ Subsequent platform integrations inherit the GCS backend without re-litigation.
 
 - The Claude Agent SDK's checkpoint primitives may not exactly match Decision 3. Verify in week 6 that `on_checkpoint` (or equivalent) fires at boundaries we can snapshot and that the SDK supports pause/restore on demand. If it doesn't, ADR-0003 Decision 2 reverts to manifest-export for v1.0 and this ADR is reopened.
 - GCS region/availability incidents block all Executor sessions in v1.0 (single-region dependency). Document the dependency explicitly; consider multi-region in v1.1.
-- Sidecar packaging interacts with how Codento builds and deploys the Executor (single container with two processes via supervisor, or two containers in one Cloud Run service). Coordinate with that build pipeline starting week 6.
+- Sidecar packaging interacts with how the platform partner builds and deploys the Executor (single container with two processes via supervisor, or two containers in one Cloud Run service). Coordinate with that build pipeline starting week 6.
 
 See also:
 [ADR-0001](0001-architecture-foundations.md) Decisions 9 (CLI-first) and 10 (self-hosted, no SaaS in MVP),
 [ADR-0002](0002-substrate-and-supercommit.md) Decision 6 (storage layer must stay swappable — this ADR exercises that swap),
-[ADR-0003](0003-codento-executor-integration.md) Decision 2 (the atomic contract this ADR makes implementable).
+[ADR-0003](0003-claude-agent-sdk-integration.md) Decision 2 (the atomic contract this ADR makes implementable).

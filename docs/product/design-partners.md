@@ -19,7 +19,7 @@ A candidate qualifies only if **all** of the following are true:
 - **Team size 2–15 engineers**, at least one of whom has authority over the staging environment and is willing to spend an hour on setup.
 - **They have already been bitten** by a regression that `git revert` alone could not fix — a prompt change that contaminated memory, a model swap that broke downstream behaviour, or similar. This is the qualifying question; if they answer "no" or "we haven't seen that yet," they are not a Week-12 partner.
 
-Per the MVP spec, **coding-agent companies (Cursor / Cognition class) are explicitly disqualified** as design partners — they own their own infrastructure and use a different shape. The Codento Executor integration (ADR-0003) runs in parallel as a platform-led track, not through this design-partner pipeline.
+Per the MVP spec, **coding-agent companies (Cursor / Cognition class) are explicitly disqualified** as design partners — they own their own infrastructure and use a different shape. The the first platform-partner integration integration (ADR-0003) runs in parallel as a platform-led track, not through this design-partner pipeline.
 
 ## The ask
 

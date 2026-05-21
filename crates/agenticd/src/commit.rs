@@ -429,7 +429,7 @@ mod tests {
         prompts.insert("system.md".to_string(), "x".to_string());
         let input = CommitInput {
             message: "hi".to_string(),
-            author: Some("alice@codento".to_string()),
+            author: Some("alice@example.com".to_string()),
             code_sha: None,
             branch: None,
             prompts,
@@ -438,7 +438,7 @@ mod tests {
             no_memory: true,
         };
         let out = assemble_inputs(input, None, None, None, BTreeMap::new());
-        assert_eq!(out.author, "alice@codento");
+        assert_eq!(out.author, "alice@example.com");
     }
 
     // Branch inference: when CommitInput.branch is None and HEAD already

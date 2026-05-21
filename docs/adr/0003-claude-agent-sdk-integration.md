@@ -1,4 +1,4 @@
-# ADR-0003: Codento Executor as First Non-LangGraph Integration Target
+# ADR-0003: Claude Agent SDK as First Non-LangGraph Integration Target
 
 **Status:** Accepted
 **Date:** 2026-05-20
@@ -12,8 +12,8 @@ Other frameworks were explicitly deferred to v1.1, "via the same SDK contract."
 
 Three things have changed since that decision was taken.
 
-First, Codento's internal **Executor** (sketched in `codento-core/docs/EXECUTOR.md`) is the most concrete agent-runtime use case we have line-of-sight to.
-It is two Cloud Run services — a dispatcher that polls Flux's MCP for ready tickets, and a Coding worker that runs one ticket per scale-to-zero instance against a sandboxed repo checkout, opens a PR, and posts the result back to Flux through Flux's MCP.
+First, the platform partner's internal coding-execution service (sketched in an internal partner design doc, not in this repo) is the most concrete agent-runtime use case we have line-of-sight to.
+It is two Cloud Run services — a dispatcher that polls the ticket dispatcher's MCP for ready tickets, and a Coding worker that runs one ticket per scale-to-zero instance against a sandboxed repo checkout, opens a PR, and posts the result back through the same MCP.
 
 Second, the Executor's primary harness is the **Claude Agent SDK**, not LangGraph.
 The reasoning in `EXECUTOR.md` §4 is explicit and well-argued: only the Claude Agent SDK gives both benchmark-quality harness behavior and the programmatic surface (per-ticket MCP wiring, streamed tool/result events, checkpoint/resume, per-run model swap) the orchestration needs.
@@ -32,10 +32,10 @@ The Executor is the first piece of evidence that stateful coding-agent teams are
 
 ## Decision
 
-### Decision 1 — Codento Executor is the first non-LangGraph integration target, in v1.0
+### Decision 1 — The Claude Agent SDK is the first non-LangGraph integration target, in v1.0
 
 ADR-0001 Decision 7 is amended.
-MVP framework support is now **LangGraph plus the Claude Agent SDK (via the Codento Executor)**.
+MVP framework support is now **LangGraph plus the Claude Agent SDK (via the first platform-partner integration)**.
 All other frameworks remain deferred to v1.1 via the same SDK contract.
 
 This is a deliberate scope add to the 12-week MVP. The cost is justified because:
@@ -97,14 +97,14 @@ The Agent-SDK manifest path is comparatively shallow — it is essentially a str
 
 - The "framework-neutral SDK contract" claim from ADR-0001 Decision 7 gets tested against a second framework before v1.0 ships, not after. If the contract is wrong, we discover it on a friendly first integrator.
 - The Executor integration reaches **parity with the LangGraph integration on atomic rollback**. The platform-led story is the full product, not a degraded subset.
-- Codento has a concrete first-party integration to point at when talking to the next platform partner — one that demonstrates atomic, not one with a caveat.
+- The platform partner has a concrete first-party integration to point at when talking to the next platform partner — one that demonstrates atomic, not one with a caveat.
 - The Executor's harness × model matrix becomes a real-world stress test of `agentic diff` and `agentic rollback` against runs we did not architect for.
 - The GCS-backed `ObjectStore` implementation (ADR-0004 Decision 5), originally anticipated as v2+ under ADR-0002 Decision 6, lands in v1.0 as a side-effect. Subsequent platform integrations inherit it without re-litigation.
 - Resolves the in-repo strategic-tension flag (LangGraph-team MVP vs. platform-led GTM) constructively: the demo discipline runs on LangGraph; the platform-style integration runs on the Claude Agent SDK with the same product surface; both through the same SDK contract.
 
 **Negative:**
 
-- 12-week MVP scope grows substantially — the **largest scope add since the foundational ADRs**. The roadmap (`docs/product/roadmap.md`) must absorb a GCS-backed `ObjectStore`, sidecar packaging, integration tests against a real GCS bucket, and ongoing coordination with the Codento Executor team. The plan now has negative slack on the Executor track.
+- 12-week MVP scope grows substantially — the **largest scope add since the foundational ADRs**. The roadmap (`docs/product/roadmap.md`) must absorb a GCS-backed `ObjectStore`, sidecar packaging, integration tests against a real GCS bucket, and ongoing coordination with the platform-partner integration team. The plan now has negative slack on the Executor track.
 - The Executor is not yet built. We are committing to a real-time integration with a sidecar that does not exist on a development schedule we do not control. Coordination risk is structural and ongoing.
 - We trade the "Executor's hot path stays free of any agentic-side runtime dependency" property of the original Decision 2 for the atomic contract. If the sidecar is broken, the Executor is broken. This is the right trade for the product story, but it raises the operational bar and the failure surface.
 
@@ -113,10 +113,10 @@ The Agent-SDK manifest path is comparatively shallow — it is essentially a str
 - If the Claude Agent SDK's checkpoint primitives are not as ADR-0004 Decision 3 assumes (granularity, pause/restore support, timing), this Decision 2 may not be implementable as designed. Verify in **week 6**. Fallback is to revert to the originally-drafted manifest-export shape for v1.0 and reopen ADR-0004 for the next attempt.
 - If the GCS-backed `ObjectStore` cannot pass integration tests by **end of week 8**, revert to manifest-export and defer atomic to v1.1. This decision point is hard, called out in the roadmap.
 - If the SDK contract cannot accommodate the Agent-SDK use case without contortion, this ADR is wrong about "no framework-specific Commit fields" and a follow-up ADR (ADR-0005 or later) will be needed to amend the Commit schema. Better to find this in week 6 than week 11.
-- If the Codento Executor team's harness work slips past the demo, the integration cannot be demonstrated even if our daemon side is ready. Fallback: a hand-rolled stub Cloud Run worker that exercises the wire protocol with synthetic Agent-SDK events, sufficient for a demo.
+- If the platform partner's harness work slips past the demo, the integration cannot be demonstrated even if our daemon side is ready. Fallback: a hand-rolled stub Cloud Run worker that exercises the wire protocol with synthetic Agent-SDK events, sufficient for a demo.
 
 See also:
 [ADR-0001](0001-architecture-foundations.md) (amended Decision 7),
 [ADR-0002](0002-substrate-and-supercommit.md) (the Commit object as platform API contract, and Decision 6's swappable storage layer exercised by ADR-0004 Decision 5),
 [ADR-0004](0004-realtime-agenticd-for-executor.md) (the sidecar topology that makes Decision 2 implementable),
-and `codento-core/docs/EXECUTOR.md` (the Codento Executor design sketch this ADR responds to).
+and the internal partner design sketch this ADR responds to (not in this repo).

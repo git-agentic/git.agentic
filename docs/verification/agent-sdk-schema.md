@@ -3,13 +3,13 @@
 Status: PASS
 Date: 2026-05-20
 Owner: toni
-ADR refs: [ADR-0002](../adr/0002-substrate-and-supercommit.md), [ADR-0003](../adr/0003-codento-executor-integration.md), [ADR-0004](../adr/0004-realtime-agenticd-for-executor.md)
+ADR refs: [ADR-0002](../adr/0002-substrate-and-supercommit.md), [ADR-0003](../adr/0003-claude-agent-sdk-integration.md), [ADR-0004](../adr/0004-realtime-agenticd-for-executor.md)
 
 ## Why this exists
 
 [`docs/product/roadmap.md`](../product/roadmap.md) Week 6 schedules a verification checkpoint: with the Commit object capturing all six tuple dimensions for LangGraph, can it also express a Claude Agent SDK session **without framework-specific fields**, and do the SDK's checkpoint primitives match what [ADR-0004 Decision 3](../adr/0004-realtime-agenticd-for-executor.md) assumes?
 
-This doc is the receipt. If either check failed, the trigger was either ADR-0005 (amend the Commit schema) or the [ADR-0003 Decision 2 escape hatch](../adr/0003-codento-executor-integration.md) (revert to layered manifest-export for v1.0 and defer atomic to v1.1).
+This doc is the receipt. If either check failed, the trigger was either ADR-0005 (amend the Commit schema) or the [ADR-0003 Decision 2 escape hatch](../adr/0003-claude-agent-sdk-integration.md) (revert to layered manifest-export for v1.0 and defer atomic to v1.1).
 
 Neither was triggered. One WARNING is recorded for future work.
 
@@ -151,7 +151,7 @@ Concrete consequences:
 1. The SDK contract stays framework-neutral. No `agent_sdk_*` fields enter `Commit`.
 2. The sidecar's snapshot triggers are: `PostToolUse` for incremental, `Stop` / `SubagentStop` for terminal, `SessionStart` for the initial commit. Wire this into `crates/agenticd/src/mcp.rs`'s hook integration when the sidecar work begins.
 3. Carry forward the per-call MCP fingerprinting WARNING as a known v1.1 polish item. Document it in the v1.0 release notes so design partners are not surprised.
-4. Coordinate with the Codento Executor team that their Coding worker registers the hooks above against the SDK's hook system. This is ADR-0003 §"Coordination" territory.
+4. Coordinate with the platform-partner integration team that their Coding worker registers the hooks above against the SDK's hook system. This is ADR-0003 §"Coordination" territory.
 
 ## What would have failed this check
 
