@@ -221,8 +221,10 @@ pub async fn execute(ctx: CommitCtx<'_>, req: CommitRequest) -> Result<CommitId>
 }
 ```
 
-<a name="a4"></a>**A4 — Split `rollback.rs` into `mod.rs` (orchestration), `loaders.rs` (typed object readers), `writeback.rs` (FS prompts/tools)**
+<a name="a4"></a>**A4 — Split `rollback.rs` into `mod.rs` (orchestration), `loaders.rs` (typed object readers), `writeback.rs` (FS prompts/tools)** — **DONE 2026-05-21** (issue [#39](https://github.com/git-agentic/git.agentic/issues/39)).
 *Addresses:* [S3](#s3), [S7](#s7), [R11](#r11), [R6](#r6) (drop the duplicate guard). *Principle:* SRP + High Cohesion. *Effort:* S.
+
+**Originally proposed** (kept for historical record; the shipped shape below differs in three ways noted in "Shipped shape"):
 
 ```rust
 // crates/agenticd/src/rollback/loaders.rs
@@ -232,6 +234,31 @@ pub async fn load_blob  (s: &dyn ObjectStore, id: &Hash) -> Result<Bytes>;
 // crates/agenticd/src/rollback/writeback.rs
 pub async fn read_text_blobs(commit: &Commit, field: TreeField) -> Result<Vec<(PathBuf,String)>>;
 ```
+
+**Shipped signatures** (differ from the proposal: loaders are sync `pub(super)` taking `&DaemonState` instead of async public on `&dyn ObjectStore`; `read_text_blobs` takes an `Option<Hash>` instead of a `TreeField` enum — see "Shipped shape" below for why):
+
+```rust
+// crates/agenticd/src/rollback/loaders.rs
+pub(super) fn load_commit  (state: &DaemonState, hash: &Hash) -> Result<Commit>;
+pub(super) fn load_tree    (state: &DaemonState, hash: &Hash) -> Result<Tree>;
+pub(super) fn load_blob    (state: &DaemonState, hash: &Hash) -> Result<Blob>;
+pub(super) fn load_manifest(state: &DaemonState, hash: &Hash) -> Result<SegmentManifest>;
+// crates/agenticd/src/rollback/writeback.rs
+pub(super) fn restore_prompts  (state: &DaemonState, repo: &Path, prompts_hash: &Hash) -> Result<()>;
+pub(super) fn read_text_blobs  (state: &DaemonState, hash: Option<Hash>) -> Result<BTreeMap<String, Vec<u8>>>;
+pub(super) fn read_model_text  (state: &DaemonState, target: &Commit) -> Result<Option<String>>;
+```
+
+**Shipped shape:**
+
+- `crates/agenticd/src/rollback.rs` (462 lines) replaced by `crates/agenticd/src/rollback/{mod.rs, loaders.rs, writeback.rs}`.
+- `loaders.rs` owns `load_commit`, `load_tree`, `load_blob`, `load_manifest` — pure `ObjectStore` consumers, no rollback logic. Functions are `pub(super)` so the orchestrator imports them, and they take `&DaemonState` (not `&dyn ObjectStore`) to match the existing call signature; switching to `&dyn ObjectStore` was rejected as scope creep for this refactor.
+- `writeback.rs` owns FS write-back (`restore_prompts`, `sweep_orphans`) and Commit-tree readers (`read_text_blobs`, `read_model_text`, helper `tree_to_map`).
+- **`read_text_blobs(state, Option<Hash>)` collapses the previous `read_prompts_for_commit` / `read_tools_for_commit` pair** (audit [§S7](#s7)). Call sites at `mod.rs` now read `read_text_blobs(&state, target.prompts)` / `read_text_blobs(&state, target.tools)` — the `Option<Hash>` parameter makes the field selector explicit and removes the duplicated body.
+- `mod.rs` owns phase orchestration (`execute`, `validate_target_shape`, `RollbackArgs`) plus the existing `#[cfg(test)] mod tests` for the validate-target-shape AC tests carried over from A8.
+- **R6 (schema-version gate duplication) re-examined:** post-A8, the rollback-side check at `mod.rs` ~line 117 is a *planning* step (decides whether reverse migrations are needed and how many), not a *gate*. The actual gate lives in `PostgresAdapter::restore_with_guard` (`postgres.rs:415`) and only runs on the success path — A8's outer-transaction rollback ensures partial-migration failure can't leave the daemon between schema versions, so the two checks no longer raise inconsistent error types. The duplication noted in S5 is now informational; left in place with a comment in `mod.rs` documenting why.
+
+**Tests:** all four `validate_target_shape` unit tests from A8 still pass (moved to `mod.rs#tests`). All 3 A8 integration tests (`reverse_migration.rs`) still pass against real Postgres. No new tests required — A4 is a behavior-preserving refactor.
 
 <a name="a5"></a>**A5 — Move GCS blocking I/O off LocalSet via `tokio::task::spawn_blocking`** (tactical now; full async-trait via ADR-0011 follows)
 *Addresses:* [C1](#c1), [B2](#b2), [B3](#b3), [R3](#r3). *Principle:* Loose coupling between execution model and I/O. *Effort:* S tactical / M with ADR.
@@ -318,7 +345,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | [#36](https://github.com/git-agentic/git.agentic/issues/36) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | (TBD) | `hardening-sprint` | — |
-| A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | (TBD) | `hardening-sprint` | — |
+| A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | [#39](https://github.com/git-agentic/git.agentic/issues/39) **DONE** | `hardening-sprint` | — |
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | (TBD) | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope (blocked by ADR-0010) | (TBD) | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | (TBD) | `hardening-sprint` | — |
