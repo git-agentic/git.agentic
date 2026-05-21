@@ -63,3 +63,7 @@ Thumbs.db
 # Other agent harnesses — per-user state
 .codex/
 .entire/
+
+# Cursor — per-user IDE state. Shared configs (e.g. .cursor/rules/*.mdc,
+# .cursor/mcp.json) are tracked; runtime hook state is not.
+.cursor/hooks/state/
