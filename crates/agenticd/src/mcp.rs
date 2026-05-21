@@ -19,9 +19,11 @@ use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 
 /// Maximum concurrent `fingerprint_one` calls inside `fingerprint_all`.
-/// Keeps a slow-but-many MCP fleet from saturating the local outbound
-/// HTTP connection pool while still letting independent servers run in
-/// parallel. Audit §A7 / B1 / C3 / R9.
+/// Bounds the number of simultaneous outbound TCP sockets / TLS
+/// handshakes / file descriptors held during the commit's MCP fan-out
+/// (reqwest already pools per-host, so this cap is about *parallel
+/// outbound connections to distinct hosts*, not pool starvation).
+/// Audit §A7 / B1 / C3 / R9.
 const FINGERPRINT_CONCURRENCY: usize = 8;
 
 /// One server to fingerprint on each commit. The `name` is purely a
@@ -72,11 +74,14 @@ pub struct McpFingerprint {
 /// so a failed server doesn't drop the others.
 ///
 /// Audit §A7 / §B1 / §C3 / §R9: pre-A7 this loop was sequential, so
-/// `handle_commit` held `commit_lock` for up to `N × 10s` on a slow MCP
-/// fleet (10s is the per-server timeout in `fingerprint_one`). With
+/// `commit::execute` (the caller after the A3 extraction) held
+/// `commit_lock` for up to `N × 10s` on a slow MCP fleet (10s is the
+/// per-server timeout in `fingerprint_one`). With
 /// `futures::stream::iter(...).buffered(FINGERPRINT_CONCURRENCY)` the
-/// total wall time becomes `max(per-server)` rather than `sum`, and the
-/// output order remains the input order — preserved on purpose so
+/// total wall time becomes `max(per-server)` for fleets up to
+/// `FINGERPRINT_CONCURRENCY` (currently 8); for larger fleets it
+/// degrades gracefully to `ceil(N / FINGERPRINT_CONCURRENCY) × max`.
+/// Output order remains input order — preserved on purpose so
 /// `commit::fingerprint_tools`'s `zip(state.mcp_servers.iter(), fingerprints)`
 /// still attributes per-server errors to the correct server name.
 pub async fn fingerprint_all(
@@ -282,6 +287,18 @@ mod tests {
         (addr, handle)
     }
 
+    /// Return an address that's known to refuse TCP connects: bind a
+    /// listener on an ephemeral port to reserve the address, then drop
+    /// it so the port closes. Connects to the returned address get
+    /// ECONNREFUSED immediately on Linux/macOS — fast and deterministic
+    /// compared to a "blackhole" address that would time out.
+    async fn unreachable_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
     /// AC for issue #42 / audit §A7: three servers each delaying
     /// `delay` should finish in roughly `delay`, not `3 × delay`.
     /// Audit's pseudocode said 5s per server; we use 1s to keep CI
@@ -331,10 +348,15 @@ mod tests {
             "parallel fingerprinting of 3 servers each delaying {delay:?} should complete < 2.5s; took {elapsed:?}"
         );
 
-        // Clean up.
-        let _ = tokio::time::timeout(Duration::from_secs(1), h1).await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), h2).await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), h3).await;
+        // Clean up — each fake exits after handling its one request,
+        // so awaiting completes promptly. JoinHandle on drop only
+        // detaches; explicit await ensures the task is observed done
+        // before the test returns. (Review on PR #54: previous code
+        // used `timeout(...).await` which only drops the future on
+        // timeout, leaving the task running.)
+        h1.await.ok();
+        h2.await.ok();
+        h3.await.ok();
     }
 
     /// Output ordering: `buffered(N)` preserves input order even when
@@ -373,7 +395,58 @@ mod tests {
         );
         assert_eq!(results[1].as_ref().unwrap().name, "fast");
 
-        let _ = tokio::time::timeout(Duration::from_secs(1), h_slow).await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), h_fast).await;
+        h_slow.await.ok();
+        h_fast.await.ok();
+    }
+
+    /// Partial failure: one healthy server + one unreachable address.
+    /// `fingerprint_all` must return BOTH a per-server entry, one Err
+    /// and one Ok, in input order. A refactor to `try_buffered` /
+    /// `try_collect` / any short-circuit on first error would silently
+    /// break `commit::fingerprint_tools`'s `zip(servers, fingerprints)`
+    /// attribution and drop the healthy server's tools-tree entry.
+    /// (Review on PR #54: critical missing test.)
+    #[tokio::test]
+    async fn fingerprint_all_returns_per_server_errors_without_dropping_healthy_servers() {
+        let dead_addr = unreachable_addr().await;
+        let (healthy_addr, h_ok) = spawn_slow_mcp_server(Duration::ZERO, 1).await;
+
+        let servers = vec![
+            McpServerSpec {
+                name: "dead".into(),
+                url: format!("http://{dead_addr}/"),
+            },
+            McpServerSpec {
+                name: "healthy".into(),
+                url: format!("http://{healthy_addr}/"),
+            },
+        ];
+
+        let client = reqwest::Client::new();
+        let results = fingerprint_all(&client, &servers).await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "every input server must get a result entry"
+        );
+        assert!(
+            results[0].is_err(),
+            "results[0] (dead server) should be Err, got Ok: {:?}",
+            results[0].as_ref().ok()
+        );
+        let err_msg = format!("{:#}", results[0].as_ref().err().unwrap());
+        assert!(
+            err_msg.contains(&format!("{dead_addr}")),
+            "error message should name the failing address; got: {err_msg}"
+        );
+        assert!(
+            results[1].is_ok(),
+            "results[1] (healthy server) must succeed despite dead peer: {:?}",
+            results[1].as_ref().err()
+        );
+        assert_eq!(results[1].as_ref().unwrap().name, "healthy");
+
+        h_ok.await.ok();
     }
 }
