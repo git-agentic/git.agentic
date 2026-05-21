@@ -24,6 +24,8 @@ tokio.workspace = true
 # even if a future change to the workspace stanza drops them — Cargo
 # unions duplicate features, so this is purely defensive/self-documenting.
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+regex = "1"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.10"
