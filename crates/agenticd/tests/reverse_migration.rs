@@ -259,3 +259,104 @@ async fn run_reverse_commits_successful_sequence() {
 
     drop_schema(&admin, &schema).await;
 }
+
+// ---------------------------------------------------------------------------
+// AC3c — accept_data_loss=true makes an IRREVERSIBLE-marked migration run
+// end-to-end through load_steps → run_reverse against real Postgres.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn ac3c_accept_data_loss_reverses_irreversible_migration() {
+    let Some(url) = database_url() else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
+    };
+
+    let admin = PgPool::connect(&url).await.expect("admin pool");
+    let schema = fresh_schema_name("ac3c");
+
+    // Setup: one applied migration (001_destructive). Its .down.sql will be
+    // marked IRREVERSIBLE; the test confirms the flag both gates the load AND
+    // the SQL actually executes when bypassed.
+    admin
+        .execute(format!("CREATE SCHEMA \"{schema}\"").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute(
+            format!(
+                "CREATE TABLE \"{schema}\".agentic_migrations ( \
+                    id          serial      PRIMARY KEY, \
+                    name        text        NOT NULL UNIQUE, \
+                    applied_at  timestamptz NOT NULL DEFAULT now() \
+                )"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    admin
+        .execute(format!("CREATE TABLE \"{schema}\".destructive_table (id int)").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute(
+            format!(
+                "INSERT INTO \"{schema}\".agentic_migrations (name) VALUES ('001_destructive')"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let tmp = TempDir::new().unwrap();
+    write_down_sql(
+        &tmp,
+        "001_destructive",
+        "-- IRREVERSIBLE\nDROP TABLE destructive_table;",
+    );
+
+    // Without the flag, the load itself fails — the SQL never reaches Postgres.
+    let blocked = migrate::load_steps(tmp.path(), &["001_destructive".to_string()], false);
+    let err = blocked.unwrap_err().to_string();
+    assert!(
+        err.contains("IRREVERSIBLE"),
+        "expected IRREVERSIBLE rejection without flag; got: {err}"
+    );
+
+    // With the flag, the load succeeds and the SQL must run successfully
+    // against real Postgres — DROP TABLE removes the table, the outer
+    // transaction commits, and apply_down_migration_tx deletes the
+    // agentic_migrations row.
+    let steps = migrate::load_steps(tmp.path(), &["001_destructive".to_string()], true)
+        .expect("load with --accept-data-loss");
+    assert_eq!(steps.len(), 1);
+
+    let store_dir = TempDir::new().unwrap();
+    let store = Arc::new(FsObjectStore::open(store_dir.path().join("objects")).unwrap());
+    let cfg = PgConfig::new(schema_scoped_url(&url, &schema), Vec::new());
+    let adapter = PostgresAdapter::connect(cfg, store)
+        .await
+        .expect("connect adapter");
+
+    migrate::run_reverse(&adapter, steps)
+        .await
+        .expect("run_reverse should execute the bypassed IRREVERSIBLE migration");
+
+    // The destructive SQL actually ran.
+    assert!(
+        !table_exists(&admin, &schema, "destructive_table")
+            .await
+            .unwrap(),
+        "destructive_table should be dropped — the IRREVERSIBLE down.sql ran"
+    );
+    // And the bookkeeping caught up.
+    let count = migration_row_count(&admin, &schema).await.unwrap();
+    assert_eq!(
+        count, 0,
+        "agentic_migrations row should be removed by the outer transaction"
+    );
+
+    drop_schema(&admin, &schema).await;
+}
