@@ -83,7 +83,7 @@ mypy agentic
 - **Don't reorder the 2PC staging in commit code.** Per ADR-0002 Decision 3: blobs to object store → collect content hashes → build Commit blob → Git push (single commit point) → branch ref update. Failure-injection tests are required at each boundary. This is the plumbing that makes "atomic rollback" honest rather than aspirational.
 - **Don't expose storage-layer concepts to platform integrators.** Per ADR-0002 Decision 6, the SDK's public surface trades in `Commit` objects only. No Git ref names, no object store paths, no internal segment IDs in public types — those preclude the v2+ storage swap.
 - **Don't add a web UI.** CLI-first is a deliberate ADR-0001 Decision 9. v1.1 distribution lever, not MVP product.
-- **Don't commit secrets.** The daemon scans every blob it would write for high-entropy strings matching common token patterns and refuses to write them. Don't bypass the scanner; fix the input.
+- **Don't commit secrets.** Per [ADR-0013](docs/adr/0013-secret-scanner.md), the daemon hard-rejects blobs containing matched secret patterns or high-entropy substrings at `put_raw` time, returning `Error::SecretDetected`. Don't bypass the scanner; fix the input.
 
 ## The demo is the discipline
 
