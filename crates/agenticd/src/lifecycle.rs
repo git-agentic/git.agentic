@@ -43,11 +43,17 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
-    /// Build a lifecycle that shares `commit_lock` with the
-    /// [`crate::server::DaemonState`].
-    pub fn new(commit_lock: Arc<Mutex<()>>) -> Self {
+    /// Build a lifecycle that shares both `commit_lock` AND the
+    /// `shutdown` token with [`crate::server::DaemonState`]. The token
+    /// must be the SAME `CancellationToken` (or an `Arc`-clone of it)
+    /// the state holds, so that signal-driven cancellation reaches the
+    /// write-path handlers' `state.check_shutdown()` calls. (Copilot
+    /// review on PR #50: without sharing the token, drain releases the
+    /// lock and a queued waiter starts a 2PC the LocalSet is about to
+    /// abort.)
+    pub fn new(commit_lock: Arc<Mutex<()>>, shutdown: CancellationToken) -> Self {
         Self {
-            shutdown: CancellationToken::new(),
+            shutdown,
             commit_lock,
         }
     }
@@ -276,11 +282,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn drain_returns_immediately_when_no_commit_in_flight() {
+    // CI-stability note: tests below use `tokio::sync::Notify` for
+    // handshakes between the main task and a spawned "commit" task,
+    // rather than `tokio::time::sleep`. Sleep-based handshakes are flaky
+    // on contended CI runners (Copilot review on PR #50, second pass).
+    use tokio::sync::Notify;
+
+    fn new_lifecycle() -> (Arc<Mutex<()>>, Lifecycle) {
         let lock = Arc::new(Mutex::new(()));
-        let lifecycle = Lifecycle::new(lock);
-        let result = tokio::time::timeout(Duration::from_millis(50), lifecycle.drain()).await;
+        let lifecycle = Lifecycle::new(lock.clone(), CancellationToken::new());
+        (lock, lifecycle)
+    }
+
+    #[tokio::test]
+    async fn drain_returns_promptly_when_no_commit_in_flight() {
+        let (_lock, lifecycle) = new_lifecycle();
+        // 5s is enough to distinguish "returns quickly" from "deadlocks"
+        // on any realistic CI runner. The previous 50ms guard was too
+        // tight under heavy load.
+        let result = tokio::time::timeout(Duration::from_secs(5), lifecycle.drain()).await;
         assert!(
             result.is_ok(),
             "drain should return promptly when commit_lock is uncontended"
@@ -293,23 +313,48 @@ mod tests {
     // exits while a partial commit is on the wire.
     #[tokio::test]
     async fn drain_waits_for_in_flight_commit_to_finish() {
-        let lock = Arc::new(Mutex::new(()));
-        let lifecycle = Lifecycle::new(lock.clone());
+        let (lock, lifecycle) = new_lifecycle();
 
-        // Simulate a commit by holding the lock for a fixed duration.
-        let lock_for_commit = lock.clone();
+        let acquired = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let commit_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let lock_for_commit = lock.clone();
+        let acquired_signal = acquired.clone();
+        let release_wait = release.clone();
         let flag = commit_finished.clone();
         tokio::spawn(async move {
             let _g = lock_for_commit.lock_owned().await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            acquired_signal.notify_one();
+            // Wait for the test to permit release — deterministic
+            // ordering, no time-based race.
+            release_wait.notified().await;
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
-        // Give the spawned task a moment to acquire the lock.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        // drain() should block until the commit task drops the lock.
-        lifecycle.drain().await;
+        // Deterministic handshake: wait for the spawned task to confirm
+        // it has the lock before we start drain.
+        acquired.notified().await;
+
+        // drain() must now block. Confirm it doesn't complete while the
+        // lock is still held by the "commit" task.
+        let drain_fut = lifecycle.drain();
+        tokio::pin!(drain_fut);
+        tokio::select! {
+            _ = &mut drain_fut => {
+                panic!("drain returned while commit_lock was still held");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Expected — drain is correctly blocked.
+            }
+        }
+
+        // Now let the commit finish. drain should unblock shortly after.
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), drain_fut)
+            .await
+            .expect("drain did not complete after commit released the lock");
+
         assert!(
             commit_finished.load(std::sync::atomic::Ordering::SeqCst),
             "drain returned before in-flight commit finished — violates ADR-0002 D3 atomicity"
@@ -318,8 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_token_initially_not_cancelled() {
-        let lock = Arc::new(Mutex::new(()));
-        let lifecycle = Lifecycle::new(lock);
+        let (_lock, lifecycle) = new_lifecycle();
         let token = lifecycle.shutdown_token();
         assert!(!token.is_cancelled());
     }
