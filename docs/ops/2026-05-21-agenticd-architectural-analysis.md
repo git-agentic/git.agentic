@@ -295,8 +295,10 @@ pub(super) fn read_model_text  (state: &DaemonState, target: &Commit) -> Result<
 
 **Tests:** all four `validate_target_shape` unit tests from A8 still pass (moved to `mod.rs#tests`). All 3 A8 integration tests (`reverse_migration.rs`) still pass against real Postgres. No new tests required — A4 is a behavior-preserving refactor.
 
-<a name="a5"></a>**A5 — Move GCS blocking I/O off LocalSet via `tokio::task::spawn_blocking`** (tactical now; full async-trait via ADR-0011 follows)
+<a name="a5"></a>**A5 — Move GCS blocking I/O off LocalSet via `tokio::task::spawn_blocking`** — **DONE 2026-05-21** (issue [#40](https://github.com/git-agentic/git.agentic/issues/40)).
 *Addresses:* [C1](#c1), [B2](#b2), [B3](#b3), [R3](#r3). *Principle:* Loose coupling between execution model and I/O. *Effort:* S tactical / M with ADR.
+
+**Originally proposed** (async-trait impl on `GcsObjectStore`):
 
 ```rust
 impl ObjectStore for GcsObjectStore {
@@ -306,6 +308,32 @@ impl ObjectStore for GcsObjectStore {
     }
 }
 ```
+
+**Shipped shape** (caller-side helpers; the `ObjectStore` trait stays sync per the AC):
+
+```rust
+// crates/agenticd/src/store_async.rs (new):
+pub async fn get(store: Arc<dyn ObjectStore + Send + Sync>, hash: Hash) -> Result<Object>;
+pub async fn get_raw(store: Arc<dyn ObjectStore + Send + Sync>, hash: Hash) -> Result<Vec<u8>>;
+pub async fn put_raw(store: Arc<dyn ObjectStore + Send + Sync>, kind: ObjectKind, bytes: Vec<u8>) -> Result<Hash>;
+// Each wraps the sync call in `tokio::task::spawn_blocking(move || store.<method>(...)).await?`.
+```
+
+**Departure from audit pseudocode.** The audit's pseudocode showed an async-trait impl on `GcsObjectStore`, which is a trait change. Issue #40's AC explicitly forbids that: "No change to the `ObjectStore` trait surface" — the trait redesign is [ADR-0011](../adr/0011-objectstore-async-trait-shape.md). The tactical fix shipped here keeps the sync trait and moves the `spawn_blocking` to the daemon call sites:
+
+- `server::dispatch` — `Request::ReadObject` wraps `store.get` via `store_async::get`.
+- `commit::execute` — `snapshot_memory` wraps the manifest `put_raw` via `store_async::put_raw`; phase 4 wraps the entire `stage_and_commit_with_now(...)` 2PC sequence in `tokio::task::spawn_blocking`.
+
+This frees the LocalSet thread to poll other connections' Ping / Log / Diff / ResolveRef even when an in-flight GCS read or write would otherwise occupy it for up to the 30s REQUEST_TIMEOUT.
+
+**Not wrapped yet:** `Request::Log` (`walk_log` recurses through `store.get`) and `Request::Diff` (chases multiple refs). Both are read paths that benefit from the same wrap but require either a `walk_log_async` helper or moving the whole arm into `spawn_blocking`. Flagged in the PR description as follow-up; they don't gate v1.0 since the demo uses `FsObjectStore`. The minimum-viable hot paths for the AC are covered.
+
+**When ADR-0011 lands** the entire `store_async` module goes away — the async-trait redesign integrates the `spawn_blocking` shim into `GcsObjectStore` itself, and the daemon call sites just `await` the store methods directly.
+
+**Tests landed** (`crates/agenticd/src/store_async.rs#tests`):
+
+- `slow_get_does_not_block_local_set_thread` — **AC for §A5**. Constructs a `SlowStore` (delegates to `FsObjectStore` but sleeps 500ms in `get`/`get_raw`). Runs on a real `tokio::task::LocalSet`. Spawns two `spawn_local` tasks: A calls `store_async::get_raw` (slow), B calls `store.has` (fast, sync). Asserts B completes within 100ms while A is still in-flight — proves the LocalSet thread polled B during A's wait.
+- `put_raw_round_trips_through_async_wrapper` — sanity round-trip with `FsObjectStore`.
 
 <a name="a6"></a>**A6 — `Response::Error` becomes a structured variant; framing errors get an envelope** *(daemon-side patch lands when ADR-0010 lands)*
 *Addresses:* [B6](#b6), [B13](#b13), [B14](#b14), [R7](#r7). *Principle:* ISP + LSP. *Effort:* S after wire-shape decision.
@@ -408,7 +436,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | [#38](https://github.com/git-agentic/git.agentic/issues/38) **DONE** | `hardening-sprint` | — |
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | [#39](https://github.com/git-agentic/git.agentic/issues/39) **DONE** | `hardening-sprint` | — |
-| A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | (TBD) | `hardening-sprint` | — |
+| A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | [#40](https://github.com/git-agentic/git.agentic/issues/40) **DONE** | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope (blocked by ADR-0010) | (TBD) | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |

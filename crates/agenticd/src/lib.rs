@@ -15,3 +15,4 @@ pub mod migrate;
 pub mod objstore;
 pub mod rollback;
 pub mod server;
+pub mod store_async;
