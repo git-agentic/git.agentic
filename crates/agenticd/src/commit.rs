@@ -745,6 +745,43 @@ mod tests {
         );
     }
 
+    // Happy-path counterpart to the duplicate-name rejection test
+    // above. Distinct MCP server names must construct cleanly — pins
+    // the validation against a future "reject everything" regression.
+    // Uses unreachable URLs because `open` doesn't make HTTP calls;
+    // fingerprinting only happens on commit.
+    #[tokio::test]
+    async fn daemon_state_accepts_distinct_mcp_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        let state = DaemonState::open(
+            dir.path().to_path_buf(),
+            agentic_dir,
+            store,
+            None,
+            Vec::new(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "alpha".to_string(),
+                    url: "http://example.invalid/a".to_string(),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "bravo".to_string(),
+                    url: "http://example.invalid/b".to_string(),
+                },
+            ],
+            Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        )
+        .await
+        .expect("distinct MCP server names must construct cleanly");
+        assert_eq!(state.mcp_servers.len(), 2);
+        assert_eq!(state.mcp_servers[0].name, "alpha");
+        assert_eq!(state.mcp_servers[1].name, "bravo");
+    }
+
     // Branch inference: when CommitInput.branch is None and HEAD is
     // unset (fresh repo), the orchestrator defaults to "main".
     // (Test-analyzer review on PR #52.)
