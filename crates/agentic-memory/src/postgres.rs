@@ -474,21 +474,45 @@ impl PostgresAdapter {
         Ok(rows.into_iter().map(|(n,)| n).collect())
     }
 
-    /// Execute one reverse migration: run `sql` and remove `name` from
-    /// `agentic_migrations`, all in a single transaction.
+    /// Begin a Postgres transaction for an atomic reverse-migration sequence.
+    ///
+    /// The caller threads the returned `Transaction` through one or more
+    /// [`Self::apply_down_migration_tx`] calls and finishes with `tx.commit()`.
+    /// Dropping the transaction without committing rolls back every step.
+    ///
+    /// This is the only path that `migrate::run_reverse` uses — the older
+    /// per-step `apply_down_migration` was removed because each step opening
+    /// its own `pool.begin()` would land on a different Postgres session,
+    /// breaking the atomicity an outer transaction is supposed to provide
+    /// (see issue #37 / audit B8 / docs/plans/a8-reverse-migration/).
+    pub async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+        Ok(self.pool.begin().await?)
+    }
+
+    /// Execute one reverse migration step against the caller's transaction:
+    /// run `sql`, then `DELETE FROM agentic_migrations WHERE name = $1`.
+    ///
+    /// Both statements run on the same Postgres connection as the caller's
+    /// outer transaction, so a `Drop` or `tx.rollback()` undoes every step
+    /// in the sequence, not just the failing one.
     ///
     /// DDL in Postgres is transactional for most statements. Non-transactional
-    /// DDL (`CREATE INDEX CONCURRENTLY`, etc.) will error inside the transaction,
-    /// which is the correct failure mode — the migration file must be rewritten.
-    pub async fn apply_down_migration(&self, name: &str, sql: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+    /// DDL (`CREATE INDEX CONCURRENTLY`, etc.) will error inside the
+    /// transaction, which is the correct failure mode — the migration file
+    /// must be rewritten.
+    pub async fn apply_down_migration_tx<'c>(
+        &self,
+        tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+        name: &str,
+        sql: &str,
+    ) -> Result<()> {
         sqlx::raw_sql(sql)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("executing down migration {name:?}: {e}")))?;
         let delete_result = sqlx::query("DELETE FROM agentic_migrations WHERE name = $1")
             .bind(name)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         let deleted_rows = delete_result.rows_affected();
         if deleted_rows != 1 {
@@ -496,7 +520,6 @@ impl PostgresAdapter {
                 "expected to delete exactly 1 agentic_migrations row for down migration {name:?}, deleted {deleted_rows}"
             )));
         }
-        tx.commit().await?;
         Ok(())
     }
 }
