@@ -144,7 +144,7 @@ The trait exists with `snapshot`/`restore`/`current_schema_version`, but rollbac
 
 ## Software-Architecture Recommendations
 
-<a name="a1"></a>**A1 — `Quiesceable` trait + `RestoreGuard` lifetime on `PostgresAdapter::begin_restore()`**
+<a name="a1"></a>**A1 — `Quiesceable` trait + `RestoreGuard` on `PostgresAdapter::begin_restore()`** — **DONE 2026-05-21** (issue [#35](https://github.com/git-agentic/git.agentic/issues/35)).
 *Addresses:* [C8](#c8), [R1](#r1). *Principle:* SRP + invariant-as-type. *Effort:* M. *Blocker for v1.0.*
 
 ```rust
@@ -160,6 +160,16 @@ let guard = memory.begin_restore().await?;
 memory.restore(&guard, snapshot).await?;
 drop(guard); // poller resumes
 ```
+
+**Shipped shape:**
+
+- `Quiesceable` + `QuiesceToken` live in `crates/agentic-memory/src/triggers.rs`. `spawn_poller` now returns a `PollerHandle` that implements `Quiesceable`; the poller's per-tick `pause_lock.lock().await` blocks while a token is held.
+- `RestoreGuard` lives in `crates/agentic-memory/src/restore.rs`. It owns the `QuiesceToken` and is non-`'a`-parameterised — the `&mut PgConnection` field in the audit pseudocode was elided as not load-bearing for v1.0; the connection still comes from the pool inside `restore_manifest`.
+- `PostgresAdapter::begin_restore() -> RestoreGuard` and `restore_with_guard(&guard, target)` are public on the adapter. The trait `MemoryAdapter::restore(target)` becomes a convenience wrapper that calls both — rollback paths use the explicit form so the quiesce window is visible at the call site (`crates/agenticd/src/rollback.rs`).
+- **Load-bearing extra fix:** `restore_manifest` adds `TRUNCATE public.agentic_change_log` inside the restore transaction. The audit pseudocode pauses the poller but doesn't address change-log entries that were already there before the restore started — those would be drained by the poller as soon as the guard releases and would describe rows the TRUNCATE wiped. Truncating the log inside the restore tx covers both pre-existing entries and entries written by the restore's own INSERTs (which fire user triggers).
+- **PgConfig.poll_interval** added (defaults to `triggers::DEFAULT_POLL_INTERVAL` 100 ms) so tests can extend the poller's idle window deterministically.
+
+**Tests landed:** `crates/agentic-memory/tests/integration.rs::ac1_writes_during_restore_are_reverted` — 100 INSERTs accumulate in `agentic_change_log` (with the poller on a 60s interval so it can't drain); `adapter.restore(&handle_A)` pauses the poller, restores the baseline, truncates the log inside its tx, and releases the poller; a post-restore snapshot manifest matches the baseline (no leaked rows in the streamer view) and `agentic_change_log` is empty. Run serial (`--test-threads=1`) because `public.agentic_change_log` is shared across schemas by design.
 
 <a name="a2"></a>**A2 — New `crates/agenticd/src/lifecycle.rs`: SIGTERM, commit_lock drain, startup ref reconciliation**
 *Addresses:* [C2](#c2), [B7](#b7), [R2](#r2). *Principle:* SRP + DIP. *Effort:* M.
@@ -284,7 +294,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 
 | Rec | Title | Issue | Label | Milestone |
 |---|---|---|---|---|
-| A1 | Quiesce trigger poller during memory restore | (TBD) | `must-fix-v1.0` | `v1.0` |
+| A1 | Quiesce trigger poller during memory restore | [#35](https://github.com/git-agentic/git.agentic/issues/35) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | (TBD) | `must-fix-v1.0` | `v1.0` |
 | A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | (TBD) | `hardening-sprint` | — |

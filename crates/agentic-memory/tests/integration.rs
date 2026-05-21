@@ -7,11 +7,24 @@
 //! ```bash
 //! podman compose -f tests/fixtures/pg.yml up -d
 //! DATABASE_URL=postgres://agentic:agentic@localhost:54321/agentic \
-//!   cargo test -p agentic-memory --test integration -- --ignored
+//!   cargo test -p agentic-memory --test integration -- --ignored --test-threads=1
 //! ```
 //!
-//! Every test allocates its own schema (`agentic_test_<nanos>`) so parallel
-//! runs don't collide; the schema is dropped on teardown.
+//! Or with the demo's Postgres on port 54322:
+//!
+//! ```bash
+//! docker compose -f examples/langgraph-rollback/docker-compose.yml up -d
+//! docker exec agentic-demo-pg psql -U agentic -d agentic -c "CREATE EXTENSION IF NOT EXISTS vector"
+//! DATABASE_URL=postgres://agentic:agentic@localhost:54322/agentic \
+//!   cargo test -p agentic-memory --test integration -- --ignored --test-threads=1
+//! ```
+//!
+//! Every test allocates its own schema (`agentic_test_<nanos>`) so user
+//! data is isolated. **Run with `--test-threads=1`**: `public.agentic_change_log`
+//! is shared across schemas by design (one daemon = one database = one
+//! log), so concurrent tests interfere with each other's trigger events
+//! and with restore's TRUNCATE-of-change_log behavior (audit §A1 / issue
+//! #35). Each test drops its schema on teardown.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -218,6 +231,130 @@ async fn snapshot_serialises_through_advisory_lock() {
         .expect("snapshot returned Err");
     assert!(start.elapsed() >= Duration::from_millis(200));
     assert_eq!(handle.schema_version, "0.0.0");
+
+    drop_schema(&admin_pool, &schema).await;
+}
+
+/// AC1 for issue #35 / audit §A1: writes that occur while a restore is in
+/// progress must not leak into the streamer's view (and therefore must
+/// not appear in any later snapshot). The poller is paused for the
+/// duration of `restore`, and `restore` truncates `agentic_change_log`
+/// inside its own transaction so neither pre-existing nor restore-fired
+/// trigger events reach the streamer.
+#[tokio::test]
+#[ignore]
+async fn ac1_writes_during_restore_are_reverted() {
+    use std::time::Duration;
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+    // make_schema inserts 5 rows (id=1..=5). Snapshot at that point is
+    // our manifest A. The 100 "concurrent" writes will use id=100..=199
+    // so they don't collide with the baseline rows.
+
+    // Long poll interval so the poller can't drain the test's writes
+    // between setup and restore — the only drainer permitted in this
+    // window is `restore`'s own change_log TRUNCATE inside its tx.
+    let mut cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    cfg.poll_interval = Duration::from_secs(60);
+
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // Snapshot the pre-write state. Manifest A captures id=1..=5.
+    let handle_a = adapter.snapshot().await.unwrap();
+    let baseline_total: u64 = handle_a.manifest.entries.iter().map(|e| e.row_count).sum();
+    assert_eq!(baseline_total, 5, "make_schema inserted 5 rows");
+
+    // User writes 100 more rows. Triggers fire and populate
+    // public.agentic_change_log; the poller is on a 60s interval so
+    // those entries sit there waiting.
+    for i in 100i64..200 {
+        admin_pool
+            .execute(
+                format!(
+                    "INSERT INTO \"{schema}\".episodes (id, text) \
+                     VALUES ({i}, 'concurrent-write-{i}')"
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Confirm change_log accumulated entries (proves we're testing the
+    // path the audit identified — pre-restore writes the poller could
+    // forward to the streamer).
+    let pre_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM public.agentic_change_log")
+        .fetch_one(&admin_pool)
+        .await
+        .unwrap();
+    assert!(
+        pre_count.0 >= 100,
+        "expected >= 100 change_log entries from the 100 concurrent writes, got {}",
+        pre_count.0
+    );
+
+    // Restore from manifest A. This pauses the poller, opens a transaction,
+    // TRUNCATEs the tracked table, INSERTs only the manifest's rows,
+    // TRUNCATEs agentic_change_log inside the same transaction, and
+    // commits. The poller resumes on guard drop and sees an empty log.
+    adapter.restore(&handle_a).await.unwrap();
+
+    // Table is back to the baseline.
+    let row_count: (i64,) =
+        sqlx::query_as(format!("SELECT COUNT(*) FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row_count.0, 5,
+        "expected 5 baseline rows after restore; got {}",
+        row_count.0
+    );
+
+    // The 100 concurrent writes are gone from change_log (truncated
+    // inside the restore tx); the poller never forwarded them.
+    let post_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM public.agentic_change_log")
+        .fetch_one(&admin_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_count.0, 0,
+        "restore should have TRUNCATEd agentic_change_log inside its tx; got {} rows",
+        post_count.0
+    );
+
+    // The strongest assertion: take a fresh snapshot. Its manifest must
+    // match A — no extra rows leaked into the streamer's view from the
+    // 100 concurrent writes. (Without the fix, the poller would have
+    // forwarded those events to the streamer between the writes and
+    // restore, and the next snapshot would describe 105 rows.)
+    let handle_b = adapter.snapshot().await.unwrap();
+    let post_total: u64 = handle_b.manifest.entries.iter().map(|e| e.row_count).sum();
+    assert_eq!(
+        post_total, baseline_total,
+        "post-restore snapshot must contain only the baseline rows; \
+         got {post_total} (baseline {baseline_total})"
+    );
 
     drop_schema(&admin_pool, &schema).await;
 }

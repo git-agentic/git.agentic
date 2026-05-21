@@ -11,6 +11,7 @@
 //! the log only after the user's transaction commits. The poller then
 //! sees rows in commit order.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value as Json;
@@ -19,6 +20,52 @@ use sqlx::{PgPool, Row};
 use crate::postgres::TrackedTable;
 use crate::streamer::{ChangeEvent, Op, StreamerHandle};
 use crate::{Error, Result};
+
+/// A subsystem whose work can be paused for the lifetime of a returned token.
+///
+/// Implemented by the trigger poller so a restore window can quiesce
+/// change-log draining while it rewrites table state. Audit anchor:
+/// [`docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1`].
+#[async_trait::async_trait]
+pub trait Quiesceable: Send + Sync {
+    /// Pause the subsystem. The returned token holds the pause; dropping
+    /// it resumes work. Multiple concurrent callers serialise — only one
+    /// pause is in effect at a time, and the others wait.
+    async fn pause(&self) -> QuiesceToken;
+}
+
+/// Proof-of-pause token. Held by [`crate::restore::RestoreGuard`] for the
+/// duration of a restore. Wraps an `OwnedMutexGuard` so dropping the token
+/// releases the pause.
+pub struct QuiesceToken {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// Handle to the trigger poller spawned by [`spawn_poller`]. Pause it via
+/// [`Quiesceable::pause`] to block change-log draining; abort the task with
+/// [`PollerHandle::abort`].
+pub struct PollerHandle {
+    pause_lock: Arc<tokio::sync::Mutex<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl PollerHandle {
+    /// Stop the poller task. Used in tests; production daemons keep the
+    /// poller alive for the process lifetime.
+    #[allow(dead_code)]
+    pub fn abort(self) -> tokio::task::JoinHandle<()> {
+        self.join.abort();
+        self.join
+    }
+}
+
+#[async_trait::async_trait]
+impl Quiesceable for PollerHandle {
+    async fn pause(&self) -> QuiesceToken {
+        let guard = self.pause_lock.clone().lock_owned().await;
+        QuiesceToken { _guard: guard }
+    }
+}
 
 /// How often the poller wakes up to drain `agentic_change_log`.
 /// Aggressive enough that snapshots see fresh data; light enough that
@@ -98,12 +145,18 @@ pub async fn install_triggers(pool: &PgPool, tables: &[TrackedTable]) -> Result<
 /// Spawn the poller task. Drains `agentic_change_log` on
 /// `interval`-spaced ticks, forwards rows as `ChangeEvent`s to the
 /// streamer, then deletes the drained range.
+///
+/// The returned [`PollerHandle`] implements [`Quiesceable`]: callers in a
+/// restore path acquire a [`QuiesceToken`] via `pause().await` and hold it
+/// for the restore window. The poller's per-tick acquisition of the same
+/// internal mutex blocks until the token is dropped, so no change-log row
+/// is forwarded to the streamer while the token is alive.
 pub fn spawn_poller(
     pool: PgPool,
     streamer: StreamerHandle,
     interval: Duration,
     tables: Vec<TrackedTable>,
-) -> tokio::task::JoinHandle<()> {
+) -> PollerHandle {
     // Trigger captures `schema.table`; the streamer was configured with
     // whatever string the caller put in PgConfig.tables. Map both ways
     // so events route correctly regardless of which form is in play.
@@ -116,7 +169,10 @@ pub fn spawn_poller(
         .map(|t| (bare_name(&t.name), t.name.clone()))
         .collect();
 
-    tokio::spawn(async move {
+    let pause_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let pause_lock_for_task = pause_lock.clone();
+
+    let join = tokio::spawn(async move {
         tracing::info!(
             interval_ms = interval.as_millis() as u64,
             "trigger poller started"
@@ -125,13 +181,20 @@ pub fn spawn_poller(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // Acquire the pause-lock around each drain. While a restore
+            // holds it via QuiesceToken, this awaits until the restore
+            // completes — ensuring no change-log row written during the
+            // restore window reaches the streamer.
+            let _permit = pause_lock_for_task.lock().await;
             match drain_once(&pool, &streamer, &key_of, &bare_lookup).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(drained = n, "agentic_change_log drained"),
                 Err(e) => tracing::warn!(error = %e, "change-log drain failed"),
             }
         }
-    })
+    });
+
+    PollerHandle { pause_lock, join }
 }
 
 /// Synchronously drain every row in `agentic_change_log`, forwarding
