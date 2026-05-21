@@ -41,7 +41,7 @@ Ephemeral branches live under their own ref prefix:
   refs/
     heads/
       main                          # durable
-      release/2026-08-11            # durable
+      release/2026-05-26            # durable
     ephemeral/
       executor/
         sess-7f3a9c…                # ADR-0005 session branch

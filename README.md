@@ -14,7 +14,7 @@ A commit captures all six dimensions atomically. A rollback restores all six coh
 
 ## Status
 
-**Pre-MVP, scaffolding phase.** Currently building toward a 12-week MVP targeting 2026-08-11. Nothing here is production-ready yet. See [`docs/product/roadmap.md`](docs/product/roadmap.md) for week-by-week progress and what's safe to depend on.
+**MVP code complete; v1.0 ships 2026-05-26 alongside the public repo release.** The 12-week build landed weeks 1–11 on `main`; the final week is verification and demo polish. See [`docs/product/roadmap.md`](docs/product/roadmap.md) for week-by-week progress and what's safe to depend on.
 
 ## Why this exists
 
@@ -85,7 +85,7 @@ git.agentic/
 ├── docs/
 │   ├── product/
 │   │   ├── mvp-spec.md           what we ship and for whom
-│   │   ├── roadmap.md            week-by-week plan to 2026-08-11
+│   │   ├── roadmap.md            12-week build narrative; v1.0 ships 2026-05-26
 │   │   └── demo-scenario.md      the canonical demo
 │   ├── adr/
 │   │   └── 0001-architecture-foundations.md
