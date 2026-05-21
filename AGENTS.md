@@ -6,16 +6,17 @@ This file is the standing context for any AI assistant working in this repo. Rea
 
 ## Phase
 
-**Pre-MVP scaffolding. 12-week build to 2026-08-11.** Currently early in the build. The MVP target is a single named demo — ["the broken prompt"](docs/product/demo-scenario.md) — running reliably from `git clone` to working rollback in under 5 minutes. Every design decision must trace back to making that demo crisp.
+**MVP code complete on `main`; hardening sprint in progress. 12-week build to 2026-08-11.** As of 2026-05-20 the implementations for roadmap weeks 1–11 have all landed: object store, atomic memory snapshot, rollback (incl. reverse migrations), MCP fingerprinting, six-dimension diff, Python SDK + LangGraph checkpointer, and the broken-prompt demo (`examples/langgraph-rollback/scripts/run-demo.sh`). Remaining work is verification + outreach, not new features — see [`docs/product/sprint-2026-05-20.md`](docs/product/sprint-2026-05-20.md) for the current sprint and [`docs/architecture/benchmarks.md`](docs/architecture/benchmarks.md) for early performance numbers. Note: the "< 5 min from `git clone` on a fresh machine" claim is still aspirational — the cold-start timing has only been measured on developer machines with warm cargo caches; a fresh-machine timing is sprint item A1. The MVP target is a single named demo — ["the broken prompt"](docs/product/demo-scenario.md) — running reliably from `git clone` to working rollback in under 5 minutes. Every design decision must trace back to making that demo crisp.
 
 If a feature, abstraction, or dependency is not on the path to the demo, it does not ship in MVP. See [`docs/product/mvp-spec.md`](docs/product/mvp-spec.md) §"Explicitly out of scope" — the boundary is hard.
 
 ## Authoritative decisions
 
-Two ADRs govern the architecture. Read both before designing anything substantial:
+Three ADRs anchor the architecture; the full set lives in [`docs/adr/`](docs/adr/). Read these three before designing anything substantial:
 
-- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — the 10 foundational decisions: tuple-as-version, content-addressed store, Rust core + Python SDK split, Postgres+pgvector only, LangGraph only, Apache 2.0, CLI-first, self-hosted Docker compose.
+- [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) — the 10 foundational decisions: tuple-as-version, content-addressed store, Rust core + Python SDK split, Postgres+pgvector only, LangGraph + Claude Agent SDK (per ADR-0003), Apache 2.0, CLI-first, self-hosted Docker compose.
 - [`docs/adr/0002-substrate-and-supercommit.md`](docs/adr/0002-substrate-and-supercommit.md) — Approach C (Git core + content-addressed blob store + coordinator), the extended Commit object as the platform API contract, the mandatory 2PC staging order, bounded rollback for destructive migrations.
+- [`docs/adr/0003-claude-agent-sdk-integration.md`](docs/adr/0003-claude-agent-sdk-integration.md) — the first platform-partner integration as the first non-LangGraph integration in v1.0, with atomic real-time integration via a sidecar `agenticd` (topology specified in ADR-0004). Amends ADR-0001 Decision 7.
 
 [`docs/architecture/snapshot-model.md`](docs/architecture/snapshot-model.md) is the technical heart — object model, segment-based snapshot algorithm, rollback semantics, performance targets. [`docs/architecture/overview.md`](docs/architecture/overview.md) is the runtime topology and component boundaries.
 
@@ -77,7 +78,7 @@ mypy agentic
 
 - **Don't expand scope past the demo path.** If it isn't required for the broken-prompt demo, it's v1.1+ work. The deferral list in [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/product/mvp-spec.md`](docs/product/mvp-spec.md) is the authoritative scope boundary.
 - **Don't add memory backends in MVP.** Postgres + pgvector only. Mem0 / Zep / Letta adapters are v1.1, behind the same `MemoryAdapter` trait.
-- **Don't add framework integrations in MVP.** LangGraph only. CrewAI / AutoGen / LlamaIndex are v1.1, behind the same SDK contract.
+- **Don't add framework integrations in MVP beyond LangGraph and the Claude Agent SDK** (per [ADR-0003](docs/adr/0003-claude-agent-sdk-integration.md)). CrewAI / AutoGen / LlamaIndex are v1.1, behind the same SDK contract.
 - **Don't mock Postgres for snapshot/restore tests.** The snapshot algorithm uses Postgres-specific features (logical decoding, advisory locks, pgvector storage); mocking defeats the test. Snapshot/restore code paths must exercise a real Postgres+pgvector via CI integration tests.
 - **Don't reorder the 2PC staging in commit code.** Per ADR-0002 Decision 3: blobs to object store → collect content hashes → build Commit blob → Git push (single commit point) → branch ref update. Failure-injection tests are required at each boundary. This is the plumbing that makes "atomic rollback" honest rather than aspirational.
 - **Don't expose storage-layer concepts to platform integrators.** Per ADR-0002 Decision 6, the SDK's public surface trades in `Commit` objects only. No Git ref names, no object store paths, no internal segment IDs in public types — those preclude the v2+ storage swap.
