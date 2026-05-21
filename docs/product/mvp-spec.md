@@ -1,8 +1,9 @@
 # git.agentic — MVP Product Spec
 
 **Status:** Draft v0.1
-**Last updated:** 2026-05-19
+**Last updated:** 2026-05-21
 **Owner:** Toni
+**Ship target:** 2026-05-26 with the repo going public (pulled forward from the originally-planned 2026-08-11). Design-partner onboarding moves post-launch; full v1.0 scope preserved.
 
 ---
 
@@ -77,12 +78,19 @@ A `git.agentic` commit content-addresses all six dimensions into one immutable o
 
 If a feature isn't in the demo path, it doesn't ship in MVP.
 
-## What success looks like at week 12
+## What success looks like
+
+**At ship (2026-05-26):**
 
 - **Technical:** The demo runs reliably on a fresh laptop in <5 minutes from `git clone`. Snapshot < 2s on a 1M-row pgvector table. Rollback < 5s end-to-end on the same.
-- **Product:** Three design partners have run `agentic rollback` against their own staging environments and reported at least one "would have saved hours" moment.
 - **Narrative:** A blog post / video showing the broken-prompt demo that explains the wedge clearly enough that a hostile-but-fair YC partner gets it in under 90 seconds.
-- **Kill criteria:** If after 12 weeks zero design partners are using it weekly, we abandon the wedge and reassess. If two or more are, we raise.
+
+**At eight weeks post-launch (2026-07-21):**
+
+- **Product:** Three design partners have run `agentic rollback` against their own staging environments and reported at least one "would have saved hours" moment.
+- **Kill criteria:** If after eight weeks zero design partners are using it weekly, we abandon the wedge and reassess. If two or more are, we raise.
+
+*The 12-week MVP scope above is preserved in full; design-partner onboarding (originally Week 12) is sequenced after the public release rather than before it.*
 
 ## Non-goals for the seed round
 

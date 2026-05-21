@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-`git.agentic` is pre-1.0. Only the latest release (and `main`) receive security fixes during the MVP build to 2026-08-11. Once v1.0 ships, this table will be updated to reflect the supported release line.
+`git.agentic` is pre-1.0 until 2026-05-26, when v1.0 ships and the repo goes public. Only the latest release (and `main`) receive security fixes during the MVP build. Once v1.0 ships, this table will be updated to reflect the supported release line.
 
 | Version | Supported          |
 | ------- | ------------------ |

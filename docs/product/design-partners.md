@@ -1,12 +1,12 @@
 # Design Partners — outreach brief (v1.0)
 
 **Owner:** Toni
-**Target:** 3 onboarded teams by 2026-08-11 (roadmap week 12).
+**Target:** 3 onboarded teams by 2026-07-21 (eight weeks post-launch). Originally a roadmap Week 12 gate; with v1.0 shipping 2026-05-26, partner onboarding sequences after the public release rather than before it.
 **Status:** Draft. Candidate list and outreach status start empty — fill in inline.
 
 ## Why this exists now
 
-Roadmap week 12 requires three design partners who have actually run `agentic rollback` against their own staging environments. The lead time on B2B outreach is weeks, not days; an empty pipeline today means missing the kill-criterion in `roadmap.md` §"Kill criteria" ("If at the end of week 12 zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope").
+The post-launch kill-criterion (`roadmap.md` §"Kill criteria") requires three design partners who have actually run `agentic rollback` against their own staging environments within eight weeks of the public release. The lead time on B2B outreach is weeks, not days; an empty pipeline at ship means missing the kill-criterion ("If at eight weeks post-launch zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope"). Outreach starts during the May 2026 hardening week so candidates are warm by ship.
 
 Per the in-repo MVP spec, design partners are explicitly **not** about feature requests. They are about proving the wedge: does the broken-prompt scenario, in their environment, actually save them time?
 
@@ -41,7 +41,7 @@ No pricing conversation. No commercial commitment. The cost to them is one focus
 For each onboarded partner:
 
 1. Time from intro call to first successful rollback against their environment.
-2. One regression-recovery incident captured before week 12 ends — even if synthetic, it has to be a real shape they would have hit. Written up in `docs/product/design-partners-feedback.md` (created when the first incident lands).
+2. One regression-recovery incident captured within eight weeks of the public release — even if synthetic, it has to be a real shape they would have hit. Written up in `docs/product/design-partners-feedback.md` (created when the first incident lands).
 3. Whether they use it again unprompted in the four weeks following.
 
 The week-12 kill-criterion fires on (3): if zero partners come back unprompted, the wedge is wrong.
@@ -102,5 +102,5 @@ Have 15 minutes <week>?
 
 - Don't pitch architecture; pitch the regression they already hate.
 - Don't take feature requests on the intro call — only check fit.
-- Don't onboard candidates who don't match the persona, however enthusiastic. Misfits at week 12 read as adoption failure.
+- Don't onboard candidates who don't match the persona, however enthusiastic. Misfits at the eight-week kill-criterion read as adoption failure.
 - Don't promise dates, SLAs, or hosted offerings. v1.0 is self-hosted.
