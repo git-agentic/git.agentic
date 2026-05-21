@@ -131,6 +131,12 @@ pub async fn fingerprint_one(
 /// hash and persist as the manifest Blob.
 pub fn canonicalize(value: &serde_json::Value) -> Vec<u8> {
     let normalized = sort_keys(value);
+    // INVARIANT: `sort_keys` only produces a `serde_json::Value` built from
+    // owned strings, owned vectors, booleans, numbers, and `Null`. Every
+    // such value is representable as JSON by construction — `serde_json::to_vec`
+    // only fails for I/O on a `Writer` (we pass a `Vec<u8>`) or for keys
+    // that aren't strings (`Map` keys are `String` here). So this is
+    // unreachable; CLAUDE.md requires the comment for any non-test `expect`.
     serde_json::to_vec(&normalized).expect("canonical serialize cannot fail")
 }
 

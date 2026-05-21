@@ -56,7 +56,10 @@ pub async fn execute_with_now(
     input: CommitInput,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<CommitOutput> {
-    let head = state.refs.read_head()?;
+    let head = state
+        .refs
+        .read_head()
+        .context("reading HEAD ref before commit")?;
     let branch = input.branch.clone().unwrap_or_else(|| match &head {
         Some(HeadRef::Branch(b)) => b.clone(),
         _ => "main".to_string(),
@@ -66,7 +69,10 @@ pub async fn execute_with_now(
     // Ok. Tracks whether we need to write HEAD on the success path.
     let needs_head_write = head.is_none();
 
-    let parent = state.refs.read_branch(&branch)?;
+    let parent = state
+        .refs
+        .read_branch(&branch)
+        .with_context(|| format!("reading branch ref {branch:?} before commit"))?;
 
     // -- Phase 1: snapshot memory ---------------------------------------
     let (memory_snapshot, schema_version) = snapshot_memory(&state, input.no_memory).await?;
@@ -78,7 +84,8 @@ pub async fn execute_with_now(
     let inputs = assemble_inputs(input, parent, memory_snapshot, schema_version, tools);
 
     // -- Phase 4: stage + commit + ref update (agentic-core) ------------
-    let out = stage_and_commit_with_now(state.store.as_ref(), &state.refs, &branch, inputs, now)?;
+    let out = stage_and_commit_with_now(state.store.as_ref(), &state.refs, &branch, inputs, now)
+        .with_context(|| format!("2PC staging on branch {branch:?}"))?;
 
     // -- Phase 5: publish HEAD on first commit --------------------------
     publish_head(&state, &branch, &out.commit_hash, needs_head_write);
@@ -293,8 +300,12 @@ mod tests {
 
     // Two distinct commits on the same branch: parent linkage works
     // and HEAD is only written on the first one (no error on second).
+    // Reads the second commit's blob back via walk_log so the assertion
+    // actually verifies the parent pointer rather than just inequality
+    // of hashes. (Test-analyzer review on PR #52.)
     #[tokio::test]
     async fn execute_chains_commits_on_same_branch() {
+        use agentic_core::commit::walk_log;
         let dir = tempfile::tempdir().unwrap();
         let state = make_state(dir.path()).await;
 
@@ -306,5 +317,143 @@ mod tests {
         assert_ne!(first.commit_hash, second.commit_hash);
         let tip = state.refs.read_branch("main").unwrap().unwrap();
         assert_eq!(tip.to_hex(), second.commit_hash);
+
+        // Walk the log: second.parent must be first.commit_hash.
+        let first_hash: agentic_core::Hash = first.commit_hash.parse().unwrap();
+        let second_hash: agentic_core::Hash = second.commit_hash.parse().unwrap();
+        let log = walk_log(state.store.as_ref(), second_hash, 10).unwrap();
+        assert_eq!(log.len(), 2, "two commits should be visible in the log");
+        assert_eq!(log[0].0, second_hash);
+        assert_eq!(log[1].0, first_hash);
+        assert_eq!(
+            log[0].1.parent,
+            Some(first_hash),
+            "second commit's parent must point at the first commit"
+        );
+    }
+
+    // assemble_inputs is a pure function — no I/O, no async. Verifies
+    // the wire→core fold preserves all dimensions, defaults author to
+    // "unknown" when CommitInput.author is None, encodes prompt
+    // strings to Vec<u8>, hardcodes intent/plan/transcript/evals to
+    // None, and zeroes cost_cents. (Test-analyzer review on PR #52.)
+    #[test]
+    fn assemble_inputs_folds_wire_input_into_core_inputs() {
+        let mut prompts = std::collections::BTreeMap::new();
+        prompts.insert("system.md".to_string(), "you are helpful".to_string());
+        prompts.insert("user.md".to_string(), "do the thing".to_string());
+
+        let mut tools = BTreeMap::new();
+        tools.insert("search".to_string(), b"{\"tools\":[]}".to_vec());
+
+        let parent_hash = agentic_core::Hash::of(b"parent-fixture");
+        let manifest_hash = agentic_core::Hash::of(b"manifest-fixture");
+
+        let input = CommitInput {
+            message: "hello".to_string(),
+            author: None, // exercise the "unknown" default
+            code_sha: Some("abc123".to_string()),
+            branch: Some("main".to_string()),
+            prompts,
+            mcp_servers: Vec::new(),
+            model: Some("anthropic:claude-opus:2026-05-01".to_string()),
+            no_memory: false,
+        };
+
+        let out = assemble_inputs(
+            input,
+            Some(parent_hash),
+            Some(manifest_hash),
+            Some("003_add_embeddings".to_string()),
+            tools.clone(),
+        );
+
+        assert_eq!(
+            out.author, "unknown",
+            "missing author defaults to 'unknown'"
+        );
+        assert_eq!(out.message, "hello");
+        assert_eq!(out.parent, Some(parent_hash));
+        assert_eq!(out.code_sha.as_deref(), Some("abc123"));
+        assert_eq!(out.prompts.len(), 2);
+        assert_eq!(
+            out.prompts.get("system.md").map(Vec::as_slice),
+            Some(b"you are helpful".as_slice()),
+            "prompt String must encode to Vec<u8>"
+        );
+        assert_eq!(out.tools, tools, "tools map is forwarded verbatim");
+        assert_eq!(
+            out.model.as_deref(),
+            Some("anthropic:claude-opus:2026-05-01")
+        );
+        assert_eq!(out.memory_snapshot, Some(manifest_hash));
+        assert_eq!(out.schema_version.as_deref(), Some("003_add_embeddings"));
+        // Dimensions the daemon doesn't yet populate — must stay None
+        // so the Commit blob is stable across versions until ADR-0002's
+        // platform extensions are wired through the daemon.
+        assert!(out.intent.is_none());
+        assert!(out.plan.is_none());
+        assert!(out.transcript.is_none());
+        assert!(out.evals.is_none());
+        assert_eq!(out.cost_cents, 0);
+    }
+
+    #[test]
+    fn assemble_inputs_uses_explicit_author_when_supplied() {
+        let mut prompts = std::collections::BTreeMap::new();
+        prompts.insert("system.md".to_string(), "x".to_string());
+        let input = CommitInput {
+            message: "hi".to_string(),
+            author: Some("alice@codento".to_string()),
+            code_sha: None,
+            branch: None,
+            prompts,
+            mcp_servers: Vec::new(),
+            model: None,
+            no_memory: true,
+        };
+        let out = assemble_inputs(input, None, None, None, BTreeMap::new());
+        assert_eq!(out.author, "alice@codento");
+    }
+
+    // Branch inference: when CommitInput.branch is None and HEAD already
+    // points at a branch, that branch wins. (Test-analyzer review on PR #52.)
+    #[tokio::test]
+    async fn execute_infers_branch_from_existing_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state(dir.path()).await;
+
+        // Set HEAD -> refs/heads/feature-x manually (no branch ref yet —
+        // first commit on this branch will land cleanly).
+        state.refs.write_head_symbolic("feature-x").unwrap();
+
+        let mut input = commit_input("on-feature");
+        input.branch = None; // force inference from HEAD
+
+        let out = execute(state.clone(), input).await.unwrap();
+        assert_eq!(out.branch, "feature-x");
+        // HEAD remains pointing at feature-x; branch ref now exists.
+        let head = state.refs.read_head().unwrap();
+        assert!(matches!(head, Some(HeadRef::Branch(b)) if b == "feature-x"));
+        assert!(state.refs.read_branch("feature-x").unwrap().is_some());
+    }
+
+    // Branch inference: when CommitInput.branch is None and HEAD is
+    // unset (fresh repo), the orchestrator defaults to "main".
+    // (Test-analyzer review on PR #52.)
+    #[tokio::test]
+    async fn execute_defaults_to_main_when_no_branch_and_no_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state(dir.path()).await;
+        assert!(state.refs.read_head().unwrap().is_none());
+
+        let mut input = commit_input("fresh-repo");
+        input.branch = None;
+
+        let out = execute(state.clone(), input).await.unwrap();
+        assert_eq!(out.branch, "main");
+        // HEAD got published on this first commit (B7 fix path).
+        let head = state.refs.read_head().unwrap();
+        assert!(matches!(head, Some(HeadRef::Branch(b)) if b == "main"));
     }
 }
