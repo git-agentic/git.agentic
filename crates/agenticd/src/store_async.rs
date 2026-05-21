@@ -32,7 +32,6 @@
 use std::sync::Arc;
 
 use agentic_core::{Hash, Object, ObjectKind, ObjectStore};
-use anyhow::Context;
 
 /// Run a sync `ObjectStore` closure on tokio's blocking thread pool,
 /// returning its result via the resulting future. The closure must
@@ -44,7 +43,21 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .with_context(|| format!("spawn_blocking join error in {label}"))?
+        .map_err(|je| {
+            if je.is_panic() {
+                let payload = je.into_panic();
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "(non-string payload)".to_string()
+                };
+                anyhow::anyhow!("spawn_blocking task for {label} panicked: {msg}")
+            } else {
+                anyhow::anyhow!("spawn_blocking join error in {label}: {je}")
+            }
+        })?
         .map_err(anyhow::Error::from)
 }
 
@@ -54,7 +67,11 @@ pub async fn get(store: Arc<dyn ObjectStore + Send + Sync>, hash: Hash) -> anyho
     run_blocking("ObjectStore::get", move || store.get(&hash)).await
 }
 
-/// Async wrapper for [`ObjectStore::get_raw`].
+/// Async wrapper for [`ObjectStore::get_raw`]. Kept for API symmetry
+/// with `get` / `put_raw`; no production caller wires it yet because
+/// the `Request::Log` / `Request::Diff` paths still call into
+/// `walk_log` and `diff::diff` synchronously (PR #55 follow-up).
+#[allow(dead_code)]
 pub async fn get_raw(
     store: Arc<dyn ObjectStore + Send + Sync>,
     hash: Hash,
