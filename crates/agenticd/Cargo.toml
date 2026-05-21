@@ -32,3 +32,4 @@ chrono.workspace = true
 tempfile = "3.10"
 sqlx.workspace = true
 libc = "0.2"
+wiremock = "0.6"

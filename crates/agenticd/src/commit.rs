@@ -164,15 +164,31 @@ async fn snapshot_memory(
 /// manifest bytes keyed by server name. A per-server failure is
 /// propagated — partial success would corrupt the tools-tree hash
 /// relative to the supposed commit state.
+///
+/// The map is keyed by the *configured* `spec.name`, not by
+/// `fp.name`. Today these are equal because `fingerprint_one`
+/// carries `spec.name` verbatim into `McpFingerprint.name`, but
+/// keying on `spec.name` here makes the layering explicit: the
+/// commit-tree key is what the operator configured, regardless of
+/// what the server declares about itself. Duplicate `spec.name`
+/// would silently overwrite at insert time — `DaemonState::open`
+/// rejects duplicates at startup so this can't happen at runtime.
 async fn fingerprint_tools(state: &Arc<DaemonState>) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     if state.mcp_servers.is_empty() {
         return Ok(BTreeMap::new());
     }
     let fingerprints = fingerprint_all(&state.http, &state.mcp_servers).await;
+    anyhow::ensure!(
+        fingerprints.len() == state.mcp_servers.len(),
+        "fingerprint_all returned {} result(s) for {} configured MCP server(s); \
+         a non-1:1 contract would silently misattribute fingerprints",
+        fingerprints.len(),
+        state.mcp_servers.len()
+    );
     let mut tools_map = BTreeMap::new();
     for (spec, result) in state.mcp_servers.iter().zip(fingerprints) {
         let fp = result.with_context(|| format!("fingerprinting MCP server {}", spec.name))?;
-        tools_map.insert(fp.name, fp.canonical_manifest);
+        tools_map.insert(spec.name.clone(), fp.canonical_manifest);
     }
     Ok(tools_map)
 }
@@ -252,6 +268,16 @@ mod tests {
     /// no MCP servers, no MCP HTTP traffic. Suitable for unit tests of
     /// the commit orchestrator that don't exercise phases 1 or 2.
     async fn make_state(repo: &std::path::Path) -> Arc<DaemonState> {
+        make_state_with_mcp(repo, Vec::new()).await
+    }
+
+    /// As `make_state`, but with a configured MCP server list. Used by
+    /// the `fingerprint_tools` tests below that point at `wiremock`
+    /// servers and exercise phase 2 end-to-end.
+    async fn make_state_with_mcp(
+        repo: &std::path::Path,
+        mcp_servers: Vec<crate::mcp::McpServerSpec>,
+    ) -> Arc<DaemonState> {
         let agentic_dir = repo.join(".agentic");
         std::fs::create_dir_all(&agentic_dir).unwrap();
         let store: Arc<dyn ObjectStore + Send + Sync> =
@@ -263,7 +289,7 @@ mod tests {
                 store,
                 None,       // no postgres
                 Vec::new(), // no tracked tables
-                Vec::new(), // no MCP servers
+                mcp_servers,
                 Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
             )
             .await
@@ -528,6 +554,232 @@ mod tests {
         let head = state.refs.read_head().unwrap();
         assert!(matches!(head, Some(HeadRef::Branch(b)) if b == "feature-x"));
         assert!(state.refs.read_branch("feature-x").unwrap().is_some());
+    }
+
+    // Issue #53 (1/2): a single failing MCP server must propagate as an
+    // Err out of `fingerprint_tools` — partial success would corrupt
+    // the tools-tree hash relative to the supposed commit state. The
+    // current implementation enforces this with an early `?` on the
+    // zipped `Result`; this test would fail under a hypothetical
+    // refactor to `Vec<Result<_>>` / partition-collect that silently
+    // dropped per-server errors.
+    #[tokio::test]
+    async fn fingerprint_tools_propagates_per_server_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+
+        // ok_srv responds with a valid JSON-RPC tools/list payload.
+        // fail_srv responds with HTTP 500 — mcp::fingerprint_one turns
+        // this into an Err with the server name embedded in the chain.
+        let ok_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": []}
+            })))
+            .expect(1)
+            .mount(&ok_srv)
+            .await;
+        let fail_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kaboom"))
+            .expect(1)
+            .mount(&fail_srv)
+            .await;
+
+        let state = make_state_with_mcp(
+            dir.path(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "ok".to_string(),
+                    url: format!("{}/", ok_srv.uri()),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "failing".to_string(),
+                    url: format!("{}/", fail_srv.uri()),
+                },
+            ],
+        )
+        .await;
+
+        let err = fingerprint_tools(&state)
+            .await
+            .expect_err("a 500 from one MCP server must fail the whole phase");
+        let chain = format!("{err:#}");
+        // Match the exact prefix produced by fingerprint_one's HTTP-error
+        // path so an unrelated reqwest/tokio error message containing the
+        // English word "failing" cannot satisfy this assertion.
+        assert!(
+            chain.contains("MCP server failing"),
+            "error chain must name the failing server via the \
+             'MCP server <name>' prefix; got: {chain}"
+        );
+    }
+
+    // Issue #53 (2/2): each key in the tools map must point at the
+    // canonical bytes returned by *that server's* URL. The map is keyed
+    // by `spec.name`; the test gives each mock server a payload that
+    // mentions its own URL identity, then asserts each configured name
+    // resolves to the correct server's bytes (and *not* the other
+    // server's). Catches a future regression where `fingerprint_all`
+    // reorders results, the call site stops using `spec.name`, or the
+    // index-zip drifts.
+    #[tokio::test]
+    async fn fingerprint_tools_attributes_payload_to_its_server() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let dir = tempfile::tempdir().unwrap();
+
+        let srv_a = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [{"name": "from-srv-a"}]}
+            })))
+            .expect(1)
+            .mount(&srv_a)
+            .await;
+        let srv_b = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [{"name": "from-srv-b"}]}
+            })))
+            .expect(1)
+            .mount(&srv_b)
+            .await;
+
+        let state = make_state_with_mcp(
+            dir.path(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "alpha".to_string(),
+                    url: format!("{}/", srv_a.uri()),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "bravo".to_string(),
+                    url: format!("{}/", srv_b.uri()),
+                },
+            ],
+        )
+        .await;
+
+        let tools = fingerprint_tools(&state)
+            .await
+            .expect("both servers returned 200 — phase must succeed");
+        assert_eq!(tools.len(), 2, "expected one entry per configured server");
+
+        let alpha_bytes = tools.get("alpha").expect("missing key 'alpha'");
+        let bravo_bytes = tools.get("bravo").expect("missing key 'bravo'");
+        let alpha_str = std::str::from_utf8(alpha_bytes).unwrap();
+        let bravo_str = std::str::from_utf8(bravo_bytes).unwrap();
+        assert!(
+            alpha_str.contains("from-srv-a"),
+            "'alpha' must hold the payload served by srv_a; got: {alpha_str}"
+        );
+        assert!(
+            bravo_str.contains("from-srv-b"),
+            "'bravo' must hold the payload served by srv_b; got: {bravo_str}"
+        );
+        // And explicitly assert the misattribution case is not present.
+        assert!(
+            !alpha_str.contains("from-srv-b"),
+            "alpha must not be attributed srv_b's payload"
+        );
+        assert!(
+            !bravo_str.contains("from-srv-a"),
+            "bravo must not be attributed srv_a's payload"
+        );
+    }
+
+    // Issue #53 / PR #72 re-review: `tools_map.insert(spec.name, ...)`
+    // would silently overwrite on duplicate keys, producing a one-entry
+    // tools tree committed as if complete. The fix lives at startup —
+    // `DaemonState::open` refuses to construct a state with duplicate
+    // MCP server names. This test pins that loud-refusal contract so a
+    // future change to the validation can't quietly delete it.
+    #[tokio::test]
+    async fn daemon_state_refuses_duplicate_mcp_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        // `DaemonState` does not impl `Debug` (it holds an `Arc<dyn ObjectStore>`),
+        // so we can't use `.expect_err` here.
+        let result = DaemonState::open(
+            dir.path().to_path_buf(),
+            agentic_dir,
+            store,
+            None,
+            Vec::new(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "dupe".to_string(),
+                    url: "http://example.invalid/a".to_string(),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "dupe".to_string(),
+                    url: "http://example.invalid/b".to_string(),
+                },
+            ],
+            Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("duplicate MCP server name must be refused at startup"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("duplicate MCP server name") && chain.contains("dupe"),
+            "error must name the duplicate; got: {chain}"
+        );
+    }
+
+    // Happy-path counterpart to the duplicate-name rejection test
+    // above. Distinct MCP server names must construct cleanly — pins
+    // the validation against a future "reject everything" regression.
+    // Uses unreachable URLs because `open` doesn't make HTTP calls;
+    // fingerprinting only happens on commit.
+    #[tokio::test]
+    async fn daemon_state_accepts_distinct_mcp_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        let state = DaemonState::open(
+            dir.path().to_path_buf(),
+            agentic_dir,
+            store,
+            None,
+            Vec::new(),
+            vec![
+                crate::mcp::McpServerSpec {
+                    name: "alpha".to_string(),
+                    url: "http://example.invalid/a".to_string(),
+                },
+                crate::mcp::McpServerSpec {
+                    name: "bravo".to_string(),
+                    url: "http://example.invalid/b".to_string(),
+                },
+            ],
+            Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        )
+        .await
+        .expect("distinct MCP server names must construct cleanly");
+        assert_eq!(state.mcp_servers.len(), 2);
+        assert_eq!(state.mcp_servers[0].name, "alpha");
+        assert_eq!(state.mcp_servers[1].name, "bravo");
     }
 
     // Branch inference: when CommitInput.branch is None and HEAD is
