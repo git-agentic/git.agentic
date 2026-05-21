@@ -85,8 +85,9 @@ pub struct PostgresAdapter {
     /// Streamer handle. Set after `init()`; `snapshot()` goes through
     /// `streamer.take_snapshot` to produce O(delta)-sized manifests.
     streamer: Option<StreamerHandle>,
-    /// Streamer task handle. Held so it stays alive for the adapter's
-    /// lifetime; dropped when the adapter is dropped.
+    /// Streamer task join handle. Retained so the adapter can later
+    /// await or abort the background task if needed; dropping the
+    /// handle would only detach the task, not stop it.
     #[allow(dead_code)]
     streamer_join: Option<JoinHandle<()>>,
     /// Trigger-poller handle. Exposes [`triggers::Quiesceable`] so the
