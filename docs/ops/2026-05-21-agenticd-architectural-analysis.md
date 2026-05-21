@@ -203,8 +203,10 @@ pub async fn reconcile_refs_on_startup(repo: &Repo, store: &dyn ObjectStore) -> 
 
 Plus `list_branches_returns_existing_names` in `agentic-core::refs#tests`.
 
-<a name="a3"></a>**A3 — Extract `handle_commit` into `crates/agenticd/src/commit.rs` with named 2PC phases**
+<a name="a3"></a>**A3 — Extract `handle_commit` into `crates/agenticd/src/commit.rs` with named 2PC phases** — **DONE 2026-05-21** (issue [#38](https://github.com/git-agentic/git.agentic/issues/38)).
 *Addresses:* [S2](#s2), [B4](#b4) (cheap fix via injected `now_fn`), [B5](#b5), [B7](#b7) partially. *Principle:* SRP + OCP. *Effort:* M.
+
+**Originally proposed** (kept for historical record):
 
 ```rust
 pub struct CommitCtx<'a> {
@@ -220,6 +222,39 @@ pub async fn execute(ctx: CommitCtx<'_>, req: CommitRequest) -> Result<CommitId>
     Ok(commit.id)
 }
 ```
+
+**Shipped shape** (differs from the proposal in three ways noted below):
+
+```rust
+// crates/agenticd/src/commit.rs
+pub async fn execute(state: Arc<DaemonState>, input: CommitInput) -> Result<CommitOutput>;
+pub async fn execute_with_now(state: Arc<DaemonState>, input: CommitInput, now: DateTime<Utc>) -> Result<CommitOutput>;
+// private phases:
+async fn snapshot_memory(state, no_memory) -> Result<(Option<Hash>, Option<String>)>;
+async fn fingerprint_tools(state) -> Result<BTreeMap<String, Vec<u8>>>;
+fn assemble_inputs(input, parent, memory_snapshot, schema_version, tools) -> CommitInputs;
+fn publish_head(state, branch, commit_hash, needs_head_write);
+// crates/agentic-core/src/commit.rs (B4 fix):
+pub fn stage_and_commit_with_now<S>(store, refs, branch, inputs, now: DateTime<Utc>) -> Result<CommitOutputs>;
+// `stage_and_commit` is now a thin wrapper that calls `_with_now(Utc::now())`.
+```
+
+**Departures from the audit pseudocode:**
+
+- The phases live at the daemon (agenticd) level rather than the core (agentic-core) level. The audit's pseudocode proposed extracting the staging steps (`stage_blobs`, `build_segment`, `build_commit_blob`, `push_commit`, `update_ref`) at the orchestrator. Those steps already exist inside `agentic_core::commit::stage_and_commit` and only have one caller — extracting them again at the daemon level would duplicate the work. Instead, the agenticd-side phases (`snapshot_memory`, `fingerprint_tools`, `assemble_inputs`, `publish_head`) are the work that's actually agenticd-specific; phase 4 delegates to `stage_and_commit_with_now` for the ADR-0002 D3 single commit point.
+- The B4 fix is a new `stage_and_commit_with_now(..., now: DateTime<Utc>)` function in `agentic-core`, with `stage_and_commit` keeping its current signature as a wrapper that reads `Utc::now()` once. Existing callers (the rollback path's forward-record step) are unchanged.
+- `Arc<DaemonState>` is the parameter shape because that's what the dispatch arm in `server.rs` already passes (mirrors `rollback::execute`). A new `CommitCtx<'a>` struct was considered but rejected as scope creep — it would have churned every test and the rollback path with no functional gain.
+- **B5 (`ObjectKind` parameter discarded by `put_raw`) is NOT addressed here.** Dropping the parameter requires changing the `ObjectStore` trait — wider blast radius than A3's scope. Filed for a follow-up.
+
+**Tests landed:**
+
+- `agentic_core::commit::tests::stage_and_commit_with_now_is_deterministic` — AC for §B4: identical `(CommitInputs, now)` across two independent tempdirs produces the same `commit_hash`.
+- `agentic_core::commit::tests::stage_and_commit_with_now_differs_when_timestamp_differs` — companion guard: timestamp is part of the commit blob's content, so different `now` correctly yields different hash.
+- `agenticd::commit::tests::execute_with_now_is_deterministic` — end-to-end determinism through the daemon-level orchestrator.
+- `agenticd::commit::tests::execute_publishes_head_on_first_commit` — confirms the §B7 fix from A2 is preserved across the extraction (HEAD is written symbolically AFTER `stage_and_commit_with_now` succeeds).
+- `agenticd::commit::tests::execute_chains_commits_on_same_branch` — sanity for parent linkage + the HEAD-already-set path.
+
+Total: 5 new tests + the old `handle_commit` body deleted from `server.rs:319-432`. 27 lib tests in agentic-core (was 25), 46 in agenticd (was 43). 89 lib tests workspace-wide.
 
 <a name="a4"></a>**A4 — Split `rollback.rs` into `mod.rs` (orchestration), `loaders.rs` (typed object readers), `writeback.rs` (FS prompts/tools)** — **DONE 2026-05-21** (issue [#39](https://github.com/git-agentic/git.agentic/issues/39)).
 *Addresses:* [S3](#s3), [S7](#s7), [R11](#r11), [R6](#r6) (drop the duplicate guard). *Principle:* SRP + High Cohesion. *Effort:* S.
@@ -344,7 +379,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A1 | Quiesce trigger poller during memory restore | [#35](https://github.com/git-agentic/git.agentic/issues/35) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A2 | Lifecycle module: SIGTERM drain + startup ref reconciliation | [#36](https://github.com/git-agentic/git.agentic/issues/36) **DONE** | `must-fix-v1.0` | `v1.0` |
 | A8 | Reverse-migration outer transaction + restore-guard fix + wire `accept_data_loss` | [#37](https://github.com/git-agentic/git.agentic/issues/37) **DONE** | `must-fix-v1.0` | `v1.0` |
-| A3 | Extract `handle_commit` into `commit.rs` orchestrator | (TBD) | `hardening-sprint` | — |
+| A3 | Extract `handle_commit` into `commit.rs` orchestrator | [#38](https://github.com/git-agentic/git.agentic/issues/38) **DONE** | `hardening-sprint` | — |
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | [#39](https://github.com/git-agentic/git.agentic/issues/39) **DONE** | `hardening-sprint` | — |
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | (TBD) | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope (blocked by ADR-0010) | (TBD) | `hardening-sprint` | — |

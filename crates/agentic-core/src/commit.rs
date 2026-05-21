@@ -76,11 +76,32 @@ pub struct CommitOutputs {
 /// Run the 2PC staging in the mandatory ADR-0002 order. Pure orchestration —
 /// no Postgres, no Git wire I/O yet (Chunk A is local-only). The Git push
 /// extension point (step 4) is a TODO marker that lands in Chunk B/C.
+///
+/// Reads wall-clock time once via `chrono::Utc::now()` and threads it
+/// into the Commit's timestamp. Callers that need a deterministic
+/// timestamp (idempotent-retry recovery; tests) should use
+/// [`stage_and_commit_with_now`] directly. Audit anchor §B4 / §A3.
 pub fn stage_and_commit<S: ObjectStore + ?Sized>(
     store: &S,
     refs: &Refs,
     branch: &str,
     inputs: CommitInputs,
+) -> Result<CommitOutputs> {
+    stage_and_commit_with_now(store, refs, branch, inputs, chrono::Utc::now())
+}
+
+/// `stage_and_commit` with the wall-clock injection point exposed. The
+/// `now` argument becomes the Commit's `timestamp`. With the same
+/// `(inputs, now)`, this function produces the same `commit_hash` on
+/// every call — that's what makes ADR-0002 D3 step-4 retry idempotent
+/// (same content → same hash → no duplicate Commit blob), and what
+/// makes a determinism test possible (audit anchor §B4 / §A3).
+pub fn stage_and_commit_with_now<S: ObjectStore + ?Sized>(
+    store: &S,
+    refs: &Refs,
+    branch: &str,
+    inputs: CommitInputs,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<CommitOutputs> {
     // -- Step 1: stage all non-Git blobs ---------------------------------
     let prompts_hash = stage_blob_tree(store, &inputs.prompts)?;
@@ -95,7 +116,7 @@ pub fn stage_and_commit<S: ObjectStore + ?Sized>(
     let commit = Commit {
         parent: inputs.parent,
         author: inputs.author,
-        timestamp: chrono::Utc::now(),
+        timestamp: now,
         message: inputs.message,
         code_sha: inputs.code_sha,
         prompts: prompts_hash,
@@ -290,5 +311,84 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(a, b, "identical inputs produce identical tree hash");
+    }
+
+    // AC for issue #38 / audit §A3 / §B4: same CommitInputs + same now
+    // → same commit_hash. Without `stage_and_commit_with_now` the
+    // public `stage_and_commit` reads `chrono::Utc::now()` internally,
+    // so two back-to-back calls with the same logical inputs produce
+    // different timestamps and therefore different commit blobs —
+    // breaking the retry-idempotency claim in the module docstring.
+    #[test]
+    fn stage_and_commit_with_now_is_deterministic() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_a = FsObjectStore::open(dir_a.path().join("objects")).unwrap();
+        let store_b = FsObjectStore::open(dir_b.path().join("objects")).unwrap();
+        let refs_a = Refs::open(dir_a.path()).unwrap();
+        let refs_b = Refs::open(dir_b.path()).unwrap();
+
+        let fixed_now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let inputs = || CommitInputs {
+            author: "tester".to_string(),
+            message: "deterministic".to_string(),
+            parent: None,
+            code_sha: Some("deadbeef".to_string()),
+            prompts: BTreeMap::from([("system.md".to_string(), b"hello".to_vec())]),
+            tools: BTreeMap::new(),
+            model: Some("anthropic:claude-opus:2026-05-01".to_string()),
+            memory_snapshot: None,
+            schema_version: None,
+            intent: None,
+            plan: None,
+            transcript: None,
+            evals: None,
+            cost_cents: 0,
+        };
+
+        let a = stage_and_commit_with_now(&store_a, &refs_a, "main", inputs(), fixed_now).unwrap();
+        let b = stage_and_commit_with_now(&store_b, &refs_b, "main", inputs(), fixed_now).unwrap();
+
+        assert_eq!(
+            a.commit_hash, b.commit_hash,
+            "same inputs + same now must produce same commit hash"
+        );
+    }
+
+    // Companion: same inputs but DIFFERENT `now` produce different
+    // commit hashes — the timestamp is part of the Commit blob's
+    // content, by design (commit history needs wall-clock attribution).
+    #[test]
+    fn stage_and_commit_with_now_differs_when_timestamp_differs() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_a = FsObjectStore::open(dir_a.path().join("objects")).unwrap();
+        let store_b = FsObjectStore::open(dir_b.path().join("objects")).unwrap();
+        let refs_a = Refs::open(dir_a.path()).unwrap();
+        let refs_b = Refs::open(dir_b.path()).unwrap();
+
+        let inputs = || CommitInputs {
+            author: "tester".to_string(),
+            message: "deterministic".to_string(),
+            parent: None,
+            code_sha: Some("deadbeef".to_string()),
+            prompts: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            model: None,
+            memory_snapshot: None,
+            schema_version: None,
+            intent: None,
+            plan: None,
+            transcript: None,
+            evals: None,
+            cost_cents: 0,
+        };
+
+        let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let t2 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_001, 0).unwrap();
+        let a = stage_and_commit_with_now(&store_a, &refs_a, "main", inputs(), t1).unwrap();
+        let b = stage_and_commit_with_now(&store_b, &refs_b, "main", inputs(), t2).unwrap();
+
+        assert_ne!(a.commit_hash, b.commit_hash);
     }
 }
