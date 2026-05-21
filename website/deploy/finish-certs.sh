@@ -164,14 +164,15 @@ fi
 
 # Install if changed.
 if ! cmp -s "$TMP" "$CONF"; then
-  cp "$CONF" "$CONF.bak.$(date +%Y%m%d-%H%M%S)"
+  backup="$CONF.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$CONF" "$backup"
   install -m 0644 "$TMP" "$CONF"
   if nginx -t; then
     systemctl reload nginx
     echo "nginx reloaded with updated config"
   else
     echo "nginx -t failed; restoring backup"
-    cp "$CONF.bak."* "$CONF" 2>/dev/null
+    cp "$backup" "$CONF"
     rm -f "$TMP"
     exit 1
   fi
