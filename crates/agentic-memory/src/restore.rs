@@ -42,13 +42,12 @@ use crate::{Error, Result};
 /// [`docs/plans/`](../../../../docs/plans/) for the design rationale.
 pub struct RestoreGuard {
     /// Held for the lifetime of the guard; drop releases the poller pause.
-    #[allow(dead_code)]
-    token: QuiesceToken,
+    _token: QuiesceToken,
 }
 
 impl RestoreGuard {
     pub(crate) fn new(token: QuiesceToken) -> Self {
-        Self { token }
+        Self { _token: token }
     }
 }
 
