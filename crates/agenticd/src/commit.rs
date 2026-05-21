@@ -43,8 +43,12 @@ use crate::server::DaemonState;
 /// Run the commit orchestration end-to-end. Called from the dispatcher
 /// in `server.rs` after `commit_lock` is acquired and the shutdown
 /// gate has been checked.
-pub async fn execute(state: Arc<DaemonState>, input: CommitInput) -> anyhow::Result<CommitOutput> {
-    execute_with_now(state, input, chrono::Utc::now()).await
+pub async fn execute(
+    state: Arc<DaemonState>,
+    input: CommitInput,
+    peer_uid: Option<u32>,
+) -> anyhow::Result<CommitOutput> {
+    execute_with_now(state, input, peer_uid, chrono::Utc::now()).await
 }
 
 /// `execute` with the wall-clock injection point exposed for the
@@ -54,6 +58,7 @@ pub async fn execute(state: Arc<DaemonState>, input: CommitInput) -> anyhow::Res
 pub async fn execute_with_now(
     state: Arc<DaemonState>,
     input: CommitInput,
+    peer_uid: Option<u32>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<CommitOutput> {
     let head = state
@@ -81,7 +86,14 @@ pub async fn execute_with_now(
     let tools = fingerprint_tools(&state).await?;
 
     // -- Phase 3: assemble core CommitInputs ----------------------------
-    let inputs = assemble_inputs(input, parent, memory_snapshot, schema_version, tools);
+    let inputs = assemble_inputs(
+        input,
+        parent,
+        memory_snapshot,
+        schema_version,
+        tools,
+        peer_uid,
+    );
 
     // -- Phase 4: stage + commit + ref update (agentic-core) ------------
     //
@@ -173,6 +185,7 @@ fn assemble_inputs(
     memory_snapshot: Option<agentic_core::Hash>,
     schema_version: Option<String>,
     tools: BTreeMap<String, Vec<u8>>,
+    peer_uid: Option<u32>,
 ) -> CommitInputs {
     let prompts = input
         .prompts
@@ -194,7 +207,7 @@ fn assemble_inputs(
         transcript: None,
         evals: None,
         cost_cents: 0,
-        peer_uid: None,
+        peer_uid,
     }
 }
 
@@ -251,6 +264,7 @@ mod tests {
                 None,       // no postgres
                 Vec::new(), // no tracked tables
                 Vec::new(), // no MCP servers
+                Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
             )
             .await
             .unwrap(),
@@ -287,10 +301,10 @@ mod tests {
         let state_b = make_state(dir_b.path()).await;
 
         let fixed_now = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let out_a = execute_with_now(state_a, commit_input("deterministic"), fixed_now)
+        let out_a = execute_with_now(state_a, commit_input("deterministic"), None, fixed_now)
             .await
             .unwrap();
-        let out_b = execute_with_now(state_b, commit_input("deterministic"), fixed_now)
+        let out_b = execute_with_now(state_b, commit_input("deterministic"), None, fixed_now)
             .await
             .unwrap();
 
@@ -314,7 +328,9 @@ mod tests {
             "fresh repo has no HEAD"
         );
 
-        let out = execute(state.clone(), commit_input("first")).await.unwrap();
+        let out = execute(state.clone(), commit_input("first"), None)
+            .await
+            .unwrap();
 
         let head = state.refs.read_head().unwrap();
         assert!(
@@ -335,8 +351,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = make_state(dir.path()).await;
 
-        let first = execute(state.clone(), commit_input("first")).await.unwrap();
-        let second = execute(state.clone(), commit_input("second"))
+        let first = execute(state.clone(), commit_input("first"), None)
+            .await
+            .unwrap();
+        let second = execute(state.clone(), commit_input("second"), None)
             .await
             .unwrap();
 
@@ -392,6 +410,7 @@ mod tests {
             Some(manifest_hash),
             Some("003_add_embeddings".to_string()),
             tools.clone(),
+            Some(1234),
         );
 
         assert_eq!(
@@ -422,6 +441,8 @@ mod tests {
         assert!(out.transcript.is_none());
         assert!(out.evals.is_none());
         assert_eq!(out.cost_cents, 0);
+        // peer_uid is propagated verbatim from the dispatch context.
+        assert_eq!(out.peer_uid, Some(1234));
     }
 
     #[test]
@@ -438,8 +459,9 @@ mod tests {
             model: None,
             no_memory: true,
         };
-        let out = assemble_inputs(input, None, None, None, BTreeMap::new());
+        let out = assemble_inputs(input, None, None, None, BTreeMap::new(), None);
         assert_eq!(out.author, "alice@example.com");
+        assert_eq!(out.peer_uid, None);
     }
 
     // Branch inference: when CommitInput.branch is None and HEAD already
@@ -456,7 +478,7 @@ mod tests {
         let mut input = commit_input("on-feature");
         input.branch = None; // force inference from HEAD
 
-        let out = execute(state.clone(), input).await.unwrap();
+        let out = execute(state.clone(), input, None).await.unwrap();
         assert_eq!(out.branch, "feature-x");
         // HEAD remains pointing at feature-x; branch ref now exists.
         let head = state.refs.read_head().unwrap();
@@ -476,7 +498,7 @@ mod tests {
         let mut input = commit_input("fresh-repo");
         input.branch = None;
 
-        let out = execute(state.clone(), input).await.unwrap();
+        let out = execute(state.clone(), input, None).await.unwrap();
         assert_eq!(out.branch, "main");
         // HEAD got published on this first commit (B7 fix path).
         let head = state.refs.read_head().unwrap();

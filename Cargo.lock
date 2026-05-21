@@ -76,6 +76,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

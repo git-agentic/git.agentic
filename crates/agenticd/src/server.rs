@@ -23,6 +23,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::mcp::McpServerSpec;
+use crate::peer_auth::PeerAuthPolicy;
 
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
@@ -53,6 +54,10 @@ pub struct DaemonState {
     /// Shared HTTP client for MCP calls. Reusing one client lets the
     /// connection pool stay warm across many commits.
     pub http: reqwest::Client,
+    /// Peer-UID policy applied at socket-accept time. Constructed at
+    /// startup from CLI flags; carried here so `DaemonState::open`
+    /// callers in integration tests can construct one explicitly.
+    pub peer_auth: Arc<PeerAuthPolicy>,
 }
 
 impl DaemonState {
@@ -63,6 +68,7 @@ impl DaemonState {
         postgres_url: Option<&str>,
         tables: Vec<TrackedTable>,
         mcp_servers: Vec<McpServerSpec>,
+        peer_auth: Arc<PeerAuthPolicy>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&agentic_dir).context("creating .agentic directory")?;
         let refs = Refs::open(&agentic_dir).context("opening refs")?;
@@ -104,6 +110,7 @@ impl DaemonState {
             memory,
             mcp_servers,
             http,
+            peer_auth,
         })
     }
 
@@ -123,14 +130,18 @@ impl DaemonState {
 
 /// Handle a single accepted connection. Runs the read/dispatch/write loop
 /// until the peer closes the socket.
-pub async fn handle_connection(state: Arc<DaemonState>, sock: UnixStream) -> anyhow::Result<()> {
+pub async fn handle_connection(
+    state: Arc<DaemonState>,
+    sock: UnixStream,
+    peer_uid: Option<u32>,
+) -> anyhow::Result<()> {
     let (read_half, write_half) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut writer = tokio::io::BufWriter::new(write_half);
 
     while let Some(envelope) = read_frame::<_, Envelope<Request>>(&mut reader).await? {
         let correlation_id = envelope.correlation_id.clone();
-        let response = match dispatch(Arc::clone(&state), envelope.payload).await {
+        let response = match dispatch(Arc::clone(&state), envelope.payload, peer_uid).await {
             Ok(r) => r,
             Err(e) => Response::Error {
                 message: format!("{e:#}"),
@@ -145,7 +156,11 @@ pub async fn handle_connection(state: Arc<DaemonState>, sock: UnixStream) -> any
     Ok(())
 }
 
-async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<Response> {
+async fn dispatch(
+    state: Arc<DaemonState>,
+    request: Request,
+    peer_uid: Option<u32>,
+) -> anyhow::Result<Response> {
     match request {
         Request::Ping => Ok(Response::Pong),
 
@@ -173,7 +188,7 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
             // and the next queued waiter wakes up and starts 2PC inside a
             // LocalSet that is about to abort it.
             state.check_shutdown()?;
-            let out = crate::commit::execute(Arc::clone(&state), input).await?;
+            let out = crate::commit::execute(Arc::clone(&state), input, peer_uid).await?;
             Ok(Response::Commit(out))
         }
 
@@ -256,6 +271,7 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
                     accept_data_loss,
                     repo: repo_root,
                 },
+                peer_uid,
             )
             .await?;
             Ok(Response::Rollback(out))

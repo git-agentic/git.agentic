@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
             .context("startup ref reconciliation")?;
     }
 
+    let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
         DaemonState::open(
             args.repo.clone(),
@@ -170,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             args.postgres.as_deref(),
             tables,
             mcp_servers,
+            Arc::clone(&peer_auth),
         )
         .await?,
     );
@@ -226,9 +228,45 @@ async fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         };
+                        // ADR-0012: read peer credentials before any I/O.
+                        let cred = match sock.peer_cred() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "peer_cred() failed; closing connection");
+                                continue;
+                            }
+                        };
+                        let peer_uid: u32 = cred.uid();
+                        let peer_pid: Option<i32> = cred.pid();
+
+                        if !state.peer_auth.is_allowed(peer_uid) {
+                            tracing::warn!(
+                                target: "agenticd::accept",
+                                peer_uid,
+                                peer_pid = ?peer_pid,
+                                "connection rejected: UID not in allowlist"
+                            );
+                            drop(sock);
+                            continue;
+                        }
+                        tracing::debug!(
+                            target: "agenticd::accept",
+                            peer_uid,
+                            peer_pid = ?peer_pid,
+                            "connection accepted"
+                        );
+
+                        // Under --insecure-allow-any-uid we deliberately do
+                        // NOT attest commits with the connection's UID; the
+                        // UID has no security meaning in that mode.
+                        let carried_uid = match &*state.peer_auth {
+                            PeerAuthPolicy::InsecureAllowAny => None,
+                            PeerAuthPolicy::Allowlist(_) => Some(peer_uid),
+                        };
+
                         let state = state.clone();
                         tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(state, sock).await {
+                            if let Err(e) = handle_connection(state, sock, carried_uid).await {
                                 tracing::warn!(error = %format!("{e:#}"), "connection error");
                             }
                         });

@@ -85,6 +85,7 @@ step "3. building + starting agenticd"
 rm -rf "${DEMO_DIR}/.agentic"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" init >/dev/null
 "${AGENTICD_BIN}" --repo "${DEMO_DIR}" --postgres "${DATABASE_URL}" --tables episodes:id \
+    --insecure-allow-any-uid \
     > "${DEMO_DIR}/.agentic/daemon.log" 2>&1 &
 DAEMON_PID=$!
 
