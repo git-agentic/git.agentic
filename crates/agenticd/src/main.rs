@@ -14,6 +14,7 @@ use tokio::net::UnixListener;
 use agenticd::lifecycle::{reconcile_refs_on_startup, Lifecycle};
 use agenticd::mcp::parse_mcp_spec;
 use agenticd::objstore::ObjectStoreSpec;
+use agenticd::peer_auth::PeerAuthPolicy;
 use agenticd::server::{handle_connection, DaemonState};
 
 fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
@@ -66,6 +67,19 @@ struct Args {
     /// and `AGENTIC_GCS_TOKEN` for bearer auth.
     #[arg(long, default_value = "fs")]
     object_store: String,
+
+    /// UID allowed to connect to the socket. Repeatable. Required in
+    /// production deployments; the daemon refuses to start without at
+    /// least one --allowed-uid unless --insecure-allow-any-uid is
+    /// explicitly passed. Per ADR-0012.
+    #[arg(long = "allowed-uid")]
+    allowed_uids: Vec<u32>,
+
+    /// Disable peer-UID enforcement on the socket. Demo and macOS-
+    /// native development only — production deployments MUST NOT use
+    /// this flag. Logged loudly at startup.
+    #[arg(long)]
+    insecure_allow_any_uid: bool,
 }
 
 #[tokio::main]
@@ -77,6 +91,38 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // ADR-0012: build the peer-auth policy from CLI flags BEFORE any I/O.
+    // The daemon refuses to start without an explicit policy choice;
+    // --insecure-allow-any-uid is loudly warned about at startup.
+    let peer_auth = match (args.allowed_uids.is_empty(), args.insecure_allow_any_uid) {
+        (true, false) => {
+            return Err(anyhow::anyhow!(
+                "agenticd refuses to start without peer-UID enforcement.\n\
+                 Pass --allowed-uid <UID> (repeatable) to enable the allowlist,\n\
+                 or pass --insecure-allow-any-uid explicitly to disable enforcement\n\
+                 (demo and macOS-native development only — never in production)."
+            ));
+        }
+        (false, true) => {
+            return Err(anyhow::anyhow!(
+                "--allowed-uid and --insecure-allow-any-uid are mutually exclusive.\n\
+                 Pass one or the other, not both."
+            ));
+        }
+        (true, true) => PeerAuthPolicy::InsecureAllowAny,
+        (false, false) => PeerAuthPolicy::Allowlist(args.allowed_uids.iter().copied().collect()),
+    };
+
+    if matches!(peer_auth, PeerAuthPolicy::InsecureAllowAny) {
+        tracing::warn!(
+            target: "agenticd::accept",
+            "running with --insecure-allow-any-uid; every socket connection is \
+             accepted regardless of peer UID. Production deployments MUST set \
+             --allowed-uid instead."
+        );
+    }
+
     let agentic_dir = args.repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
