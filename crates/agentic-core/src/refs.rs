@@ -108,31 +108,26 @@ impl Refs {
         Ok(Some(hash))
     }
 
-    /// List all branch names that have a ref file under `refs/heads/`.
-    /// Returns them in arbitrary order; callers that need determinism
-    /// should sort. Used by the startup ref-reconciler in
+    /// List all branch names under `refs/heads/`, recursively. Nested
+    /// names like `feature/foo` are reported with `/` separators
+    /// regardless of platform, so the result round-trips through
+    /// `read_branch` / `write_branch`. Returns names in arbitrary order;
+    /// callers that need determinism should sort. Used by the startup
+    /// ref-reconciler in
     /// `agenticd::lifecycle::reconcile_refs_on_startup` to find branch
     /// refs whose tip hash needs to be verified against the object store.
+    ///
+    /// The recursive form is required because `write_branch` calls
+    /// `create_dir_all(parent)` and writes nested branches to nested
+    /// directories. A flat listing would silently skip them. (Spotted by
+    /// Copilot review on PR #50.)
     pub fn list_branches(&self) -> Result<Vec<String>> {
-        let dir = self.agentic_dir.join("refs").join("heads");
-        if !dir.exists() {
+        let root = self.agentic_dir.join("refs").join("heads");
+        if !root.exists() {
             return Ok(Vec::new());
         }
         let mut branches = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            // `write_atomic` leaves `.tmp` files only mid-write; skip them
-            // in case we race a concurrent writer.
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".tmp") {
-                    continue;
-                }
-                branches.push(name.to_string());
-            }
-        }
+        collect_branch_files(&root, &root, &mut branches)?;
         Ok(branches)
     }
 
@@ -153,6 +148,38 @@ impl Refs {
         }
         self.read_branch(name)
     }
+}
+
+/// Walk `dir` (recursively) collecting branch names relative to `root`.
+/// Skips `.tmp` files left by `write_atomic` mid-write. Path separators
+/// in the returned names are always `/`, regardless of platform.
+fn collect_branch_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            collect_branch_files(root, &entry.path(), out)?;
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if name.ends_with(".tmp") {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(rel);
+    }
+    Ok(())
 }
 
 /// Atomic write via tmp-file plus `rename(2)`. The rename is atomic on POSIX
@@ -203,6 +230,43 @@ mod tests {
         let mut branches = refs.list_branches().unwrap();
         branches.sort();
         assert_eq!(branches, vec!["feature".to_string(), "main".to_string()]);
+    }
+
+    // Regression guard: write_branch supports nested names like
+    // `feature/foo` via create_dir_all(parent), so list_branches must
+    // recurse and report them with `/` separators on all platforms.
+    // (Copilot review on PR #50.)
+    #[test]
+    fn list_branches_recurses_into_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        refs.write_branch("main", &Hash::of(b"m")).unwrap();
+        refs.write_branch("feature/foo", &Hash::of(b"ff")).unwrap();
+        refs.write_branch("feature/bar", &Hash::of(b"fb")).unwrap();
+        refs.write_branch("releases/v1.0/rc", &Hash::of(b"rc"))
+            .unwrap();
+
+        let mut branches = refs.list_branches().unwrap();
+        branches.sort();
+        assert_eq!(
+            branches,
+            vec![
+                "feature/bar".to_string(),
+                "feature/foo".to_string(),
+                "main".to_string(),
+                "releases/v1.0/rc".to_string(),
+            ]
+        );
+
+        // The listed names must round-trip through read_branch.
+        assert_eq!(
+            refs.read_branch("feature/foo").unwrap(),
+            Some(Hash::of(b"ff"))
+        );
+        assert_eq!(
+            refs.read_branch("releases/v1.0/rc").unwrap(),
+            Some(Hash::of(b"rc"))
+        );
     }
 
     #[test]
