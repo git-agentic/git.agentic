@@ -258,6 +258,7 @@ pub async fn execute(
         transcript: None,
         evals: None,
         cost_cents: 0,
+        peer_uid: None,
     };
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)
         .context("forward-recording rollback commit")?;
@@ -333,6 +334,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             signatures: Vec::new(),
+            peer_uid: None,
         }
     }
 

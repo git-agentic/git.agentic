@@ -126,6 +126,14 @@ pub struct Commit {
     /// Platform + reviewer attestations chained over this commit.
     #[serde(default)]
     pub signatures: Vec<Attestation>,
+
+    // --- ADR-0012 attestation ---
+    /// UID of the OS process that opened the socket connection which
+    /// shaped this commit. `None` on commits shaped before ADR-0012's
+    /// implementation landed (pre-attestation history). Additive
+    /// `Option` per ADR-0002 D6.
+    #[serde(default)]
+    pub peer_uid: Option<u32>,
 }
 
 impl Commit {
@@ -213,5 +221,50 @@ mod tests {
         );
 
         assert_eq!(t1.hash(), t2.hash(), "BTreeMap must canonicalize order");
+    }
+
+    #[test]
+    fn commit_peer_uid_serde_roundtrip() {
+        use serde_json::{from_str, to_string};
+
+        // A Commit with peer_uid set: hash must change vs the same Commit
+        // without it, and the field must round-trip.
+        let mut c = Commit {
+            parent: None,
+            author: "alice@example.com".into(),
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            message: "test".into(),
+            code_sha: None,
+            prompts: None,
+            tools: None,
+            model: None,
+            memory_snapshot: None,
+            schema_version: None,
+            intent: None,
+            plan: None,
+            transcript: None,
+            evals: None,
+            cost_cents: 0,
+            signatures: Vec::new(),
+            peer_uid: Some(1000),
+        };
+        let json = to_string(&c).unwrap();
+        let back: Commit = from_str(&json).unwrap();
+        assert_eq!(back.peer_uid, Some(1000));
+
+        // Backwards compat: a Commit JSON missing the peer_uid field
+        // deserializes with peer_uid: None (#[serde(default)]).
+        let legacy_json = json.replace(r#","peer_uid":1000"#, "");
+        assert!(!legacy_json.contains("peer_uid"));
+        let legacy: Commit = from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.peer_uid, None);
+
+        // peer_uid: None and peer_uid: Some(_) hash differently — the field
+        // is part of the canonical bytes.
+        c.peer_uid = None;
+        let hash_none = Hash::of(&serde_json::to_vec(&c).unwrap());
+        c.peer_uid = Some(1000);
+        let hash_some = Hash::of(&serde_json::to_vec(&c).unwrap());
+        assert_ne!(hash_none, hash_some);
     }
 }

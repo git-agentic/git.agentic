@@ -194,6 +194,7 @@ fn assemble_inputs(
         transcript: None,
         evals: None,
         cost_cents: 0,
+        peer_uid: None,
     }
 }
 

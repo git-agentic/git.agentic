@@ -177,6 +177,7 @@ fn bench_commit(c: &mut Criterion) {
                     transcript: None,
                     evals: None,
                     cost_cents: 0,
+                    peer_uid: None,
                 };
                 (dir, store, refs, inputs)
             },
