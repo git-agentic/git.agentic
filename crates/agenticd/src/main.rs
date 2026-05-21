@@ -80,6 +80,13 @@ struct Args {
     /// this flag. Logged loudly at startup.
     #[arg(long)]
     insecure_allow_any_uid: bool,
+
+    /// Path to the secret-scanner allowlist (TOML). ADR-0013 D4.
+    /// Default: `<repo>/.agentic/scanner-allowlist.toml`. A missing
+    /// file is treated as an empty allowlist; only invalid TOML or
+    /// invalid blob_hash entries are fatal.
+    #[arg(long)]
+    scanner_allowlist: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -127,9 +134,32 @@ async fn main() -> anyhow::Result<()> {
 
     let tables = parse_tracked_tables(&args.tables)?;
     let mcp_servers = parse_mcp_spec(&args.mcp)?;
+
+    // ADR-0013: load the scanner allowlist at startup. The allowlist is
+    // NOT reloaded dynamically; operators bounce the daemon to pick up
+    // new exceptions. A missing file degrades to an empty allowlist so
+    // the common case (no exceptions on file) just works.
+    let allowlist_path = args
+        .scanner_allowlist
+        .clone()
+        .unwrap_or_else(|| agentic_dir.join("scanner-allowlist.toml"));
+    let allowlist = agentic_core::scanner::Allowlist::load_from_path(&allowlist_path)
+        .with_context(|| {
+            format!(
+                "loading scanner allowlist from {}",
+                allowlist_path.display()
+            )
+        })?;
+    tracing::info!(
+        target: "agenticd::scanner",
+        allowlist_entries = allowlist.len(),
+        path = %allowlist_path.display(),
+        "scanner allowlist loaded"
+    );
+
     let store = ObjectStoreSpec::parse(&args.object_store, &agentic_dir)
         .context("parsing --object-store")?
-        .open()
+        .open(allowlist)
         .context("opening object store")?;
     tracing::info!(spec = %args.object_store, "object store ready");
 

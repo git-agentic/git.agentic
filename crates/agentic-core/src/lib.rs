@@ -16,6 +16,8 @@ pub mod gcs_store;
 pub mod hash;
 pub mod object;
 pub mod refs;
+pub mod scanner;
+pub mod scanner_patterns;
 pub mod store;
 
 pub use diff::{diff as diff_commits, CommitDiff, HashChange, StringChange, TreeDiff};
@@ -45,6 +47,9 @@ pub enum Error {
 
     #[error("object integrity error: declared {declared}, computed {computed}")]
     IntegrityError { declared: Hash, computed: Hash },
+
+    #[error("blob rejected by secret scanner: {hits:?}")]
+    SecretDetected { hits: Vec<scanner::Hit> },
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

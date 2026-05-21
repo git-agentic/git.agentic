@@ -5,15 +5,18 @@
 //!   - First two hex chars of the BLAKE3 hash form the shard directory.
 //!   - Filename is the remaining 62 hex chars plus `.zst`.
 //!
-//! Week-1 implementation: blob put/get on a local directory. Week-2+ adds
-//! tree/commit support and ref management. The `ObjectStore` trait is the
-//! seam where remote (S3) backends will plug in later (v1.1).
+//! `FsObjectStore` is the local-filesystem implementation; `GcsObjectStore`
+//! (see `gcs.rs`) is the remote backend introduced for the sidecar
+//! `agenticd` topology (ADR-0004). The `ObjectStore` trait is the seam
+//! where additional backends (e.g. S3, network-replicated) will plug in.
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
+use crate::scanner::{Allowlist, Scanner};
 use crate::{Error, Result};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The store contract. MVP implementer is `FsObjectStore`; future
 /// implementers include S3, GCS, and a network-replicated store.
@@ -31,13 +34,26 @@ pub trait ObjectStore: Send + Sync {
 /// Local-filesystem object store. The MVP implementation.
 pub struct FsObjectStore {
     root: PathBuf,
+    scanner: Arc<Scanner>,
+    allowlist: Arc<Allowlist>,
 }
 
 impl FsObjectStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            scanner: Arc::new(Scanner::new()),
+            allowlist: Arc::new(Allowlist::empty()),
+        })
+    }
+
+    /// Replace the allowlist on this store. Builder-style so callers can
+    /// chain `FsObjectStore::open(root)?.with_allowlist(al)`.
+    pub fn with_allowlist(mut self, allowlist: Allowlist) -> Self {
+        self.allowlist = Arc::new(allowlist);
+        self
     }
 
     fn path_for(&self, hash: &Hash) -> PathBuf {
@@ -67,6 +83,22 @@ impl FsObjectStore {
 
 impl ObjectStore for FsObjectStore {
     fn put(&self, object: &Object) -> Result<Hash> {
+        // Scanner pre-hook (ADR-0013). Every user-controlled blob
+        // (prompts, tools, model, intent, plan, transcript, evals) is
+        // staged via `store.put(&Object::Blob(..))`, so the scanner
+        // must run here too — not only in `put_raw`. Trees and Commits
+        // contain hashes + metadata, not user data, so they are
+        // skipped.
+        if let Object::Blob(blob) = object {
+            let hits = self.scanner.scan(&blob.bytes);
+            if !hits.is_empty() {
+                let h = object.hash();
+                if !self.allowlist.contains(&h) {
+                    return Err(Error::SecretDetected { hits });
+                }
+            }
+        }
+
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let path = self.path_for(&hash);
@@ -77,6 +109,18 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn put_raw(&self, _kind: ObjectKind, bytes: &[u8]) -> Result<Hash> {
+        // Scanner pre-hook (ADR-0013). Reject blobs with high-precision
+        // pattern matches or high-entropy runs unless the blob's hash is
+        // in the configured allowlist. The reject happens BEFORE any
+        // bytes touch disk.
+        let hits = self.scanner.scan(bytes);
+        if !hits.is_empty() {
+            let h = Hash::of(bytes);
+            if !self.allowlist.contains(&h) {
+                return Err(Error::SecretDetected { hits });
+            }
+        }
+
         let hash = Hash::of(bytes);
         let path = self.path_for(&hash);
         if !path.exists() {
@@ -149,5 +193,116 @@ mod tests {
             Err(Error::NotFound(h2)) => assert_eq!(h, h2),
             _ => panic!("expected NotFound"),
         }
+    }
+
+    #[test]
+    fn put_raw_rejects_blob_with_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let blob = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld";
+        match store.put_raw(ObjectKind::Blob, blob) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected, got {other:?}"),
+        }
+        // Confirm no object was written.
+        let h = Hash::of(blob);
+        assert!(!store.has(&h));
+    }
+
+    #[test]
+    fn put_raw_allowlist_suppresses_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld";
+        let h = Hash::of(blob);
+        let toml_text = format!(
+            r#"
+            [[ignore]]
+            blob_hash = "{}"
+        "#,
+            h.to_hex()
+        );
+        let al = crate::scanner::Allowlist::from_toml(&toml_text).unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap().with_allowlist(al);
+        let hash = store
+            .put_raw(ObjectKind::Blob, blob)
+            .expect("allowlisted blob should put cleanly");
+        assert_eq!(hash, h);
+        assert!(store.has(&h));
+    }
+
+    #[test]
+    fn put_rejects_blob_object_with_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let bytes = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec();
+        let obj = Object::Blob(Blob::new(bytes.clone()));
+        match store.put(&obj) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected, got {other:?}"),
+        }
+        // Confirm no object was written.
+        let h = Hash::of(&bytes);
+        assert!(!store.has(&h));
+    }
+
+    #[test]
+    fn put_blob_allowlist_suppresses_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec();
+        let obj = Object::Blob(Blob::new(bytes.clone()));
+        let h = obj.hash();
+        let toml_text = format!(
+            r#"
+            [[ignore]]
+            blob_hash = "{}"
+        "#,
+            h.to_hex()
+        );
+        let al = crate::scanner::Allowlist::from_toml(&toml_text).unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap().with_allowlist(al);
+        let hash = store
+            .put(&obj)
+            .expect("allowlisted blob object should put cleanly");
+        assert_eq!(hash, h);
+        assert!(store.has(&h));
+    }
+
+    #[test]
+    fn put_raw_rejects_blob_with_high_entropy_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        // 30 base64-ish chars with high entropy — same shape as the
+        // entropy_detector_catches_high_entropy_run unit test in scanner.rs.
+        let blob = b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+        match store.put_raw(crate::ObjectKind::Blob, blob) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits
+                    .iter()
+                    .any(|h| h.kind == crate::scanner::HitKind::HighEntropy));
+            }
+            other => panic!("expected SecretDetected (HighEntropy), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn put_raw_clean_blob_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let blob = b"normal-looking content";
+        let h = store
+            .put_raw(ObjectKind::Blob, blob)
+            .expect("clean blob should put");
+        assert_eq!(h, Hash::of(blob));
+        assert!(store.has(&h));
     }
 }
