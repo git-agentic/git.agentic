@@ -200,9 +200,11 @@ async fn dispatch(state: Arc<DaemonState>, request: Request) -> anyhow::Result<R
             let h: agentic_core::Hash = hash
                 .parse()
                 .with_context(|| format!("invalid hash: {hash}"))?;
-            let object = state
-                .store
-                .get(&h)
+            // Wrap the (potentially slow under GCS) read in spawn_blocking
+            // so the LocalSet thread stays free to poll other connections'
+            // pings, logs, and diffs. Audit §A5 / B2 / C1 / R3.
+            let object = crate::store_async::get(Arc::clone(&state.store), h)
+                .await
                 .with_context(|| format!("reading object {hash}"))?;
             // Extract canonical bytes — the same bytes the hash commits to —
             // so callers can verify Hash::of(&data) == hash.
