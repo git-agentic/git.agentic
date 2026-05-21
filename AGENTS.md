@@ -97,21 +97,6 @@ What the demo requires:
 
 Performance targets (from [`snapshot-model.md`](docs/architecture/snapshot-model.md) §9): commit < 2s, rollback < 5s, diff < 1s, write overhead < 5ms p99, snapshot storage < 2× changed data amortized. These are commitments, not aspirations.
 
-## OpenWolf workflow
-
-This project uses OpenWolf for context management. The standing rules apply to every session:
-
-- Read [`.wolf/OPENWOLF.md`](.wolf/OPENWOLF.md) at session start.
-- Check [`.wolf/anatomy.md`](.wolf/anatomy.md) before reading project files (it's the token-cost map of the repo).
-- Check [`.wolf/cerebrum.md`](.wolf/cerebrum.md) Decision Log and Do-Not-Repeat list before generating code.
-- Before fixing any bug / error / failed test / failed build, read [`.wolf/buglog.json`](.wolf/buglog.json) for known fixes.
-- After writing or editing files, update `.wolf/anatomy.md` and append to `.wolf/memory.md`.
-- After fixing any bug, log it to `.wolf/buglog.json` with `error_message`, `root_cause`, `fix`, and `tags`.
-- After receiving a user correction, update `.wolf/cerebrum.md` immediately (Preferences, Learnings, or Do-Not-Repeat).
-- If you edit the same file more than twice in a session, that likely indicates a bug — log it to `.wolf/buglog.json`.
-
-@.wolf/OPENWOLF.md
-
 ## Canonical references
 
 When in doubt, these are authoritative:
