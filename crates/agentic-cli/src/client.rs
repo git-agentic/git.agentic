@@ -41,10 +41,7 @@ pub async fn round_trip(repo: &Path, request: Request) -> anyhow::Result<Respons
     let mut sock = UnixStream::connect(&path)
         .await
         .with_context(|| format!("connecting to daemon at {}", path.display()))?;
-    let envelope = Envelope {
-        correlation_id: new_correlation_id(),
-        payload: request,
-    };
+    let envelope = Envelope::new(new_correlation_id(), request);
     let (read_half, write_half) = sock.split();
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut writer = tokio::io::BufWriter::new(write_half);

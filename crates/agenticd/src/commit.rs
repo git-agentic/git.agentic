@@ -203,11 +203,11 @@ fn assemble_inputs(
     tools: BTreeMap<String, Vec<u8>>,
     peer_uid: Option<u32>,
 ) -> CommitInputs {
-    let prompts = input
-        .prompts
-        .into_iter()
-        .map(|(name, body)| (name, body.into_bytes()))
-        .collect();
+    // ADR-0010 Decision 3: `input.prompts` already arrives as
+    // `BTreeMap<String, Vec<u8>>` (base64-decoded by serde at the wire
+    // layer; v0 coexistence shim does the String→Vec<u8> translation
+    // before this assemble step). Forward verbatim.
+    let prompts = input.prompts;
     CommitInputs {
         author: input.author.unwrap_or_else(|| "unknown".to_string()),
         message: input.message,
@@ -299,7 +299,7 @@ mod tests {
 
     fn commit_input(message: &str) -> CommitInput {
         let mut prompts = std::collections::BTreeMap::new();
-        prompts.insert("system.md".to_string(), "you are helpful".to_string());
+        prompts.insert("system.md".to_string(), b"you are helpful".to_vec());
         CommitInput {
             message: message.to_string(),
             author: Some("tester".to_string()),
@@ -417,7 +417,7 @@ mod tests {
         let mut prompts = std::collections::BTreeMap::new();
         prompts.insert(
             "system.md".to_string(),
-            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE".to_string(),
+            b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE".to_vec(),
         );
         let input = CommitInput {
             message: "should be rejected".to_string(),
@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn assemble_inputs_folds_wire_input_into_core_inputs() {
         let mut prompts = std::collections::BTreeMap::new();
-        prompts.insert("system.md".to_string(), "you are helpful".to_string());
-        prompts.insert("user.md".to_string(), "do the thing".to_string());
+        prompts.insert("system.md".to_string(), b"you are helpful".to_vec());
+        prompts.insert("user.md".to_string(), b"do the thing".to_vec());
 
         let mut tools = BTreeMap::new();
         tools.insert("search".to_string(), b"{\"tools\":[]}".to_vec());
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn assemble_inputs_uses_explicit_author_when_supplied() {
         let mut prompts = std::collections::BTreeMap::new();
-        prompts.insert("system.md".to_string(), "x".to_string());
+        prompts.insert("system.md".to_string(), b"x".to_vec());
         let input = CommitInput {
             message: "hi".to_string(),
             author: Some("alice@example.com".to_string()),

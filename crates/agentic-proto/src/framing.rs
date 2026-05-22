@@ -54,6 +54,23 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    let Some(bytes) = read_frame_bytes(r).await? else {
+        return Ok(None);
+    };
+    let value = serde_json::from_slice(&bytes)?;
+    Ok(Some(value))
+}
+
+/// Read a single length-prefixed JSON frame and return its raw bytes
+/// without attempting to deserialise. Used by the daemon's ADR-0010
+/// v0/v1 coexistence shim: the daemon peeks at `protocol_version` in
+/// the JSON before choosing which `Request` shape to deserialise into.
+///
+/// Returns `Ok(None)` on a clean EOF before any bytes are read.
+pub async fn read_frame_bytes<R>(r: &mut R) -> Result<Option<Vec<u8>>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -66,8 +83,7 @@ where
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
-    let value = serde_json::from_slice(&buf)?;
-    Ok(Some(value))
+    Ok(Some(buf))
 }
 
 #[cfg(test)]
