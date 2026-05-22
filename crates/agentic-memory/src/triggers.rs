@@ -186,7 +186,7 @@ pub fn spawn_poller(
             // completes — ensuring no change-log row written during the
             // restore window reaches the streamer.
             let _permit = pause_lock_for_task.lock().await;
-            match drain_once(&pool, &streamer, &key_of, &bare_lookup).await {
+            match drain_once(&pool, &streamer, &key_of, &bare_lookup, DrainMode::Lenient).await {
                 Ok(DrainOutcome { processed: 0, .. }) => {}
                 Ok(DrainOutcome {
                     processed,
@@ -209,18 +209,21 @@ pub fn spawn_poller(
 /// each to the streamer. Used by `snapshot()` as a strict correctness
 /// fence: the streamer must see every committed change before sealing.
 ///
-/// Strict semantics — if `drain_once` skipped any rows (decode failure,
-/// unknown op, untracked table), this function returns `Err` rather
-/// than `Ok`. The skip path is correct for the poller (loud log + don't
-/// poison the loop), but it would produce a snapshot manifest that
-/// doesn't reflect actual DB state — the user's row is still in the
-/// table, but our streamer never saw it. Refusing to snapshot in that
-/// case is the only honest contract.
+/// Strict semantics — runs every batch under [`DrainMode::Strict`]: a
+/// per-batch *pre-validation pass* checks each row's decode + op +
+/// tracked-table resolution before any side effect. If validation
+/// fails on any row, the function returns `Err` *without* forwarding
+/// any of that batch's rows to the streamer and *without* deleting
+/// any rows from `agentic_change_log`. The offending row stays in the
+/// log so a retry sees the same problem (until the operator fixes the
+/// invariant). The poller's skip-and-delete mode would have made the
+/// row vanish after one error, leaving a permanently-missed event
+/// even though the user's row is still in their table.
 ///
 /// Operator recovery from a skip-blocked snapshot: inspect the
-/// surrounding warn!/error! logs to identify the offending row(s),
-/// fix the underlying invariant (restore CHECK constraint, add
-/// missing TrackedTable, etc.), retry the snapshot.
+/// surrounding error! logs to identify the offending row(s), fix the
+/// underlying invariant (restore CHECK constraint, add missing
+/// TrackedTable, etc.), retry the snapshot.
 pub async fn drain_to_completion(
     pool: &PgPool,
     streamer: &StreamerHandle,
@@ -235,34 +238,40 @@ pub async fn drain_to_completion(
         .map(|t| (bare_name(&t.name), t.name.clone()))
         .collect();
     let mut total_forwarded: u64 = 0;
-    let mut total_skipped: u64 = 0;
     loop {
         let DrainOutcome {
             processed,
             forwarded,
-        } = drain_once(pool, streamer, &key_of, &bare_lookup).await?;
+        } = drain_once(pool, streamer, &key_of, &bare_lookup, DrainMode::Strict).await?;
         if processed == 0 {
             break;
         }
         total_forwarded += forwarded;
-        total_skipped += processed - forwarded;
-    }
-    if total_skipped > 0 {
-        return Err(Error::Backend(format!(
-            "drain (snapshot fence): {total_skipped} change_log row(s) could not be forwarded \
-             to the streamer; a snapshot taken now would silently miss those changes. \
-             See the error!/warn! logs above to identify the offending rows; fix the \
-             underlying invariant (CHECK constraint, TrackedTable config, etc.) and retry."
-        )));
     }
     Ok(total_forwarded)
 }
 
+/// How `drain_once` reacts to row-level bad data.
+///
+/// - `Lenient` is the poller's mode: log + skip + DELETE the bad row
+///   so the loop doesn't poison-pill itself at 100 ms ticks. The
+///   trade-off is that skipped rows are permanently dropped from the
+///   change log.
+/// - `Strict` is the snapshot fence's mode: pre-validate every row
+///   in the batch before any forward or DELETE. On the first
+///   skip-worthy row, return `Err` with no side effects; the row
+///   stays in the log for the operator to address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainMode {
+    Lenient,
+    Strict,
+}
+
 /// Per-batch drain result. `processed` counts every row removed from
-/// `agentic_change_log` (forwarded + skipped); `forwarded` counts only
-/// the rows actually sent to the streamer as `ChangeEvent`s. The
-/// snapshot fence treats `processed - forwarded > 0` as an error;
-/// the poller treats it as a logged-and-recovered condition.
+/// `agentic_change_log` (forwarded + skipped in `Lenient` mode; equal
+/// to `forwarded` in `Strict` mode because skips abort the batch).
+/// `forwarded` counts only the rows actually sent to the streamer as
+/// `ChangeEvent`s.
 struct DrainOutcome {
     processed: u64,
     forwarded: u64,
@@ -273,6 +282,7 @@ async fn drain_once(
     streamer: &StreamerHandle,
     key_of: &std::collections::BTreeMap<String, String>,
     bare_lookup: &std::collections::BTreeMap<String, String>,
+    mode: DrainMode,
 ) -> Result<DrainOutcome> {
     let rows = sqlx::query(
         "SELECT id, table_name, op, row \
@@ -307,15 +317,61 @@ async fn drain_once(
             ))
         })?;
 
-    // Within the per-row loop, ROW-level bad data (decode failure,
-    // unknown op, untracked table) is logged loudly and the row is
-    // SKIPPED — `max_id` still advances past it so the bulk DELETE
-    // at the end cleans it up. Returning Err from inside this loop
-    // would (a) leave already-forwarded rows in change_log so the
-    // next tick re-fetches them (duplicate events, segment bloat),
-    // and (b) make the offending row a permanent poison pill
-    // because cleanup never runs. Systemic errors above this loop
-    // (the schema_version fetch, the initial query) still propagate.
+    // In `Strict` mode, walk every row in the batch FIRST and refuse
+    // to proceed if any would skip. No streamer send_event, no DELETE
+    // — pure inspection. This is the snapshot fence's contract: if
+    // we can't forward every change to the streamer, don't seal a
+    // snapshot that's missing them, AND don't delete the offending
+    // rows so the operator can fix the invariant and retry.
+    if mode == DrainMode::Strict {
+        for row in &rows {
+            let id: i64 = row.try_get("id")?;
+            let table_name: String = row.try_get("table_name").map_err(|e| {
+                Error::Backend(format!(
+                    "drain (strict): change_log id={id} table_name failed to decode: {e}"
+                ))
+            })?;
+            let op_str: String = row.try_get("op").map_err(|e| {
+                Error::Backend(format!(
+                    "drain (strict): change_log id={id} table={table_name:?} op failed to decode: {e}"
+                ))
+            })?;
+            if row.try_get::<sqlx::types::JsonValue, _>("row").is_err() {
+                return Err(Error::Backend(format!(
+                    "drain (strict): change_log id={id} table={table_name:?} `row` JSONB failed to decode; \
+                     refusing snapshot fence (row preserved in log for retry)"
+                )));
+            }
+            if key_of
+                .get(&table_name)
+                .or_else(|| bare_lookup.get(&bare_name(&table_name)))
+                .is_none()
+            {
+                return Err(Error::Backend(format!(
+                    "drain (strict): change_log id={id} references untracked table {table_name:?}; \
+                     either add it to TrackedTable config or remove its capture trigger, then retry"
+                )));
+            }
+            if !matches!(op_str.as_str(), "insert" | "update" | "delete") {
+                return Err(Error::Backend(format!(
+                    "drain (strict): change_log id={id} table={table_name:?} has unknown op {op_str:?}; \
+                     CHECK constraint may have been dropped or capture trigger rewritten"
+                )));
+            }
+        }
+    }
+
+    // Within the per-row loop (lenient mode, or strict-after-validation),
+    // ROW-level bad data (decode failure, unknown op, untracked table)
+    // is logged loudly and the row is SKIPPED — `max_id` still advances
+    // past it so the bulk DELETE at the end cleans it up. Returning Err
+    // from inside this loop would (a) leave already-forwarded rows in
+    // change_log so the next tick re-fetches them (duplicate events,
+    // segment bloat), and (b) make the offending row a permanent poison
+    // pill because cleanup never runs. Systemic errors above this loop
+    // (the schema_version fetch, the initial query) still propagate. In
+    // strict mode the pre-validation pass above guarantees no row will
+    // skip here.
     let mut max_id: i64 = 0;
     let mut processed: u64 = 0;
     let mut forwarded: u64 = 0;

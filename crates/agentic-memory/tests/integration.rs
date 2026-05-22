@@ -1080,3 +1080,104 @@ async fn restore_rejects_delete_envelope_with_absent_pk() {
 
     drop_schema(&admin_pool, &schema).await;
 }
+
+/// The snapshot fence's strict drain mode must (a) refuse to snapshot
+/// when a change_log row can't be forwarded to the streamer, AND
+/// (b) NOT delete the offending row — so a retry sees it, blocks
+/// again, and the operator can fix the underlying invariant. The
+/// previous round-4 fix returned `Err` but had already deleted the
+/// row, making the retry succeed with a silently-incomplete snapshot.
+#[tokio::test]
+#[ignore]
+async fn snapshot_strict_drain_preserves_bad_row_on_block() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    // Use a long poll interval so the background poller doesn't drain
+    // the bad row out from under us before we call snapshot().
+    let mut cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    cfg.poll_interval = std::time::Duration::from_secs(600);
+    let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // The public.agentic_change_log table is shared across all
+    // schemas in this database. By the time we get here, prior
+    // tests have written + drained their own trigger events; the
+    // log may be empty or may have residue. To guarantee the only
+    // row drain_to_completion sees is the one we plant, clear it
+    // explicitly. This is the same TRUNCATE pattern restore uses
+    // for the same reason.
+    admin_pool
+        .execute("TRUNCATE public.agentic_change_log")
+        .await
+        .unwrap();
+
+    // Inject a change_log row whose `table_name` references a table
+    // we DON'T have in TrackedTable config. This trips the strict
+    // mode's untracked-table check.
+    admin_pool
+        .execute(
+            "INSERT INTO public.agentic_change_log (table_name, op, row) \
+             VALUES ('public.not_tracked', 'insert', '{\"id\": 99}'::jsonb)",
+        )
+        .await
+        .unwrap();
+    let pre_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM public.agentic_change_log WHERE table_name = 'public.not_tracked'",
+    )
+    .fetch_one(&admin_pool)
+    .await
+    .unwrap();
+    assert_eq!(pre_count.0, 1, "test fixture: planted row must be present");
+
+    // Snapshot must fail — strict drain refuses to proceed.
+    let err = adapter
+        .snapshot()
+        .await
+        .expect_err("snapshot must block on an untracked-table change_log row");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not_tracked") && msg.contains("untracked"),
+        "error must name the offending table and the cause; got: {msg}"
+    );
+
+    // Critically: the bad row must STILL be in change_log. The
+    // previous (broken) shape deleted it on the first call, making a
+    // retry see an empty log and succeed with a silently-incomplete
+    // snapshot.
+    let post_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM public.agentic_change_log WHERE table_name = 'public.not_tracked'",
+    )
+    .fetch_one(&admin_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        post_count.0, 1,
+        "strict drain must NOT delete the row that blocked the snapshot; \
+         operator needs it preserved for the retry-after-fix flow"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+    // Clean up the planted row so other tests in the suite aren't affected.
+    let _ = admin_pool
+        .execute("DELETE FROM public.agentic_change_log WHERE table_name = 'public.not_tracked'")
+        .await;
+}
