@@ -277,19 +277,30 @@ impl PostgresAdapter {
         // laptop. The running counter is *one re-serialise per segment*
         // plus a per-row envelope-size add.
         //
-        // Accuracy: the segment's encoded size has three moving parts —
-        // `pk_lo` (set once, on the first row), `pk_hi` (rewritten every
-        // row but its encoded length changes only when the value's text
-        // form does), `row_count` (the JSON integer grows by a digit at
-        // 10, 100, 1000, …), and the row envelopes themselves
-        // (incremented exactly). We rebaseline once *after* `pk_lo` is
-        // set on the first row so its bytes are caught; after that the
-        // header-field deltas (pk_hi reshape, row_count digit growth)
-        // are bounded by a few tens of bytes per segment — negligible
-        // against `segment_target_bytes` (default 64 MiB) and against
-        // the bound the seal check itself enforces. The counter is
-        // therefore correct to within ~tens of bytes per segment, never
-        // O(rows).
+        // Accuracy: the segment's encoded size has four moving parts —
+        // `pk_lo`/`pk_hi` (both set on the first row; pk_hi may also be
+        // rewritten every row but its encoded length only changes when
+        // the value's text form does), `row_count` (the JSON integer
+        // grows by a digit at 10, 100, 1000, …), and the row envelopes
+        // themselves (incremented exactly). We rebaseline once *after
+        // both `pk_lo` AND `pk_hi` are set on the first row* so the
+        // null → first-PK delta on both ends of the segment is caught;
+        // after that the header-field deltas (pk_hi reshape on later
+        // rows, row_count digit growth) are bounded by a few tens of
+        // bytes per segment — negligible against `segment_target_bytes`
+        // (default 64 MiB) and bounded by the seal check itself.
+        //
+        // Per-row envelope-bytes add includes `+ 1` for the JSON-array
+        // comma; the very first row of a segment doesn't actually have
+        // a leading comma (`[X]`, not `[,X]`), so the counter
+        // intentionally over-counts by 1 byte per segment. Safe
+        // direction: seals one byte early at worst, never late.
+        //
+        // Maintenance caveat: if `bootstrap_table` is ever extended to
+        // populate `embeddings` or `metadata` mid-segment, the running
+        // counter would silently under-count those fields. Rebaseline
+        // again at the change site, or grow this comment to call them
+        // out.
         let mut running_bytes: usize = current.canonical_size();
 
         for row in &rows {
@@ -340,9 +351,13 @@ impl PostgresAdapter {
             if running_bytes >= self.cfg.segment_target_bytes {
                 self.seal_segment(&mut current, schema_version, manifest)?;
                 have_lo = false;
-                // After seal_segment the segment is reset; recompute the
-                // baseline overhead for the fresh segment shape.
-                running_bytes = current.canonical_size();
+                // The `first_row_of_segment` branch above will overwrite
+                // `running_bytes` from `current.canonical_size()` on the
+                // very next iteration once it sets pk_lo + pk_hi, so any
+                // value we assign here is dead in practice. Leaving it
+                // unset would be load-bearing only if a `break` lands
+                // between the seal and the next row, which doesn't
+                // happen today; not worth a defensive reset.
             }
         }
 
