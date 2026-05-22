@@ -398,7 +398,9 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 **Tests landed:** AC3a/AC3b unit tests in `crates/agenticd/src/migrate.rs`; AC1 + AC3c integration tests + happy-path regression in `crates/agenticd/tests/reverse_migration.rs` (real Postgres, gated by `#[ignore]`); AC2 unit tests in `crates/agenticd/src/rollback.rs`. Full workspace `cargo test` + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check` green.
 
-<a name="a9"></a>**A9 — `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — unblocked 2026-05-22 (ADR-0005 Accepted). Implementation tracked on [#43](https://github.com/git-agentic/git.agentic/issues/43); still M-effort and labelled v1.1 (Rule-of-Three says wait for the second real backend before generalising the trait).
+<a name="a9"></a>**A9 — `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — **PARTIAL 2026-05-22** ([#43](https://github.com/git-agentic/git.agentic/issues/43)). Trait surface expanded with the read-side of rollback: `migrations_after`, `begin_restore`, `restore_with_guard`. `RestoreGuard` generalised to an opaque boxed-payload type so backends without trigger pollers return `RestoreGuard::noop()`. `InMemoryAdapter` test fixture (under `crates/agentic-memory/src/in_memory.rs`) implements the trait and rounds-trips `snapshot → restore` through the canonical `SegmentManifest` path — the Rule-of-Three signal for the read-side trait shape.
+
+Still pending under the same issue: lifting `apply_reverse_migrations` onto the trait, and retyping `DaemonState.memory` from `Arc<Mutex<PostgresAdapter>>` to `Arc<dyn MemoryAdapter>`. The reverse-migration method blocked on a sqlx 0.8 + `async_trait` + `Executor<'c>` HRTB incompatibility — `&mut PgConnection`'s per-borrow lifetime can't unify across the boxed-future elision. `PostgresAdapter::begin_reverse_tx` + `apply_down_migration_tx` stay as inherent methods until either sqlx exposes a friendlier shape, the trait moves to AFIT with `trait_variant`-style Send bounds, or a second real backend (Mem0 / Zep / Letta) lands to inform the right abstraction. The daemon-state retype waits behind that.
 
 <a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
@@ -442,7 +444,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | [#40](https://github.com/git-agentic/git.agentic/issues/40) **DONE** | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope | [#41](https://github.com/git-agentic/git.agentic/issues/41) **DONE** | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
-| A9 | Complete `MemoryAdapter` trait | [#43](https://github.com/git-agentic/git.agentic/issues/43) | `v1.1` | — |
+| A9 | Complete `MemoryAdapter` trait | [#43](https://github.com/git-agentic/git.agentic/issues/43) **PARTIAL** | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
 | A11 | `Diff` atomicity | [#45](https://github.com/git-agentic/git.agentic/issues/45) **DONE** | `v1.1` | — |
 
