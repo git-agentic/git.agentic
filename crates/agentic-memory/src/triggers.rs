@@ -242,13 +242,14 @@ async fn drain_once(
     if rows.is_empty() {
         return Ok(0);
     }
-    // A drain-time failure to fetch the live schema version
-    // (transient DB error, helper-function dropped, etc.) must not
-    // silently fall back to "0.0.0" — that would stamp every event in
-    // the batch with the baseline, surfacing later as a misleading
-    // SchemaMismatch at restore with no signal that the real cause
-    // was a drain-time connectivity blip. Propagate the error;
-    // drain_to_completion bubbles it to snapshot() via `?`.
+    // Any error here — function absent (helper not installed),
+    // transient DB failure, etc. — propagates instead of silently
+    // falling back to "0.0.0", which would stamp every event in the
+    // batch with the baseline and surface later as a misleading
+    // SchemaMismatch at restore. This is a systemic failure: bubble
+    // it to the caller (`drain_to_completion` propagates with `?` to
+    // `snapshot()`; the poller's loop logs and retries on the next
+    // tick).
     let schema_version: String = sqlx::query_scalar("SELECT agentic_schema_version()")
         .fetch_one(pool)
         .await
@@ -259,31 +260,50 @@ async fn drain_once(
             ))
         })?;
 
+    // Within the per-row loop, ROW-level bad data (decode failure,
+    // unknown op, untracked table) is logged loudly and the row is
+    // SKIPPED — `max_id` still advances past it so the bulk DELETE
+    // at the end cleans it up. Returning Err from inside this loop
+    // would (a) leave already-forwarded rows in change_log so the
+    // next tick re-fetches them (duplicate events, segment bloat),
+    // and (b) make the offending row a permanent poison pill
+    // because cleanup never runs. Systemic errors above this loop
+    // (the schema_version fetch, the initial query) still propagate.
     let mut max_id: i64 = 0;
-    let mut count: u64 = 0;
+    let mut processed: u64 = 0;
+    let mut forwarded: u64 = 0;
     for row in &rows {
         let id: i64 = row.try_get("id")?;
         let table_name: String = row.try_get("table_name")?;
         let op_str: String = row.try_get("op")?;
-        // A JSONB decode failure on the change_log row payload
-        // (wire mismatch, malformed JSON, type mismatch) must not
-        // silently forward `Json::Null` to the streamer — that would
-        // anchor a segment on a null payload. Propagate.
-        let row_json: Json = row
-            .try_get::<sqlx::types::JsonValue, _>("row")
-            .map_err(|e| {
-                Error::Backend(format!(
-                    "drain: failed to decode `row` JSONB on change_log id={id}: {e}"
-                ))
-            })?;
 
-        // Map the trigger's `<schema>.<table>` form to whatever string
-        // the caller registered in `TrackedTable.name`. If neither
-        // form matches, the table was written to but isn't tracked —
-        // forwarding to the streamer would anchor a segment under a
-        // key no head exists for. Log + skip; the change_log row gets
-        // cleaned up by the bulk DELETE below since max_id still moves
-        // forward (untracked-table rows can't accumulate forever).
+        // JSONB decode failure on the change_log row payload — wire
+        // mismatch, malformed JSON, type mismatch. Was previously
+        // `.unwrap_or(Json::Null)` which silently forwarded a null
+        // row to the streamer (segment anchored on null). Now skip
+        // with a loud error log so the operator sees the problem
+        // without poisoning the poller.
+        let row_json: Json = match row.try_get::<sqlx::types::JsonValue, _>("row") {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    change_log_id = id,
+                    table = %table_name,
+                    error = %e,
+                    "drain: failed to decode `row` JSONB; skipping (row dropped from change_log)"
+                );
+                max_id = max_id.max(id);
+                processed += 1;
+                continue;
+            }
+        };
+
+        // Map the trigger's `<schema>.<table>` form to whatever the
+        // caller registered in `TrackedTable.name`. If neither form
+        // matches, the row was written by a non-tracked table that
+        // somehow has our capture trigger — forwarding it would
+        // anchor a segment under a key no head exists for. Skip with
+        // warn (this is a config gap, not tampering).
         let key = match key_of
             .get(&table_name)
             .cloned()
@@ -297,6 +317,7 @@ async fn drain_once(
                     "drain: change_log row references untracked table; skipping"
                 );
                 max_id = max_id.max(id);
+                processed += 1;
                 continue;
             }
         };
@@ -305,19 +326,27 @@ async fn drain_once(
             "insert" => Op::Insert,
             "update" => Op::Update,
             "delete" => Op::Delete,
-            // An op outside the CHECK-constrained set ("insert"/"update"/
-            // "delete") shouldn't be reachable — the change_log CHECK
-            // constraint rejects it. If we see one anyway something is
-            // wrong (constraint dropped, trigger function rewritten);
-            // surface it loudly rather than silently `continue`'ing
-            // (which would also delete the offending row when max_id
-            // advances past it).
+            // An op outside the CHECK-constrained set
+            // ("insert"/"update"/"delete") shouldn't be reachable —
+            // the change_log CHECK constraint rejects it. If we see
+            // one anyway it signals tampering (constraint dropped,
+            // trigger function rewritten). Log at `error!` level —
+            // louder than the untracked-table `warn!` because the
+            // root cause is invariant-breaking — then skip + advance
+            // max_id. Returning Err here would create a poison-pill
+            // loop in the poller.
             other => {
-                return Err(Error::Backend(format!(
-                    "drain: change_log id={id} table={table_name:?} has unknown op {other:?}; \
-                     the CHECK constraint on agentic_change_log.op may have been dropped \
-                     or the capture trigger rewritten"
-                )));
+                tracing::error!(
+                    change_log_id = id,
+                    table = %table_name,
+                    op = %other,
+                    "drain: change_log row has unknown op outside the CHECK constraint; \
+                     skipping. The CHECK on agentic_change_log.op may have been dropped \
+                     or the capture trigger rewritten."
+                );
+                max_id = max_id.max(id);
+                processed += 1;
+                continue;
             }
         };
         streamer
@@ -329,14 +358,32 @@ async fn drain_once(
             })
             .await?;
         max_id = max_id.max(id);
-        count += 1;
+        processed += 1;
+        forwarded += 1;
     }
 
+    // Bulk-delete everything we processed (forwarded OR skipped).
+    // `max_id` is the max id we saw in this batch — sqlx's ORDER BY
+    // ASC in the SELECT plus the per-row `max_id.max(id)` updates
+    // mean it's also the last id we saw. Any rows still in the log
+    // are strictly newer than max_id and will be picked up on the
+    // next tick.
     sqlx::query("DELETE FROM public.agentic_change_log WHERE id <= $1")
         .bind(max_id)
         .execute(pool)
         .await?;
-    Ok(count)
+    if forwarded != processed {
+        tracing::debug!(
+            forwarded,
+            skipped = processed - forwarded,
+            "drain batch: some rows were skipped (see warn/error logs above)"
+        );
+    }
+    // Return `processed`, not `forwarded`. `drain_to_completion`
+    // terminates on `n == 0` — if we returned `forwarded`, a batch
+    // of only-skipped rows would falsely terminate the drain even
+    // though more tracked rows are still in the log.
+    Ok(processed)
 }
 
 fn validate_identifier(s: &str) -> Result<()> {

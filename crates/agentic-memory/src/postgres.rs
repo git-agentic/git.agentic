@@ -439,13 +439,13 @@ impl PostgresAdapter {
     async fn current_schema_version_inner(&self) -> Result<String> {
         // `agentic_schema_version()` is a SQL function installed by
         // `install_helpers` that always returns exactly one row
-        // (COALESCE → `'0.0.0'` when no migrations are recorded), so
-        // zero rows here would mean the helper wasn't installed —
-        // a precondition violation, not a "no migrations applied"
-        // signal. `fetch_one` surfaces that loudly instead of
-        // silently falling back to `"0.0.0"` and tagging snapshots
-        // with the baseline (which would then pass the equality
-        // check at restore and skip reverse migrations).
+        // (COALESCE → `'0.0.0'` when no migrations are recorded).
+        // Any error here — function absent (helper not installed),
+        // transient DB failure, etc. — propagates instead of silently
+        // falling back to `"0.0.0"`. The previous `.unwrap_or_else(||
+        // "0.0.0".to_string())` would have tagged snapshots with the
+        // baseline on a missed call, then passed the equality check
+        // at restore and skipped reverse migrations.
         let (v,): (String,) = sqlx::query_as("SELECT agentic_schema_version()")
             .fetch_one(&self.pool)
             .await?;

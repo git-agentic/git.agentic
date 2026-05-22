@@ -974,6 +974,21 @@ async fn restore_rejects_delete_envelope_with_null_pk() {
         "error must name the NULL PK and refuse the no-op DELETE; got: {msg}"
     );
 
+    // Restore opens a transaction that TRUNCATEs then replays rows;
+    // when delete_row errors mid-replay the whole tx must roll back,
+    // leaving the user's original 5 baseline rows intact. Locks in
+    // the invariant that a refactor moving TRUNCATE outside the tx
+    // would break.
+    let count: (i64,) =
+        sqlx::query_as(format!("SELECT COUNT(*) FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, 5,
+        "failed restore must roll back TRUNCATE; original rows must survive"
+    );
+
     drop_schema(&admin_pool, &schema).await;
 }
 
@@ -1049,6 +1064,18 @@ async fn restore_rejects_delete_envelope_with_absent_pk() {
     assert!(
         msg.contains("PK column") && msg.contains("absent"),
         "error must name the absent PK column; got: {msg}"
+    );
+
+    // Failed restore must roll back TRUNCATE — same invariant as the
+    // NULL-PK sibling test.
+    let count: (i64,) =
+        sqlx::query_as(format!("SELECT COUNT(*) FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, 5,
+        "failed restore must roll back TRUNCATE; original rows must survive"
     );
 
     drop_schema(&admin_pool, &schema).await;
