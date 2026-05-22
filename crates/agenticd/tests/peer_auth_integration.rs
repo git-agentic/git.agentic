@@ -30,14 +30,7 @@ async fn ping(sock_path: &std::path::Path) -> anyhow::Result<()> {
     let (read, write) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut writer = tokio::io::BufWriter::new(write);
-    write_frame(
-        &mut writer,
-        &Envelope {
-            correlation_id: "t1".into(),
-            payload: Request::Ping,
-        },
-    )
-    .await?;
+    write_frame(&mut writer, &Envelope::new("t1", Request::Ping)).await?;
     let reply: Envelope<Response> = read_frame(&mut reader).await?.expect("response frame");
     assert!(matches!(reply.payload, Response::Pong));
     Ok(())
@@ -83,28 +76,48 @@ async fn non_allowlisted_uid_is_rejected() {
         let mut reader = tokio::io::BufReader::new(read);
         let mut writer = tokio::io::BufWriter::new(write);
         // Try to send a Ping; if write succeeds, expect read to hit EOF.
-        let _ = write_frame(
-            &mut writer,
-            &Envelope {
-                correlation_id: "rej".into(),
-                payload: Request::Ping,
-            },
-        )
-        .await;
+        let _ = write_frame(&mut writer, &Envelope::new("rej", Request::Ping)).await;
         // Read should fail or return None (EOF) because the daemon dropped
-        // the socket.
-        let res: Result<Option<Envelope<Response>>, _> = read_frame(&mut reader).await;
-        Ok::<_, anyhow::Error>(res)
+        // the socket. The test must distinguish three outcomes:
+        //   * `Ok(None)`        — clean EOF: daemon dropped, no response. PASS.
+        //   * `Err(FrameError::Io(_))` — transport reset/closed mid-read:
+        //                       still consistent with "daemon dropped us".
+        //                       Treat as `None` for the assertion below.
+        //   * `Err(FrameError::Json(_))` / `Err(FrameError::TooLarge(_))` —
+        //                       daemon DID send bytes, just malformed or
+        //                       oversized. That's a real regression in
+        //                       the rejection path; bubble it up as
+        //                       `Err` so the test fails loudly with the
+        //                       reason instead of green-passing.
+        let frame: Option<Envelope<Response>> = match read_frame(&mut reader).await {
+            Ok(opt) => opt,
+            Err(agentic_proto::framing::FrameError::Io(_)) => None,
+            Err(other) => {
+                // Preserve `other` as the anyhow error source so the
+                // outer `expect`'s "see error chain above" actually
+                // surfaces the FrameError detail (JSON location,
+                // oversize bytes) via `{:#}` rendering.
+                return Err(anyhow::Error::new(other).context(
+                    "daemon delivered a malformed frame to a non-allowlisted UID; \
+                     rejection path is broken",
+                ));
+            }
+        };
+        Ok::<_, anyhow::Error>(frame)
     })
     .await;
 
     child.kill().ok();
     let _ = child.wait();
 
-    let read_result =
-        result.expect("connection attempt timed out — daemon hung instead of dropping");
-    let frame =
-        read_result.expect("read_frame returned a transport error rather than a clean drop");
+    let frame = result
+        .expect("connection attempt timed out — daemon hung instead of dropping")
+        .expect(
+            "inner closure failed: either UnixStream::connect errored \
+             before the daemon dropped us, or read_frame returned a \
+             malformed-frame error (Json/TooLarge) indicating the \
+             rejection path is broken — see error chain above",
+        );
     assert!(
         frame.is_none(),
         "daemon responded to a non-allowlisted UID; rejection path is broken. Got: {frame:?}"
@@ -151,10 +164,7 @@ async fn insecure_mode_does_not_attest_commits() {
     let mut writer = tokio::io::BufWriter::new(write);
     write_frame(
         &mut writer,
-        &Envelope {
-            correlation_id: "c1".into(),
-            payload: Request::Commit(commit_input),
-        },
+        &Envelope::new("c1", Request::Commit(commit_input)),
     )
     .await
     .unwrap();
@@ -170,10 +180,7 @@ async fn insecure_mode_does_not_attest_commits() {
     // Read back the Commit object.
     write_frame(
         &mut writer,
-        &Envelope {
-            correlation_id: "r1".into(),
-            payload: Request::ReadObject { hash: commit_hash },
-        },
+        &Envelope::new("r1", Request::ReadObject { hash: commit_hash }),
     )
     .await
     .unwrap();
