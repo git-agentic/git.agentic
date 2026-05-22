@@ -214,9 +214,20 @@ async fn apply_segment_rows(
             .as_object()
             .ok_or_else(|| Error::Backend(format!("segment row is not a JSON object: {row}")))?;
         if obj.is_empty() {
-            // Empty row payload would produce a zero-column INSERT,
-            // which is invalid SQL anyway. Skip — matches what the
-            // single-row upsert path did via early-return.
+            // Empty row payload is op-dependent:
+            //   * Upsert: legitimately skipped — a zero-column INSERT is
+            //     invalid SQL anyway. Matches the old single-row
+            //     upsert_row early-return.
+            //   * Delete: a delete envelope with no PK column means we
+            //     can't issue the DELETE. The old single-row delete_row
+            //     errored loudly on missing PK; preserve that.
+            if matches!(op, Op::Delete) {
+                return Err(Error::Backend(format!(
+                    "delete envelope row is empty for {qualified}; PK column \
+                     {pk_col:?} is absent so we cannot issue the DELETE. \
+                     Refusing to no-op a delete."
+                )));
+            }
             continue;
         }
         entries.push((op, obj));
@@ -225,7 +236,15 @@ async fn apply_segment_rows(
         return Ok(());
     }
 
-    // Walk consecutive same-shape runs.
+    // Walk consecutive same-shape runs. Three break conditions for an
+    // upsert run: mode change, column-set change, batch cap. Plus a
+    // duplicate-PK check — packing two upserts with the same PK into
+    // one statement triggers Postgres SQLSTATE 21000 ("ON CONFLICT DO
+    // UPDATE command cannot affect row a second time"). When that
+    // would happen we flush early; the next batch starts with the
+    // dup, and its ON CONFLICT DO UPDATE overwrites the earlier
+    // landing — preserving the old per-row "last writer wins"
+    // semantics across the segment.
     let mut i = 0;
     while i < entries.len() {
         let (first_op, first_obj) = entries[i];
@@ -233,15 +252,32 @@ async fn apply_segment_rows(
         let first_cols: Vec<&str> = first_obj.keys().map(String::as_str).collect();
         // Cap by both row count AND param count. For upserts param
         // count == col_count * rows; for deletes it's just rows.
-        // The smaller cap controls.
+        // The smaller cap controls. `.max(1)` so a pathological wide
+        // schema (col_count > BATCH_MAX_PARAMS) doesn't produce
+        // cap==0 — degenerate one-row batches still make progress.
         let per_row_params = match first_mode {
             BatchMode::Upsert => first_cols.len(),
             BatchMode::Delete => 1,
         };
-        let cap = BATCH_MAX_ROWS.min(BATCH_MAX_PARAMS / per_row_params.max(1));
+        let cap = BATCH_MAX_ROWS
+            .min(BATCH_MAX_PARAMS / per_row_params.max(1))
+            .max(1);
+
+        // For upsert runs, track which PKs are already in this batch
+        // so we flush before a duplicate would trigger SQLSTATE 21000.
+        // `pk_signature` stringifies the PK value canonically so two
+        // equivalent JSON scalars (e.g. `1` and `1`) match. Init with
+        // the first row's PK.
+        let mut seen_pks: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(cap);
+        if first_mode == BatchMode::Upsert {
+            if let Some(pk) = first_obj.get(pk_col) {
+                seen_pks.insert(pk_signature(pk));
+            }
+        }
 
         // Find the run end: same mode, same column-set (for upserts),
-        // and within the cap.
+        // no PK duplicate (for upserts), and within the cap.
         let mut j = i + 1;
         while j < entries.len() && j - i < cap {
             let (next_op, next_obj) = entries[j];
@@ -249,15 +285,29 @@ async fn apply_segment_rows(
                 break;
             }
             if first_mode == BatchMode::Upsert {
-                // Column-sets must match. Cheap check first: equal length.
                 if next_obj.len() != first_cols.len() {
                     break;
                 }
-                // Same keys in same canonical (BTreeMap) order — since
-                // serde_json::Map preserves insertion order, compare
-                // the sorted column lists.
+                // `serde_json::Map` preserves insertion order, not
+                // sorted order. `same_column_set` is set-equality, not
+                // sequence-equality — two rows with the same columns
+                // in different orders still batch (uncommon in
+                // practice because the streamer emits a consistent
+                // shape per source row).
                 let next_cols: Vec<&str> = next_obj.keys().map(String::as_str).collect();
                 if !same_column_set(&first_cols, &next_cols) {
+                    break;
+                }
+                // Duplicate-PK check. `HashSet::insert` returns false
+                // if the value was already present, in which case
+                // packing this row into the same VALUES list would
+                // make Postgres reject the whole statement.
+                let next_pk = match next_obj.get(pk_col) {
+                    Some(v) => pk_signature(v),
+                    None => break, // missing PK → flush and let the
+                                   // upsert path error on this row
+                };
+                if !seen_pks.insert(next_pk) {
                     break;
                 }
             }
@@ -276,10 +326,23 @@ async fn apply_segment_rows(
     Ok(())
 }
 
-/// Max rows per batched SQL statement. 1000 is well under Postgres's
-/// query-length limit at typical schema widths and small enough that
-/// a partial failure (rare — restore is single-tx) doesn't waste a
-/// huge amount of work on rollback.
+/// Canonical text signature for a PK JSON value. Two values that
+/// would land in the same Postgres row use the same signature. Used
+/// only for in-process duplicate detection during batch planning;
+/// the actual SQL parameter still binds the original JSON value.
+fn pk_signature(v: &Json) -> String {
+    // `serde_json::to_string` for scalars is stable: `Number(1)` →
+    // `"1"`, `String("x")` → `"\"x\""`, `Null` → `"null"`. The output
+    // is a string-only key so HashSet hashing is cheap.
+    serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+}
+
+/// Max rows per batched SQL statement. The actual ceiling is
+/// Postgres's 65535-parameter limit per statement (see
+/// [`BATCH_MAX_PARAMS`]) — 1000 is a row count well under that ceiling
+/// even for moderately wide schemas, and small enough that a partial
+/// failure (rare — restore is single-tx) doesn't make rollback
+/// expensive.
 const BATCH_MAX_ROWS: usize = 1000;
 /// Postgres caps a single statement at 65535 parameters. Stay well
 /// under to leave headroom for any future helper columns / placeholders.
@@ -305,12 +368,17 @@ fn batch_mode_of(op: Op) -> BatchMode {
 /// Compare two column-name slices irrespective of order. `serde_json::Map`
 /// preserves insertion order, so we can't rely on identical iteration
 /// order across two row objects from different sources. Cheap because
-/// each segment's rows almost always share the same column-set, so the
-/// check is at most O(n²) per row-pair in the *very* unusual mixed case;
-/// the common case is identical iteration order and the loop short-circuits.
+/// column counts are small in practice (typically 2–20) — the O(k²)
+/// `contains` scan is bounded tightly enough that adding a HashSet
+/// indirection would cost more in allocation than it saves in
+/// comparison. A fast `a == b` equality check up-front handles the
+/// common case where the streamer emits identical iteration order.
 fn same_column_set(a: &[&str], b: &[&str]) -> bool {
     if a.len() != b.len() {
         return false;
+    }
+    if a == b {
+        return true; // identical iteration order — most common case
     }
     a.iter().all(|c| b.contains(c))
 }
@@ -404,6 +472,11 @@ async fn batch_delete(
     rows: &[(Op, &serde_json::Map<String, Json>)],
 ) -> Result<()> {
     debug_assert!(!rows.is_empty());
+    // Belt-and-suspenders identifier validation. `apply_segment_rows`
+    // already validated `pk_col` before this call, but the rest of
+    // this file validates at every SQL boundary too — keep the
+    // pattern consistent.
+    validate_identifier(pk_col)?;
     // Build the placeholder list `$1, $2, ..., $N` and bind PKs.
     let mut placeholders = String::new();
     let mut args = PgArguments::default();
@@ -555,6 +628,34 @@ mod tests {
     /// producer emits them — the streamer always writes both keys —
     /// so making it an error would just add code without a real
     /// failure mode to prevent.
+    #[test]
+    fn same_column_set_identity_fast_path() {
+        // Common case: streamer emits a consistent column order. The
+        // fast `a == b` check resolves without the O(k²) scan.
+        let a = ["id", "text", "embedding"];
+        assert!(same_column_set(&a, &a));
+    }
+
+    #[test]
+    fn same_column_set_handles_reordered_keys() {
+        assert!(same_column_set(&["id", "text"], &["text", "id"]));
+        assert!(!same_column_set(&["id", "text"], &["id", "score"]));
+        assert!(!same_column_set(&["id"], &["id", "text"]));
+    }
+
+    #[test]
+    fn pk_signature_distinguishes_distinct_scalars() {
+        // Used by the duplicate-PK detector in apply_segment_rows.
+        // Two distinct PK values must hash to distinct signatures.
+        assert_ne!(pk_signature(&json!(1)), pk_signature(&json!(2)));
+        assert_ne!(pk_signature(&json!("a")), pk_signature(&json!("b")));
+        // Same value → same signature (the dup-detection invariant).
+        assert_eq!(pk_signature(&json!(1)), pk_signature(&json!(1)));
+        assert_eq!(pk_signature(&json!("x")), pk_signature(&json!("x")));
+        // Number 1 and string "1" must NOT collide.
+        assert_ne!(pk_signature(&json!(1)), pk_signature(&json!("1")));
+    }
+
     #[test]
     fn peel_envelope_partial_envelope_falls_through_to_plain_row() {
         let partial = json!({"op": "delete"}); // no `row` key

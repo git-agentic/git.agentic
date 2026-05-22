@@ -9,11 +9,11 @@ This is a **measured early sanity-check** of where performance sits relative to 
 
 | Operation | Target (`snapshot-model` §9) | Measured | Notes |
 |---|---|---|---|
-| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **8.87 ms @ 100K rows** (laptop, post-fix) — linearly ~89 ms at 1M | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
+| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **5 ms @ 10K / 5.6 ms @ 100K / 18.81 ms @ 1M** (laptop) | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
 | `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** (Criterion) | ✓ no obvious blocker; not a §9 measurement |
-| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **102 ms @ 10K rows / 1.07 s @ 100K / 10.34 s @ 1M** (laptop, post-batched-INSERT) | ⚠ 1M still ~2× over §9 on this hardware shape, but linear and predictable. Multi-row INSERT closed the 12× gap from the per-row path; the next 10× hop is `COPY FROM STDIN` (tracked, v1.1). |
+| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **102 ms @ 10K / 1.07 s @ 100K / 10.34 s @ 1M** (laptop, post-batched-INSERT) | ⚠ 1M still ~2× over §9 on this hardware shape, but linear and predictable. Multi-row INSERT closed the 12× gap from the per-row path; the next 10× hop is `COPY FROM STDIN` (tracked, v1.1). |
 | `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in `run-demo.sh`; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
-| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **66 µs @ 10K rows** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target at the segment counts we measure. |
+| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **3 µs @ 10K / 4 µs @ 100K / 5 µs @ 1M** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target. |
 | `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
 | Per-blob write, **median** | < 5 ms per row (p99) | **2.7 ms median (512 KB)** / **0.83 ms median (1 KB)** | ⚠ Criterion reports median, not p99 — p99 needs `--save-baseline` raw-sample analysis (tracked) |
 | Snapshot storage amortized | < 2× changed data | _not yet measured_ | ⚠ pending segment-size sampling job |

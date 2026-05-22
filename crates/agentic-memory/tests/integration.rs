@@ -1259,3 +1259,262 @@ async fn schema_qualified_tracked_table_routes_events() {
 
     drop_schema(&admin_pool, &schema).await;
 }
+
+// ── Restore batching edge cases (PR #92 review follow-ups) ───────────────────
+
+/// Helper: construct a SegmentManifest pointing at one segment whose
+/// raw bytes contain the given envelopes. Used by the batching tests
+/// below to drive `restore` against hand-crafted shapes.
+fn write_single_segment(
+    store: &Arc<FsObjectStore>,
+    table: &str,
+    schema_version: &str,
+    envelopes: Vec<serde_json::Value>,
+) -> agentic_memory::segment::SegmentManifest {
+    use agentic_core::{ObjectKind, ObjectStore as _};
+    use agentic_memory::segment::{Segment, SegmentManifest, SegmentRef};
+
+    let row_count = envelopes.len() as u64;
+    let seg = Segment {
+        table: table.into(),
+        schema_version: schema_version.into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        row_count,
+        rows: envelopes,
+        embeddings: Vec::new(),
+        metadata: Default::default(),
+    };
+    let bytes = seg.to_canonical_bytes();
+    let seg_hash = store.put_raw(ObjectKind::Segment, &bytes).unwrap();
+    let mut manifest = SegmentManifest::new(schema_version.to_string());
+    manifest.push(SegmentRef {
+        table: table.into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        segment: seg_hash,
+        row_count,
+    });
+    manifest
+}
+
+/// Two upserts with the same PK in one same-shape run used to pack
+/// into a single `INSERT … VALUES (...,A), (...,B) ON CONFLICT` —
+/// which Postgres rejects with SQLSTATE 21000 (`ON CONFLICT DO UPDATE
+/// command cannot affect row a second time`). The batching planner
+/// now flushes on the second occurrence so each lands in its own
+/// statement; ON CONFLICT DO UPDATE on the second statement
+/// overwrites the first row's data, preserving "last writer wins".
+#[tokio::test]
+#[ignore]
+async fn restore_handles_duplicate_pk_within_a_batch() {
+    use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // Segment with two updates to id=42: text="first" then text="last".
+    // Both are upserts of the same column-set, so the pre-fix planner
+    // would have packed them into one INSERT … VALUES (42,'first'), (42,'last')
+    // ON CONFLICT DO UPDATE — which Postgres rejects.
+    let manifest = write_single_segment(
+        &store,
+        "episodes",
+        "0.0.0",
+        vec![
+            serde_json::json!({"op": "insert", "row": {"id": 42, "text": "first"}}),
+            serde_json::json!({"op": "update", "row": {"id": 42, "text": "last"}}),
+        ],
+    );
+    let handle = SnapshotHandle {
+        manifest,
+        schema_version: "0.0.0".to_string(),
+    };
+
+    adapter
+        .restore(&handle)
+        .await
+        .expect("restore must handle duplicate PK in same shape run by flushing between");
+
+    // Verify last-writer-wins: id=42 must have text="last", and there
+    // should be no other row.
+    let row: (i64, String) =
+        sqlx::query_as(format!("SELECT id, text FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 42);
+    assert_eq!(
+        row.1, "last",
+        "duplicate-PK restore must preserve last-writer-wins via separate statements; \
+         got {:?}",
+        row.1
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
+
+/// An empty delete envelope (`{"op": "delete", "row": {}}`) has no PK
+/// to issue the DELETE with. The old single-row `delete_row` errored
+/// loudly; the batched path must preserve that loud failure rather
+/// than silently no-op.
+#[tokio::test]
+#[ignore]
+async fn restore_rejects_empty_delete_envelope() {
+    use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    let manifest = write_single_segment(
+        &store,
+        "episodes",
+        "0.0.0",
+        vec![serde_json::json!({"op": "delete", "row": {}})],
+    );
+    let handle = SnapshotHandle {
+        manifest,
+        schema_version: "0.0.0".to_string(),
+    };
+
+    let err = adapter
+        .restore(&handle)
+        .await
+        .expect_err("restore must reject an empty delete envelope");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("delete envelope") && msg.contains("empty"),
+        "error must name the empty-delete failure mode; got: {msg}"
+    );
+
+    // Failed restore must roll back the TRUNCATE — original 5 rows survive.
+    let count: (i64,) =
+        sqlx::query_as(format!("SELECT COUNT(*) FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, 5,
+        "failed restore must roll back TRUNCATE; original rows must survive"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
+
+/// Mode transitions mid-segment must flush. A sequence of
+/// `Insert(id=1) Delete(id=1) Insert(id=1)` must apply as three
+/// separate statements (the batching planner can't combine across
+/// mode boundaries), and the final state must be the last Insert's
+/// values.
+#[tokio::test]
+#[ignore]
+async fn restore_preserves_order_across_mode_transitions() {
+    use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // Insert id=7 v="first" → Delete id=7 → Insert id=7 v="final".
+    // If mode transitions weren't flushed correctly, the final state
+    // would be wrong (e.g. row missing because Delete ran after the
+    // second Insert).
+    let manifest = write_single_segment(
+        &store,
+        "episodes",
+        "0.0.0",
+        vec![
+            serde_json::json!({"op": "insert", "row": {"id": 7, "text": "first"}}),
+            serde_json::json!({"op": "delete", "row": {"id": 7}}),
+            serde_json::json!({"op": "insert", "row": {"id": 7, "text": "final"}}),
+        ],
+    );
+    let handle = SnapshotHandle {
+        manifest,
+        schema_version: "0.0.0".to_string(),
+    };
+
+    adapter
+        .restore(&handle)
+        .await
+        .expect("restore must succeed across Insert→Delete→Insert sequence");
+
+    let row: (i64, String) =
+        sqlx::query_as(format!("SELECT id, text FROM \"{schema}\".episodes").as_str())
+            .fetch_one(&admin_pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, 7);
+    assert_eq!(
+        row.1, "final",
+        "Insert→Delete→Insert must apply in order; final state is the last Insert. Got: {:?}",
+        row.1
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
