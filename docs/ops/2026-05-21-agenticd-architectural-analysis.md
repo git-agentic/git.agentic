@@ -402,7 +402,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 <a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
-<a name="a11"></a>**A11 — Diff atomicity** ([C6](#c6)) — unblocked 2026-05-22 (ADR-0007 Accepted). Implementation tracked on [#45](https://github.com/git-agentic/git.agentic/issues/45).
+<a name="a11"></a>**A11 — Diff atomicity** ([C6](#c6)) — **DONE 2026-05-22** ([#45](https://github.com/git-agentic/git.agentic/issues/45), pulled forward from v1.1). New `Refs::snapshot()` returns a `RefsSnapshot` that freezes HEAD + every branch ref at construction time; the diff dispatch arm takes the snapshot under `commit_lock`, then drops the lock and resolves both endpoints from the frozen map. Concurrent commit during diff can't mix one branch's pre-commit state with another's post-commit state.
 
 <a name="a12"></a>**A12 — Intentionally not addressed:** [C7](#c7), [C11](#c11), [C12](#c12), [C13](#c13) (correct/benign per analyst); [B12](#b12) (idempotent GCS uploads — performance only, YAGNI); [B15](#b15) (per-snapshot PgConnection — tactical patch inside `PostgresAdapter`, no architectural change); [C4](#c4), [C5](#c5) (correct under current single-writer assumption; revisit when goals change).
 
@@ -444,6 +444,6 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
-| A11 | `Diff` atomicity (unblocked 2026-05-22 — ADR-0007 Accepted) | [#45](https://github.com/git-agentic/git.agentic/issues/45) | `v1.1` | — |
+| A11 | `Diff` atomicity | [#45](https://github.com/git-agentic/git.agentic/issues/45) **DONE** | `v1.1` | — |
 
 This doc will be updated with the issue numbers once they are created.
