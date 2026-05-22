@@ -93,9 +93,13 @@ async fn non_allowlisted_uid_is_rejected() {
             Ok(opt) => opt,
             Err(agentic_proto::framing::FrameError::Io(_)) => None,
             Err(other) => {
-                return Err(anyhow::anyhow!(
+                // Preserve `other` as the anyhow error source so the
+                // outer `expect`'s "see error chain above" actually
+                // surfaces the FrameError detail (JSON location,
+                // oversize bytes) via `{:#}` rendering.
+                return Err(anyhow::Error::new(other).context(
                     "daemon delivered a malformed frame to a non-allowlisted UID; \
-                     rejection path is broken: {other}"
+                     rejection path is broken",
                 ));
             }
         };
