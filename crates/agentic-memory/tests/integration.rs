@@ -1181,3 +1181,81 @@ async fn snapshot_strict_drain_preserves_bad_row_on_block() {
         .execute("DELETE FROM public.agentic_change_log WHERE table_name = 'public.not_tracked'")
         .await;
 }
+
+/// A schema-qualified `TrackedTable.name` (e.g. `"public.episodes"`)
+/// must route trigger-captured events to the streamer head correctly.
+///
+/// The previous resolver shape stored bare names as VALUES in the
+/// exact-match map, so a configured `"public.episodes"` paired with
+/// a trigger emission of the same string returned the bare
+/// `"episodes"` — which didn't match the streamer's head keyed by
+/// `"public.episodes"`. Events got silently dropped by the streamer
+/// while strict pre-validation passed (the lookup found something,
+/// just the wrong value).
+///
+/// This test creates a public-schema table, configures the adapter
+/// with the schema-qualified name, writes a row, takes a snapshot,
+/// and asserts the row landed in the manifest. If the resolver bug
+/// returns it would silently produce an empty manifest.
+#[tokio::test]
+#[ignore]
+async fn schema_qualified_tracked_table_routes_events() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+    // Clear any prior-test residue so the snapshot's strict drain
+    // sees only the rows this test produced.
+    admin_pool
+        .execute("TRUNCATE public.agentic_change_log")
+        .await
+        .unwrap();
+
+    // Configure with the SCHEMA-QUALIFIED form — the path that was
+    // broken before the resolver fix.
+    let qualified = format!("{schema}.episodes");
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: qualified.clone(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
+    adapter.init().await.unwrap();
+
+    let handle = adapter
+        .snapshot()
+        .await
+        .expect("snapshot must succeed with a schema-qualified TrackedTable");
+    let total: u64 = handle.manifest.entries.iter().map(|e| e.row_count).sum();
+    assert_eq!(
+        total, 5,
+        "schema-qualified config must route the 5 baseline rows; pre-fix this returned 0"
+    );
+    // The manifest's table-name string must be the configured form,
+    // not the bare form — downstream rollback selects by exact
+    // string compare.
+    assert!(
+        handle.manifest.entries.iter().all(|e| e.table == qualified),
+        "manifest entries must carry the configured table key; got: {:?}",
+        handle
+            .manifest
+            .entries
+            .iter()
+            .map(|e| &e.table)
+            .collect::<Vec<_>>()
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}

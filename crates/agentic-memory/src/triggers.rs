@@ -157,17 +157,16 @@ pub fn spawn_poller(
     interval: Duration,
     tables: Vec<TrackedTable>,
 ) -> PollerHandle {
-    // Trigger captures `schema.table`; the streamer was configured with
-    // whatever string the caller put in PgConfig.tables. Map both ways
-    // so events route correctly regardless of which form is in play.
-    let key_of: std::collections::BTreeMap<String, String> = tables
-        .iter()
-        .map(|t| (t.name.clone(), bare_name(&t.name)))
-        .collect();
-    let bare_lookup: std::collections::BTreeMap<String, String> = tables
-        .iter()
-        .map(|t| (bare_name(&t.name), t.name.clone()))
-        .collect();
+    // Trigger captures `schema.table`; the streamer was configured
+    // with whatever string the caller put in `PgConfig.tables`. Both
+    // forms must resolve to the SAME canonical key — the configured
+    // `TrackedTable.name`, which is what `streamer_loop` uses as the
+    // `heads` map key. The previous shape had `key_of`'s VALUE be the
+    // bare name and `bare_lookup`'s VALUE be the configured name; an
+    // exact-match hit on a schema-qualified config returned the bare
+    // name, missed the streamer's head, and dropped the event with
+    // no signal — that bug is now closed.
+    let (key_of, bare_lookup) = build_table_resolvers(&tables);
 
     let pause_lock = Arc::new(tokio::sync::Mutex::new(()));
     let pause_lock_for_task = pause_lock.clone();
@@ -229,14 +228,7 @@ pub async fn drain_to_completion(
     streamer: &StreamerHandle,
     tables: &[TrackedTable],
 ) -> Result<u64> {
-    let key_of: std::collections::BTreeMap<String, String> = tables
-        .iter()
-        .map(|t| (t.name.clone(), bare_name(&t.name)))
-        .collect();
-    let bare_lookup: std::collections::BTreeMap<String, String> = tables
-        .iter()
-        .map(|t| (bare_name(&t.name), t.name.clone()))
-        .collect();
+    let (key_of, bare_lookup) = build_table_resolvers(tables);
     let mut total_forwarded: u64 = 0;
     loop {
         let DrainOutcome {
@@ -336,10 +328,10 @@ async fn drain_once(
                     "drain (strict): change_log id={id} table={table_name:?} op failed to decode: {e}"
                 ))
             })?;
-            if row.try_get::<sqlx::types::JsonValue, _>("row").is_err() {
+            if let Err(e) = row.try_get::<sqlx::types::JsonValue, _>("row") {
                 return Err(Error::Backend(format!(
-                    "drain (strict): change_log id={id} table={table_name:?} `row` JSONB failed to decode; \
-                     refusing snapshot fence (row preserved in log for retry)"
+                    "drain (strict): change_log id={id} table={table_name:?} `row` JSONB failed \
+                     to decode: {e}; refusing snapshot fence (row preserved in log for retry)"
                 )));
             }
             if key_of
@@ -562,6 +554,32 @@ fn bare_name(s: &str) -> String {
     s.rsplit_once('.')
         .map(|(_, n)| n.to_string())
         .unwrap_or_else(|| s.to_string())
+}
+
+/// Build the two lookup maps the drain loop uses to resolve a
+/// trigger-emitted `table_name` to the streamer's head key.
+///
+/// Both maps now hold the **configured** `TrackedTable.name` as the
+/// VALUE — the streamer keys its `heads` map by that string, so the
+/// resolved key must match it exactly. `key_of` handles the
+/// exact-match case (configured form == what the trigger emitted);
+/// `bare_lookup` handles the cross-form case (configured `"episodes"`
+/// vs trigger `"public.episodes"` and vice versa).
+fn build_table_resolvers(
+    tables: &[TrackedTable],
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let key_of: std::collections::BTreeMap<String, String> = tables
+        .iter()
+        .map(|t| (t.name.clone(), t.name.clone()))
+        .collect();
+    let bare_lookup: std::collections::BTreeMap<String, String> = tables
+        .iter()
+        .map(|t| (bare_name(&t.name), t.name.clone()))
+        .collect();
+    (key_of, bare_lookup)
 }
 
 #[cfg(test)]
