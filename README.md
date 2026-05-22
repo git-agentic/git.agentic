@@ -35,7 +35,7 @@ We build it.
 
 Explicitly **not** in MVP scope: web UI, hosted SaaS, eval/CI/AE pipelines, MCP registry hosting, sandbox execution, A2A routing, more than one memory backend, more than one framework. See [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) §9–§10 for why.
 
-## The demo (target week 11)
+## The demo
 
 ```bash
 # baseline: agent works
@@ -112,7 +112,7 @@ pip install -e ".[langgraph,dev]"
 pytest
 ```
 
-A `docker-compose.yml` lands in week 11 to bring up Postgres + agenticd + the demo agent in one command.
+A `docker-compose.yml` under [`examples/langgraph-rollback/`](examples/langgraph-rollback/) brings up Postgres + `agenticd` + the demo agent in one command; [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) drives the broken-prompt scenario end-to-end.
 
 ## Design partners
 
