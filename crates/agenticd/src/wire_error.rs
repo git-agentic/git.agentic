@@ -34,8 +34,7 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
     // classify. `agentic_memory::Error` is checked first because it
     // wraps `agentic_core::Error` and `sqlx::Error` — so we look at
     // the most-specific layer before falling through. Raw sqlx errors
-    // are classified inside `classify_memory_error`'s `Sqlx` arm; we
-    // don't carry a direct `sqlx::Error` runtime dependency here.
+    // are classified inside `classify_memory_error`'s `Sqlx` arm.
     if let Some(mem) = err.chain().find_map(|e| e.downcast_ref::<MemoryError>()) {
         let (class, code, retryable) = classify_memory_error(mem);
         return Response::error(class, code, message, retryable);
@@ -90,7 +89,29 @@ fn classify_core_error(err: &CoreError) -> (ErrorClass, &'static str, bool) {
 
 fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) {
     match err {
-        MemoryError::Backend(_) => (ErrorClass::Memory, "backend_failure", true),
+        // TODO: `MemoryError::Backend(String)` mixes transient failures
+        // (connection dropped mid-snapshot, lock waiter timeout) with
+        // permanent configuration bugs ("empty identifier", "snapshot
+        // called before init"). The right fix is upstream — split the
+        // variant in `agentic-memory::Error`. Until then we sniff the
+        // string for the known-permanent shapes and downgrade those to
+        // non-retryable; the default remains retryable so transient
+        // outages still get the retry loop they need. Tracked separately
+        // as a v1.1 cleanup.
+        MemoryError::Backend(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            let is_permanent_config_bug = lower.contains("empty identifier")
+                || lower.contains("called before init")
+                || lower.contains("not initialised")
+                || lower.contains("not initialized")
+                || lower.contains("misconfigured")
+                || lower.contains("invalid configuration");
+            if is_permanent_config_bug {
+                (ErrorClass::Memory, "backend_misconfigured", false)
+            } else {
+                (ErrorClass::Memory, "backend_failure", true)
+            }
+        }
         MemoryError::SchemaMismatch { .. } => (ErrorClass::Memory, "schema_mismatch", false),
         MemoryError::MissingReverseMigration(_) => {
             (ErrorClass::Memory, "missing_reverse_migration", false)
@@ -105,23 +126,35 @@ fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) 
 
 /// Classify a `sqlx::Error` that arrives via `MemoryError::Sqlx`.
 ///
-/// Defined as a free function on a `&dyn std::error::Error` so this
-/// module does not carry a direct sqlx runtime dependency — the error
-/// shape is determined from the rendered string. The discriminators
-/// here are not exhaustive: anything we don't recognise falls into
-/// `(Memory, "postgres_other", false)`.
-fn classify_sqlx_like(err: &(dyn std::error::Error + 'static)) -> (ErrorClass, &'static str, bool) {
-    let s = err.to_string().to_ascii_lowercase();
-    if s.contains("row not found") {
-        return (ErrorClass::NotFound, "row_not_found", false);
+/// Match on the concrete enum variants rather than the rendered
+/// string so a future sqlx-side message tweak can't silently shift a
+/// connection failure from `(Memory, retryable=true)` into
+/// `(Memory, "postgres_other", retryable=true)`.
+///
+/// The catchall returns `retryable=true` because the safe default for
+/// an unrecognised database error is "transient; retry" — most sqlx
+/// failures we don't know about are network or pool churn, not
+/// permanent config bugs. A wrongly-retryable error wastes work; a
+/// wrongly-non-retryable one surfaces a transient hiccup as a permanent
+/// failure to the agent, which is the worse outcome for
+/// `AgenticSessionStore.append`'s retry loop.
+fn classify_sqlx_like(err: &sqlx::Error) -> (ErrorClass, &'static str, bool) {
+    match err {
+        sqlx::Error::RowNotFound => (ErrorClass::NotFound, "row_not_found", false),
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => {
+            (ErrorClass::Memory, "postgres_pool_unavailable", true)
+        }
+        sqlx::Error::Io(_) => (ErrorClass::Memory, "postgres_io_failure", true),
+        sqlx::Error::Database(_) => (ErrorClass::Memory, "postgres_database", false),
+        sqlx::Error::Configuration(_) => (ErrorClass::Memory, "postgres_configuration", false),
+        sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::TypeNotFound { .. }
+        | sqlx::Error::Decode(_) => (ErrorClass::Memory, "postgres_schema_drift", false),
+        // Catchall — assume transient. See doc comment above.
+        _ => (ErrorClass::Memory, "postgres_other", true),
     }
-    if s.contains("pool timed out") || s.contains("pool closed") {
-        return (ErrorClass::Memory, "postgres_pool_unavailable", true);
-    }
-    if s.contains("io error") || s.contains("connection reset") || s.contains("broken pipe") {
-        return (ErrorClass::Memory, "postgres_io_failure", true);
-    }
-    (ErrorClass::Memory, "postgres_other", false)
 }
 
 #[cfg(test)]
@@ -197,6 +230,130 @@ mod tests {
         let err = anyhow::anyhow!("invalid hash: not-a-hex-string");
         match map_anyhow_to_response_error(err) {
             Response::Error { class, .. } => assert_eq!(class, ErrorClass::Validation),
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn core_io_classifies_as_retryable_storage() {
+        let io: std::io::Error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "GCS dropped us");
+        let core_err: anyhow::Error =
+            anyhow::Error::new(agentic_core::Error::Io(io)).context("writing blob");
+        match map_anyhow_to_response_error(core_err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Storage);
+                assert_eq!(code, "io_failure");
+                assert!(retryable, "I/O is transient; retry");
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn core_secret_detected_classifies_as_validation() {
+        // ADR-0013: SecretDetected is a structural rejection — the
+        // caller would have to mutate the input. Not retryable.
+        // (Hit list is empty here; the variant tag alone drives the
+        // classification.)
+        let core_err: anyhow::Error =
+            anyhow::Error::new(agentic_core::Error::SecretDetected { hits: Vec::new() });
+        match map_anyhow_to_response_error(core_err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Validation);
+                assert_eq!(code, "secret_detected");
+                assert!(!retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn memory_backend_transient_message_is_retryable() {
+        let err: anyhow::Error = anyhow::Error::new(MemoryError::Backend(
+            "connection dropped mid-snapshot".to_string(),
+        ));
+        match map_anyhow_to_response_error(err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Memory);
+                assert_eq!(code, "backend_failure");
+                assert!(retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn memory_backend_permanent_config_bug_is_not_retryable() {
+        // The known-permanent shapes (TODO upstream: split the
+        // Backend(String) variant) must not flip AgenticSessionStore
+        // into retry-forever.
+        for msg in [
+            "empty identifier on memory snapshot",
+            "snapshot called before init",
+            "Postgres adapter not initialised",
+            "memory adapter misconfigured",
+            "invalid configuration: missing url",
+        ] {
+            let err: anyhow::Error = anyhow::Error::new(MemoryError::Backend(msg.to_string()));
+            match map_anyhow_to_response_error(err) {
+                Response::Error {
+                    class,
+                    code,
+                    retryable,
+                    ..
+                } => {
+                    assert_eq!(class, ErrorClass::Memory);
+                    assert_eq!(code, "backend_misconfigured");
+                    assert!(!retryable, "permanent config bug must not retry; msg={msg}");
+                }
+                _ => panic!("expected Response::Error"),
+            }
+        }
+    }
+
+    #[test]
+    fn sqlx_row_not_found_classifies_as_not_found() {
+        // Uses the concrete enum variant rather than a string match.
+        let err: anyhow::Error = anyhow::Error::new(MemoryError::Sqlx(sqlx::Error::RowNotFound));
+        match map_anyhow_to_response_error(err) {
+            Response::Error { class, code, .. } => {
+                assert_eq!(class, ErrorClass::NotFound);
+                assert_eq!(code, "row_not_found");
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn sqlx_pool_closed_classifies_as_retryable_memory() {
+        let err: anyhow::Error = anyhow::Error::new(MemoryError::Sqlx(sqlx::Error::PoolClosed));
+        match map_anyhow_to_response_error(err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Memory);
+                assert_eq!(code, "postgres_pool_unavailable");
+                assert!(retryable, "pool churn is transient; retry");
+            }
             _ => panic!("expected Response::Error"),
         }
     }

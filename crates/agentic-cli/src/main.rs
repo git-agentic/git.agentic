@@ -27,6 +27,10 @@ fn daemon_error(class: ErrorClass, code: &str, message: &str, retryable: bool) -
         ErrorClass::Memory => "memory",
         ErrorClass::Concurrency => "concurrency",
         ErrorClass::Internal => "internal",
+        // Forward-compat: a future ADR may add a class this CLI binary
+        // doesn't know about. Print it under "unknown" rather than
+        // crashing the user's shell.
+        ErrorClass::Unknown => "unknown",
     };
     let suffix = if retryable { " (retryable)" } else { "" };
     anyhow!("[{cls}:{code}]{suffix} {message}")
@@ -184,11 +188,11 @@ async fn cmd_rollback(
         {
             Response::Rollback(p) => p,
             Response::Error {
-            class,
-            code,
-            message,
-            retryable,
-        } => return Err(daemon_error(class, &code, &message, retryable)),
+                class,
+                code,
+                message,
+                retryable,
+            } => return Err(daemon_error(class, &code, &message, retryable)),
             other => return Err(anyhow!("unexpected response: {other:?}")),
         };
         println!("Planned rollback to {target}:");

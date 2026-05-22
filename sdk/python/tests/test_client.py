@@ -29,7 +29,12 @@ from agentic import (
     AgenticClient,
     AgenticConcurrencyError,
     AgenticError,
+    AgenticInternalError,
+    AgenticMemoryError,
     AgenticNotFoundError,
+    AgenticProtocolError,
+    AgenticStorageError,
+    AgenticValidationError,
 )
 from agentic._framing import read_frame, write_frame
 
@@ -258,11 +263,125 @@ def test_commit_base64_encodes_prompts(short_tmp: Path):
     assert sent["blob.bin"] == base64.b64encode(b"\x00\x01\xff").decode("ascii")
 
 
-def test_daemon_not_running_raises(short_tmp: Path):
+def test_daemon_not_running_raises_protocol_error(short_tmp: Path):
+    """Transport failures route through AgenticProtocolError so callers can
+    write `except AgenticProtocolError:` and catch wire-level issues as a
+    class. AgenticError subclass relationship is preserved."""
     sock_path = short_tmp / "missing.sock"
     client = AgenticClient(socket_path=sock_path)
-    with pytest.raises(AgenticError, match="daemon not reachable"):
+    with pytest.raises(AgenticProtocolError) as excinfo:
         client.ping()
+    assert isinstance(excinfo.value, AgenticError)
+    assert excinfo.value.retryable is True
+    assert excinfo.value.code == "daemon_unreachable"
+
+
+@pytest.mark.parametrize(
+    "class_token,expected_exc",
+    [
+        ("protocol", AgenticProtocolError),
+        ("validation", AgenticValidationError),
+        ("not_found", AgenticNotFoundError),
+        ("storage", AgenticStorageError),
+        ("memory", AgenticMemoryError),
+        ("concurrency", AgenticConcurrencyError),
+        ("internal", AgenticInternalError),
+    ],
+)
+def test_error_class_token_routes_to_subclass(
+    short_tmp: Path, class_token: str, expected_exc: type[AgenticError]
+):
+    """Every ErrorClass token from the ADR-0010 taxonomy must route to
+    its dedicated subclass. A typo in the dispatch table would silently
+    promote callers to AgenticInternalError; this parametrised test
+    catches that."""
+    sock_path = short_tmp / "mock.sock"
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "error",
+                    "class": class_token,
+                    "code": "x",
+                    "message": "hi",
+                    "retryable": False,
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    with pytest.raises(expected_exc):
+        client.ping()
+
+
+def test_concurrency_error_forces_retryable_true_even_if_daemon_says_false(
+    short_tmp: Path,
+):
+    """ADR-0010 Decision 2 names Concurrency as always-retryable. A
+    malformed daemon response (or future-version daemon that drops the
+    invariant) must not make AgenticSessionStore stop retrying transient
+    contention."""
+    sock_path = short_tmp / "mock.sock"
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "error",
+                    "class": "concurrency",
+                    "code": "lock_busy",
+                    "message": "lock held",
+                    "retryable": False,
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    with pytest.raises(AgenticConcurrencyError) as excinfo:
+        client.ping()
+    assert excinfo.value.retryable is True, (
+        "Concurrency errors must remain retryable even if the wire says otherwise"
+    )
+
+
+def test_retryable_strict_truthiness(short_tmp: Path):
+    """The SDK uses `is True` rather than `bool(...)` so a daemon (or
+    future protocol version) sending retryable as the JSON string
+    "false" doesn't silently flip into retry-forever behaviour."""
+    sock_path = short_tmp / "mock.sock"
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "error",
+                    "class": "storage",
+                    "code": "x",
+                    "message": "hi",
+                    "retryable": "false",  # ← JSON string, not boolean
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    with pytest.raises(AgenticStorageError) as excinfo:
+        client.ping()
+    assert excinfo.value.retryable is False, (
+        "non-boolean retryable values must not be coerced to True"
+    )
 
 
 def test_frame_format_matches_rust():

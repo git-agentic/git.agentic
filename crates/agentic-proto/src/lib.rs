@@ -124,6 +124,14 @@ pub enum ErrorClass {
     /// Last-resort. Bugs, panics, anything the daemon can't classify. Treat as
     /// non-retryable until a more specific class is added in a future ADR.
     Internal,
+    /// Forward-compat catchall. A future ADR may add a class (e.g. `Auth`
+    /// when remote `agenticd` lands per ADR-0004 Decision 2's footnote);
+    /// older clients deserialise the unknown tag as this variant rather
+    /// than failing the whole envelope. Treat as non-retryable until the
+    /// client upgrades to the proto version that names the class
+    /// concretely.
+    #[serde(other)]
+    Unknown,
 }
 
 #[serde_as]
@@ -464,6 +472,37 @@ mod tests {
         match Response::protocol("version_mismatch", "client too new") {
             Response::Error { retryable, .. } => assert!(!retryable),
             _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn v0_client_can_deserialise_v1_error_response() {
+        // A pre-ADR-0010 Rust client built against the old proto crate
+        // had this Response shape (Error variant carried only `message`).
+        // Simulate it locally and confirm a v1 wire-shape Error reply
+        // still deserialises successfully (extra fields are ignored by
+        // serde's default tagged-enum behaviour). This pins the
+        // backward-compat guarantee for the v1.0.0 release window.
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum V0Response {
+            Pong,
+            Error { message: String },
+        }
+
+        let v1_wire = r#"{
+            "kind": "error",
+            "class": "not_found",
+            "code": "ref_not_found",
+            "message": "ref not found: feature-x",
+            "retryable": false
+        }"#;
+        let parsed: V0Response = serde_json::from_str(v1_wire).unwrap();
+        match parsed {
+            V0Response::Error { message } => {
+                assert!(message.contains("ref not found: feature-x"));
+            }
+            _ => panic!("expected Error variant"),
         }
     }
 

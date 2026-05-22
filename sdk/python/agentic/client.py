@@ -84,7 +84,28 @@ class AgenticMemoryError(AgenticError):
 
 
 class AgenticConcurrencyError(AgenticError):
-    """Daemon-internal serialisation. Always retryable."""
+    """Daemon-internal serialisation. Always retryable per ADR-0010 D2."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        retryable: bool = True,
+        class_token: str = "concurrency",
+    ) -> None:
+        # ADR-0010 Decision 2 names Concurrency as always-retryable. If
+        # a malformed daemon response sets retryable=false on a
+        # Concurrency-class error, override it loudly here: the alternative
+        # is silently making AgenticSessionStore stop retrying transient
+        # contention.
+        super().__init__(
+            message,
+            code=code,
+            retryable=True,
+            class_token=class_token,
+        )
+        del retryable  # ignored on purpose; see comment above.
 
 
 class AgenticInternalError(AgenticError):
@@ -111,7 +132,12 @@ def _raise_from_error_response(response: dict[str, Any]) -> None:
     class_token = response.get("class", "internal")
     code = response.get("code", "")
     message = response.get("message", "daemon returned Error")
-    retryable = bool(response.get("retryable", False))
+    # Strict truthiness so a daemon (or future-version client) sending
+    # retryable as the JSON string "false" doesn't silently flip into
+    # retry-forever behaviour. JSON booleans deserialise as Python bools;
+    # anything else is treated as not-retryable.
+    raw_retryable = response.get("retryable", False)
+    retryable = raw_retryable is True
     exc_cls = _ERROR_CLASS_TO_EXCEPTION.get(class_token, AgenticInternalError)
     raise exc_cls(
         message,
@@ -282,30 +308,53 @@ class AgenticClient:
             "protocol_version": PROTOCOL_VERSION,
             "payload": payload,
         }
+        # Wire-level failures (transport, framing, correlation mismatch,
+        # malformed payload) raise AgenticProtocolError so callers can
+        # write `except AgenticProtocolError` and catch them as a class.
+        # Inheritance from AgenticError is preserved for catch-all sites.
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.connect(str(self.socket_path))
                 write_frame(sock, envelope)
                 reply = read_frame(sock)
         except (FileNotFoundError, ConnectionRefusedError) as e:
-            raise AgenticError(
-                f"daemon not reachable at {self.socket_path}; is `agenticd` running?"
+            raise AgenticProtocolError(
+                f"daemon not reachable at {self.socket_path}; is `agenticd` running?",
+                code="daemon_unreachable",
+                retryable=True,
+                class_token="protocol",
             ) from e
         except FrameError as e:
-            raise AgenticError(str(e)) from e
+            raise AgenticProtocolError(
+                str(e),
+                code="framing_error",
+                retryable=False,
+                class_token="protocol",
+            ) from e
         except OSError as e:
-            raise AgenticError(f"socket error: {e}") from e
+            raise AgenticProtocolError(
+                f"socket error: {e}",
+                code="socket_error",
+                retryable=True,
+                class_token="protocol",
+            ) from e
 
         if reply.get("correlation_id") != correlation_id:
-            raise AgenticError(
+            raise AgenticProtocolError(
                 f"correlation id mismatch: sent {correlation_id} got "
-                f"{reply.get('correlation_id')!r}"
+                f"{reply.get('correlation_id')!r}",
+                code="correlation_mismatch",
+                retryable=False,
+                class_token="protocol",
             )
         response = reply.get("payload", {})
         if not isinstance(response, dict):
-            raise AgenticError(
+            raise AgenticProtocolError(
                 f"daemon returned non-dict payload ({type(response).__name__!r}); "
-                "protocol version mismatch?"
+                "protocol version mismatch?",
+                code="malformed_response",
+                retryable=False,
+                class_token="protocol",
             )
         if response.get("kind") == "error":
             _raise_from_error_response(response)

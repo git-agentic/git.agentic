@@ -17,7 +17,9 @@ use agentic_core::{Object, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame_bytes, write_frame, FrameError};
-use agentic_proto::{DiffOutput, Envelope, LogEntry, Request, RequestV0, Response, PROTOCOL_VERSION};
+use agentic_proto::{
+    DiffOutput, Envelope, LogEntry, Request, RequestV0, Response, PROTOCOL_VERSION,
+};
 use anyhow::{anyhow, Context};
 
 use crate::wire_error::map_anyhow_to_response_error;
@@ -172,9 +174,7 @@ pub async fn handle_connection(
                     peer_uid = ?peer_uid,
                     "inbound frame exceeds MAX_FRAME_BYTES; closing connection"
                 );
-                return Err(anyhow!(
-                    "inbound frame exceeds MAX_FRAME_BYTES ({n} bytes)"
-                ));
+                return Err(anyhow!("inbound frame exceeds MAX_FRAME_BYTES ({n} bytes)"));
             }
             Err(e) => return Err(e.into()),
         };
@@ -183,27 +183,57 @@ pub async fn handle_connection(
         // Decision 6 coexistence shim. Either branch may fail with a
         // structured Protocol-class error reply that we send before
         // dropping the connection.
-        let (correlation_id, request) =
-            match parse_envelope_with_v0_shim(&bytes, peer_uid).await {
-                Ok(pair) => pair,
-                Err(EnvelopeParseError::Attributable {
-                    correlation_id,
-                    response,
-                }) => {
-                    let reply = Envelope::new(correlation_id, response);
-                    write_frame(&mut writer, &reply).await?;
-                    continue;
-                }
-                Err(EnvelopeParseError::Unattributable(msg)) => {
+        let (correlation_id, request) = match parse_envelope_with_v0_shim(&bytes, peer_uid).await {
+            Ok(pair) => pair,
+            Err(EnvelopeParseError::Attributable {
+                correlation_id,
+                response,
+            }) => {
+                // Log the parse failure here, before the write attempt,
+                // so a write_frame failure can't swallow the reason this
+                // connection is being closed. The Attributable case still
+                // gives the client a structured reply when the socket
+                // survives long enough.
+                if let Response::Error {
+                    class,
+                    code,
+                    message,
+                    ..
+                } = &response
+                {
                     tracing::warn!(
                         target: "agenticd::framing",
                         peer_uid = ?peer_uid,
-                        error = %msg,
-                        "envelope unparseable; closing connection"
+                        correlation_id = %correlation_id,
+                        class = ?class,
+                        code = %code,
+                        error = %message,
+                        "envelope parse failed; sending attributable reply"
                     );
-                    return Err(anyhow!("malformed envelope: {msg}"));
                 }
-            };
+                let reply = Envelope::new(correlation_id.clone(), response);
+                if let Err(e) = write_frame(&mut writer, &reply).await {
+                    tracing::warn!(
+                        target: "agenticd::framing",
+                        peer_uid = ?peer_uid,
+                        correlation_id = %correlation_id,
+                        write_error = %e,
+                        "failed to deliver attributable parse-error reply; closing connection"
+                    );
+                    return Err(e.into());
+                }
+                continue;
+            }
+            Err(EnvelopeParseError::Unattributable(msg)) => {
+                tracing::warn!(
+                    target: "agenticd::framing",
+                    peer_uid = ?peer_uid,
+                    error = %msg,
+                    "envelope unparseable; closing connection"
+                );
+                return Err(anyhow!("malformed envelope: {msg}"));
+            }
+        };
 
         let response = match dispatch(Arc::clone(&state), request, peer_uid).await {
             Ok(r) => r,
@@ -265,10 +295,55 @@ async fn parse_envelope_with_v0_shim(
             EnvelopeParseError::Unattributable("envelope missing correlation_id".to_string())
         })?
         .to_string();
-    let protocol_version = value
-        .get("protocol_version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u16;
+    // Decode `protocol_version` explicitly so we can refuse two
+    // silent-failure shapes the previous `as_u64().unwrap_or(0) as u16`
+    // path enabled: (a) values outside u16 range silently wrapping
+    // modulo 65536 (e.g. 65537 → 1), and (b) a JSON string `"1"`
+    // silently downgrading to v0 because `as_u64()` returns `None`
+    // for non-integer JSON. Both are now attributable Protocol-class
+    // replies rather than corrupt deserialisation paths.
+    let protocol_version: u16 = match value.get("protocol_version") {
+        None => 0, // ADR-0010 Decision 6: no field → v0.
+        Some(serde_json::Value::Number(n)) => {
+            let n_u64 = n.as_u64().ok_or_else(|| EnvelopeParseError::Attributable {
+                correlation_id: correlation_id.clone(),
+                response: Response::protocol(
+                    "malformed_protocol_version",
+                    format!("protocol_version is not a non-negative integer: {n}"),
+                ),
+            })?;
+            u16::try_from(n_u64).map_err(|_| EnvelopeParseError::Attributable {
+                correlation_id: correlation_id.clone(),
+                response: Response::protocol(
+                    "malformed_protocol_version",
+                    format!(
+                        "protocol_version {n_u64} exceeds the u16 wire range; \
+                         max is {}",
+                        u16::MAX
+                    ),
+                ),
+            })?
+        }
+        Some(other) => {
+            return Err(EnvelopeParseError::Attributable {
+                correlation_id,
+                response: Response::protocol(
+                    "malformed_protocol_version",
+                    format!(
+                        "protocol_version must be a JSON integer; got {}",
+                        match other {
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Bool(_) => "boolean",
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::Object(_) => "object",
+                            serde_json::Value::Null => "null",
+                            serde_json::Value::Number(_) => unreachable!(),
+                        }
+                    ),
+                ),
+            });
+        }
+    };
 
     if protocol_version > PROTOCOL_VERSION {
         tracing::info!(
@@ -295,15 +370,14 @@ async fn parse_envelope_with_v0_shim(
     // know matches the client's wire version.
     if protocol_version == 0 {
         // v0 client: prompts are String, no protocol_version field.
-        let env_v0: Envelope<RequestV0> = serde_json::from_slice(bytes).map_err(|e| {
-            EnvelopeParseError::Attributable {
+        let env_v0: Envelope<RequestV0> =
+            serde_json::from_slice(bytes).map_err(|e| EnvelopeParseError::Attributable {
                 correlation_id: correlation_id.clone(),
                 response: Response::protocol(
                     "malformed_v0_envelope",
                     format!("v0 envelope failed to deserialise: {e}"),
                 ),
-            }
-        })?;
+            })?;
         tracing::debug!(
             target: "agenticd::framing",
             correlation_id = %correlation_id,
@@ -312,15 +386,14 @@ async fn parse_envelope_with_v0_shim(
         Ok((correlation_id, env_v0.payload.into()))
     } else {
         // v1 (or future-equivalent) client.
-        let env: Envelope<Request> = serde_json::from_slice(bytes).map_err(|e| {
-            EnvelopeParseError::Attributable {
+        let env: Envelope<Request> =
+            serde_json::from_slice(bytes).map_err(|e| EnvelopeParseError::Attributable {
                 correlation_id: correlation_id.clone(),
                 response: Response::protocol(
                     "malformed_envelope",
                     format!("v{protocol_version} envelope failed to deserialise: {e}"),
                 ),
-            }
-        })?;
+            })?;
         Ok((correlation_id, env.payload))
     }
 }
