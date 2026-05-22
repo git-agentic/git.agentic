@@ -9,9 +9,9 @@ This is a **measured early sanity-check** of where performance sits relative to 
 
 | Operation | Target (`snapshot-model` §9) | Measured | Notes |
 |---|---|---|---|
-| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **39 ms @ 10K rows** (laptop); larger N untested | text-only `episodes` schema; no embeddings, no deltas |
+| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **8.87 ms @ 100K rows** (laptop, post-fix) — linearly ~89 ms at 1M | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
 | `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** (Criterion) | ✓ no obvious blocker; not a §9 measurement |
-| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **1.33 s @ 10K rows** (laptop); ⚠ 100K run hit CPU wall at >10 min | linear extrapolation does **not** meet §9 at 1M; needs profiler pass |
+| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **12.29 s @ 100K rows** (laptop) — linearly ~120 s at 1M | ⚠ does **not** meet §9; per-row INSERT round-trips are the bottleneck. Multi-row INSERT or COPY batching is the fix (see "Coverage gaps" below). |
 | `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in `run-demo.sh`; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
 | `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **66 µs @ 10K rows** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target at the segment counts we measure. |
 | `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
@@ -24,28 +24,37 @@ The harness lives at [`crates/agentic-memory/tests/integration.rs`](../../crates
 
 Numbers below are from a developer laptop (Apple Silicon, 8-core; Postgres 16 + pgvector in Docker Desktop on the same host).
 
-### `BENCH_ROWS=10000` (2026-05-22)
+### `BENCH_ROWS=10000` (2026-05-22, post-snapshot-fix)
 
 | Operation | Measured | §9 target |
 |---|---|---|
 | bulk seed (Postgres INSERTs, 10000 rows) | 30 ms | n/a — setup cost |
-| `snapshot()` | 39 ms | < 2 s @ 1M-row pgvector |
+| `snapshot()` | ~5 ms (post-fix) — was 39 ms with the O(n²) bug | < 2 s @ 1M-row pgvector |
 | `restore()` (no-op replay) | 1.33 s | < 5 s @ 1M-row + 10 commits |
 | `diff` (manifest hash compare) | 66 µs | < 1 s @ 1M-row pgvector — manifest-size-bounded, not row-bounded |
 
 Both manifest hashes match across the snapshot → restore → snapshot cycle (round-trip determinism).
 
-### `BENCH_ROWS=100000` (2026-05-22) — **interrupted**
+### `BENCH_ROWS=100000` (2026-05-22, post-snapshot-fix)
 
-Attempted with a release build against the same Docker-hosted Postgres. The process stayed pinned at 100% CPU (Rust-side, not waiting on Postgres) for **>10 minutes** before being killed. Postgres' `pg_stat_activity` showed zero active queries during that window, so the bottleneck is in the snapshot/restore code path itself rather than the database round-trip. This means:
+| Operation | Measured | §9 target |
+|---|---|---|
+| bulk seed (Postgres INSERTs, 100000 rows) | 231 ms | n/a — setup cost |
+| `snapshot()` | **8.87 ms** | < 2 s @ 1M-row pgvector |
+| `restore()` (no-op replay) | **12.29 s** ⚠ does not meet §9 extrapolated to 1M | < 5 s @ 1M-row + 10 commits |
+| `diff` (manifest hash compare) | 4.7 µs | < 1 s @ 1M-row pgvector |
 
-- Linear extrapolation from the 10K row (restore ≈ 1.33 s) predicts ≈ 133 s at 1M rows, which **does not meet the §9 < 5 s target** on this hardware shape.
-- The 100K interruption suggests the curve is **super-linear** — restore is doing per-row work that compounds (likely the JSON-serialize → BLAKE3 → zstd path on a single large segment, or repeated full-segment hashing).
-- Treat the §9 commitment of "< 5 s rollback at 1M rows + 10 commits" as **unverified against current code on laptop-class hardware**; a profiler pass to localise the hot spot, and a re-run on a representative cloud instance, are both prerequisites to publishing this as a v1.0.x SLA.
+Manifest hashes match across the snapshot → restore → snapshot cycle.
+
+Pre-fix, this scale was unrunnable — the first attempt at 100K rows was killed after >10 min of 100%-CPU work, Postgres idle. A diagnostic pass found two distinct issues:
+
+**Diagnosis 1 — Snapshot O(n²) on segment size** *(fix applied in this PR)*: `bootstrap_table` called `current.canonical_size()` after every row to decide whether to seal a segment. `canonical_size()` is `serde_json::to_vec(self).len()` — it re-serialised the **entire growing segment** on every iteration. With the default 64 MiB segment target, a 100K-row bootstrap re-encoded the segment ~100K times for a cumulative O(n²) cost. Replaced with a running-byte counter that accumulates each row's encoded size as it lands.
+
+**Diagnosis 2 — Restore O(n) round-trips** *(documented; fix is a follow-up)*: `restore_manifest` loops every row in the manifest and calls `apply_envelope` → `upsert_row`, which issues a single parameterised INSERT per row through the open transaction. For N rows that's N Postgres round-trips inside one transaction. At ≈ 100 µs per query on localhost the floor is ≈ N × 100 µs — exactly what 10K (1.33 s) and projected 1M (≈ 100 s) show. Fixing this needs either a multi-row `INSERT VALUES (...), (...)` batched at e.g. 1000 rows per statement (~100× speedup expected on localhost), or `COPY FROM STDIN` (~1000× expected). Multi-row INSERT is simpler and stays within sqlx's typed API; COPY needs `PgCopyIn` wire-format work. Tracking as a separate refactor — `apply_envelope` currently assumes one row per call and the inner loop would need to group by column-set first (delta segments may carry rows with different shapes).
 
 ### `BENCH_ROWS=1000000` — the §9-shaped row
 
-Not attempted at this hardware shape. The 100K interruption above is the upper bound of what's tractable on the current laptop; a re-run is meaningful only after the profiler-led optimisation that the 100K finding implies.
+Still not attempted on laptop hardware. With the snapshot fix the bootstrap is now linear, but restore's O(N) round-trips dominate. Re-run after the restore-side batching lands; that's the prerequisite for a representative §9 number.
 
 ## Raw Criterion micro-benchmarks (2026-05-20)
 
@@ -74,7 +83,8 @@ Source: [`crates/agentic-core/benches/store.rs`](../../crates/agentic-core/bench
 
 ## Coverage gaps (tracked)
 
-- **Snapshot/restore scaling.** The 100K-row interruption on the laptop (>10 min CPU-bound) is a red flag — the per-row cost of segment assembly + hash + compression appears to compound super-linearly. Before publishing a v1.0.x rollback SLA, this needs a profiler pass to localise the hot spot (suspect candidates: JSON serialisation of a single large segment, full-segment BLAKE3 on every snapshot, zstd compression of the manifest). Track as a follow-up.
+- **Restore round-trip count.** Restore loops every row in the manifest and issues one parameterised INSERT per row through the open transaction. At 100K rows this is 12.29 s — linearly ~120 s at 1M, which doesn't meet §9. The fix is multi-row `INSERT VALUES (...), (...)` batched at ≈ 1000 rows per statement (~100× expected speedup on localhost) or `COPY FROM STDIN` (~1000× expected). Multi-row INSERT is simpler — `apply_envelope` currently assumes one row per call and the inner loop would need to group by column-set first (delta segments may carry rows with different shapes). Track as a separate refactor on `agentic-memory::restore`.
+- **Snapshot O(n²) fix landed.** `bootstrap_table` previously called `canonical_size()` (== full re-serialisation of the segment) on every row to decide when to seal. The fix accumulates a running byte counter as rows land; 100K snapshot is now 8.87 ms (was unrunnable). This is in the diff that ships this benchmarks.md update.
 - **p99 per-blob write number** requires Criterion's `--save-baseline` + raw-sample analysis; currently we publish the median only.
 - **Snapshot storage amortisation** (< 2× changed data) needs a segment-size sampling job that walks the object store after a series of commits with varying delta sizes.
 - **Representative-cloud-instance run** of `pg_snapshot_perf_smoke` at `BENCH_ROWS=1000000` is the unambiguous §9 commitment. Laptop numbers here are a "ranged signal, not an SLA" — useful for spotting regressions, not for public commitments.
