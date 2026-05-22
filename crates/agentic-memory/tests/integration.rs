@@ -541,3 +541,150 @@ async fn pg_snapshot_perf_smoke() {
 
     drop_schema(&admin_pool, &schema).await;
 }
+// ── Data-integrity error paths ────────────────────────────────────────────────
+
+/// A NULL-valued primary key must cause `snapshot` to fail loudly rather
+/// than silently anchor a segment with `pk_lo`/`pk_hi == null`. The
+/// manifest's range metadata is load-bearing for restore; a null-anchored
+/// segment would corrupt downstream rollback selection.
+///
+/// Schema: `id bigint NULL` (not the usual NOT NULL) so we can insert a
+/// row with `id = NULL` and exercise the path.
+#[tokio::test]
+#[ignore]
+async fn snapshot_rejects_null_primary_key() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    admin_pool
+        .execute(format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"").as_str())
+        .await
+        .unwrap();
+    admin_pool
+        .execute(
+            format!(
+                r#"CREATE TABLE "{schema}".episodes (
+                    id    bigint,
+                    text  text NOT NULL
+                )"#
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    admin_pool
+        .execute(
+            format!("INSERT INTO \"{schema}\".episodes (id, text) VALUES (NULL, 'orphan')")
+                .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
+    // `init` bootstraps every tracked table via the same `row_to_json`
+    // path that `snapshot` uses, so the error surfaces here on the
+    // very first read — earlier than `snapshot` is even reached. The
+    // operator-level shape: "starting agenticd against a table with a
+    // NULL PK fails loudly with the offending column named."
+    let err = adapter
+        .init()
+        .await
+        .expect_err("init must reject a table with a NULL PK row");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("primary-key column \"id\" is NULL"),
+        "error message must name the NULL PK explicitly; got: {msg}"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
+
+/// A column whose decode would fail (NaN floats can't round-trip through
+/// JSON Number) must propagate as an Err instead of silently emitting
+/// `Json::Null`. Before this fix, every decode-failure arm in
+/// `row_to_json` did `.unwrap_or(Json::Null)` and the snapshot was
+/// silently corrupted.
+#[tokio::test]
+#[ignore]
+async fn snapshot_rejects_non_finite_float() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    admin_pool
+        .execute(format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"").as_str())
+        .await
+        .unwrap();
+    admin_pool
+        .execute(
+            format!(
+                r#"CREATE TABLE "{schema}".episodes (
+                    id    bigint PRIMARY KEY,
+                    score double precision NOT NULL,
+                    text  text NOT NULL
+                )"#
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    admin_pool
+        .execute(
+            format!(
+                "INSERT INTO \"{schema}\".episodes (id, score, text) \
+                 VALUES (1, 'NaN'::float8, 'nan-row')"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
+    // Same shape as the NULL-PK test: `init` bootstraps the table via
+    // the `row_to_json` path, so the non-finite-float decode error
+    // surfaces here.
+    let err = adapter
+        .init()
+        .await
+        .expect_err("init must reject a non-finite float row");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("non-finite") && msg.contains("score"),
+        "error message must name the offending column and the reason; got: {msg}"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
