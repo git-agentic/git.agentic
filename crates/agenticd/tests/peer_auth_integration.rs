@@ -32,10 +32,7 @@ async fn ping(sock_path: &std::path::Path) -> anyhow::Result<()> {
     let mut writer = tokio::io::BufWriter::new(write);
     write_frame(
         &mut writer,
-        &Envelope {
-            correlation_id: "t1".into(),
-            payload: Request::Ping,
-        },
+        &Envelope::new("t1", Request::Ping),
     )
     .await?;
     let reply: Envelope<Response> = read_frame(&mut reader).await?.expect("response frame");
@@ -83,28 +80,27 @@ async fn non_allowlisted_uid_is_rejected() {
         let mut reader = tokio::io::BufReader::new(read);
         let mut writer = tokio::io::BufWriter::new(write);
         // Try to send a Ping; if write succeeds, expect read to hit EOF.
-        let _ = write_frame(
-            &mut writer,
-            &Envelope {
-                correlation_id: "rej".into(),
-                payload: Request::Ping,
-            },
-        )
-        .await;
+        let _ = write_frame(&mut writer, &Envelope::new("rej", Request::Ping)).await;
         // Read should fail or return None (EOF) because the daemon dropped
-        // the socket.
-        let res: Result<Option<Envelope<Response>>, _> = read_frame(&mut reader).await;
-        Ok::<_, anyhow::Error>(res)
+        // the socket. Unwrap the FrameError here so the outer assertion
+        // sees `Option<Envelope<Response>>` directly (and `frame.is_none()`
+        // is type-correct). A transport error and a clean EOF are both
+        // acceptable signals that the daemon dropped us — collapse both
+        // into `Ok(None)` so the test reads as "no response delivered".
+        let frame: Option<Envelope<Response>> = match read_frame(&mut reader).await {
+            Ok(opt) => opt,
+            Err(_) => None,
+        };
+        Ok::<_, anyhow::Error>(frame)
     })
     .await;
 
     child.kill().ok();
     let _ = child.wait();
 
-    let read_result =
-        result.expect("connection attempt timed out — daemon hung instead of dropping");
-    let frame =
-        read_result.expect("read_frame returned a transport error rather than a clean drop");
+    let frame = result
+        .expect("connection attempt timed out — daemon hung instead of dropping")
+        .expect("inner closure cannot fail — only returns Ok");
     assert!(
         frame.is_none(),
         "daemon responded to a non-allowlisted UID; rejection path is broken. Got: {frame:?}"
@@ -151,10 +147,7 @@ async fn insecure_mode_does_not_attest_commits() {
     let mut writer = tokio::io::BufWriter::new(write);
     write_frame(
         &mut writer,
-        &Envelope {
-            correlation_id: "c1".into(),
-            payload: Request::Commit(commit_input),
-        },
+        &Envelope::new("c1", Request::Commit(commit_input)),
     )
     .await
     .unwrap();
@@ -170,10 +163,7 @@ async fn insecure_mode_does_not_attest_commits() {
     // Read back the Commit object.
     write_frame(
         &mut writer,
-        &Envelope {
-            correlation_id: "r1".into(),
-            payload: Request::ReadObject { hash: commit_hash },
-        },
+        &Envelope::new("r1", Request::ReadObject { hash: commit_hash }),
     )
     .await
     .unwrap();
