@@ -1,7 +1,8 @@
 # ADR-0005: SessionStore-based amendment to ADR-0004 Decisions 3 and 4
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-20
+**Accepted:** 2026-05-22
 **Deciders:** Toni
 **Amends:** [ADR-0004](0004-realtime-agenticd-for-executor.md) Decisions 3 and 4
 **Relates to:** [`docs/integration/executor-harness-check.md`](../integration/executor-harness-check.md) (research memo this ADR codifies)

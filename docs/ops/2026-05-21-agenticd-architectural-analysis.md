@@ -27,7 +27,7 @@ This document is the durable evidence behind the v1.0 hardening + v1.1 architect
 
 **Dimensions that found NO inaction risk:** lock ordering ([C13](#c13) — globally consistent, no deadlock cycle), advisory-lock cancellation safety ([C12](#c12)), `spawn_local` panic isolation ([C11](#c11)), `FsObjectStore` TOCTOU ([C7](#c7) — benign by content-addressing). The daemon's basic concurrency machinery is sound; the failures are in *what it does inside the locks*, not in the lock structure.
 
-**ADR overlap:** ADR-0005 (SessionStore amendment, Proposed) is the natural place to add the missing trait methods on `MemoryAdapter` ([A9](#a9) — deferred). ADR-0010 (planned: wire-protocol error model) unblocks [A6](#a6). ADR-0011 (planned: ObjectStore async-trait shape) is where the full async-trait redesign that solves [R3](#r3) lives — [A5](#a5) has a tactical `spawn_blocking` patch that lands now without waiting on the ADR. ADR-0007 (ephemeral branches, Accepted 2026-05-22) governs the diff-atomicity question ([C6](#c6), [A11](#a11) — implementation tracked on [#45](https://github.com/git-agentic/git.agentic/issues/45), now unblocked).
+**ADR overlap:** ADR-0005 (SessionStore amendment, Accepted 2026-05-22) is the natural place to add the missing trait methods on `MemoryAdapter` ([A9](#a9) — now unblocked, tracked on [#43](https://github.com/git-agentic/git.agentic/issues/43)). ADR-0010 (planned: wire-protocol error model) unblocks [A6](#a6). ADR-0011 (planned: ObjectStore async-trait shape) is where the full async-trait redesign that solves [R3](#r3) lives — [A5](#a5) has a tactical `spawn_blocking` patch that lands now without waiting on the ADR. ADR-0007 (ephemeral branches, Accepted 2026-05-22) governs the diff-atomicity question ([C6](#c6), [A11](#a11) — implementation tracked on [#45](https://github.com/git-agentic/git.agentic/issues/45), now unblocked).
 
 ---
 
@@ -398,7 +398,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 **Tests landed:** AC3a/AC3b unit tests in `crates/agenticd/src/migrate.rs`; AC1 + AC3c integration tests + happy-path regression in `crates/agenticd/tests/reverse_migration.rs` (real Postgres, gated by `#[ignore]`); AC2 unit tests in `crates/agenticd/src/rollback.rs`. Full workspace `cargo test` + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check` green.
 
-<a name="a9"></a>**A9 — Defer: `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — blocked by ADR-0005; single backend today (Rule-of-Three fails).
+<a name="a9"></a>**A9 — `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — unblocked 2026-05-22 (ADR-0005 Accepted). Implementation tracked on [#43](https://github.com/git-agentic/git.agentic/issues/43); still M-effort and labelled v1.1 (Rule-of-Three says wait for the second real backend before generalising the trait).
 
 <a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
@@ -442,7 +442,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | [#40](https://github.com/git-agentic/git.agentic/issues/40) **DONE** | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope | [#41](https://github.com/git-agentic/git.agentic/issues/41) **DONE** | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
-| A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
+| A9 | Complete `MemoryAdapter` trait | [#43](https://github.com/git-agentic/git.agentic/issues/43) | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
 | A11 | `Diff` atomicity | [#45](https://github.com/git-agentic/git.agentic/issues/45) **DONE** | `v1.1` | — |
 
