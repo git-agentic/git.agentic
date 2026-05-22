@@ -301,9 +301,20 @@ impl PostgresAdapter {
             // `serde_json::to_vec(&envelope).len()` is the row body; the
             // `+ 1` covers the comma that joins rows inside the segment's
             // JSON array.
+            //
+            // INVARIANT: `envelope` is a `serde_json::Value` we just
+            // constructed from `{"op": "insert", "row": <row_json>}`.
+            // `row_json` is the output of `row_to_json`, which only
+            // produces Value variants serde_json can encode. The same
+            // discipline `Segment::to_canonical_bytes` already relies on
+            // for its `.expect(...)`. Swallowing a serialise failure as
+            // 0 bytes would under-count `running_bytes`, prevent
+            // sealing, and produce oversized segments silently — fail
+            // loudly instead.
             let envelope_bytes = serde_json::to_vec(&envelope)
-                .map(|v| v.len() + 1)
-                .unwrap_or(0);
+                .expect("envelope JSON encoding cannot fail; see INVARIANT above")
+                .len()
+                + 1;
             running_bytes = running_bytes.saturating_add(envelope_bytes);
 
             current.rows.push(envelope);
