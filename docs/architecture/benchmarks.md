@@ -13,7 +13,7 @@ This is a **measured early sanity-check** of where performance sits relative to 
 | `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** (Criterion) | ✓ no obvious blocker; not a §9 measurement |
 | `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **1.33 s @ 10K rows** (laptop); ⚠ 100K run hit CPU wall at >10 min | linear extrapolation does **not** meet §9 at 1M; needs profiler pass |
 | `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in `run-demo.sh`; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
-| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **66 µs @ 10K rows** (laptop) | manifest comparison is content-addressed — operation cost is essentially independent of row count; trivially within target |
+| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **66 µs @ 10K rows** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target at the segment counts we measure. |
 | `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
 | Per-blob write, **median** | < 5 ms per row (p99) | **2.7 ms median (512 KB)** / **0.83 ms median (1 KB)** | ⚠ Criterion reports median, not p99 — p99 needs `--save-baseline` raw-sample analysis (tracked) |
 | Snapshot storage amortized | < 2× changed data | _not yet measured_ | ⚠ pending segment-size sampling job |
@@ -31,7 +31,7 @@ Numbers below are from a developer laptop (Apple Silicon, 8-core; Postgres 16 + 
 | bulk seed (Postgres INSERTs, 10000 rows) | 30 ms | n/a — setup cost |
 | `snapshot()` | 39 ms | < 2 s @ 1M-row pgvector |
 | `restore()` (no-op replay) | 1.33 s | < 5 s @ 1M-row + 10 commits |
-| `diff` (manifest hash compare) | 66 µs | < 1 s @ 1M-row pgvector |
+| `diff` (manifest hash compare) | 66 µs | < 1 s @ 1M-row pgvector — manifest-size-bounded, not row-bounded |
 
 Both manifest hashes match across the snapshot → restore → snapshot cycle (round-trip determinism).
 

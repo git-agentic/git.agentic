@@ -385,27 +385,42 @@ fn bench_rows() -> u64 {
         .unwrap_or(10_000)
 }
 
-/// Bulk-INSERT `n` rows into the schema's `episodes` table in a single
-/// statement. Postgres' single-statement INSERT with many VALUES is far
-/// faster than N round-trip statements; for 1M rows on a laptop this is
-/// the difference between "minutes" and "tens of seconds".
+/// Bulk-INSERT `n` rows into the schema's `episodes` table as a small
+/// number of batched single-statement INSERTs. Postgres' single-statement
+/// INSERT with many VALUES is far faster than N round-trip statements;
+/// for 1M rows on a laptop this is the difference between "minutes" and
+/// "tens of seconds". The batching cap keeps each statement well under
+/// any practical query-length limit.
 async fn bulk_insert_episodes(pool: &PgPool, schema: &str, n: u64) {
-    // Cap the statement size to avoid hitting Postgres' max query length
-    // (~1GB but practical limit is much lower). 50k rows per batch keeps
-    // each statement well under any limit and gives the planner room.
+    use std::fmt::Write;
+
     const BATCH: u64 = 50_000;
-    let mut next_id: u64 = 100; // start past the 5 baseline rows make_schema seeds
-    let end = next_id + n;
+    let next_start: u64 = 100; // start past the 5 baseline rows make_schema seeds
+                               // Checked addition: BENCH_ROWS is operator-controlled; refuse to
+                               // overflow into a wraparound (release) or panic (debug) on a
+                               // misconfigured value rather than silently producing the wrong
+                               // number of rows.
+    let end = next_start
+        .checked_add(n)
+        .unwrap_or_else(|| panic!("BENCH_ROWS={n} overflows u64 when offset by the baseline 100"));
+
+    let mut next_id = next_start;
     while next_id < end {
         let batch_end = (next_id + BATCH).min(end);
-        let mut sql = format!("INSERT INTO \"{schema}\".episodes (id, text) VALUES ");
+        // Pre-reserve capacity for the batch so per-row `write!` calls
+        // don't reallocate. Each row encodes as roughly
+        // "(<19-digit id>, 'ep-<19-digit id>'), " — bound generously
+        // at 64 bytes/row plus the static prefix.
+        let mut sql = String::with_capacity(64 + 64 * (batch_end - next_id) as usize);
+        write!(sql, "INSERT INTO \"{schema}\".episodes (id, text) VALUES ").unwrap();
         for i in next_id..batch_end {
             if i > next_id {
                 sql.push(',');
             }
-            // Each row carries a short identifier so total table size scales
-            // with `n` rather than being dominated by a single huge text.
-            sql.push_str(&format!("({i}, 'ep-{i}')"));
+            // `write!` into the existing buffer avoids the per-row
+            // String allocation that `format!(...)` followed by
+            // `push_str` would do.
+            write!(sql, "({i}, 'ep-{i}')").unwrap();
         }
         pool.execute(sql.as_str())
             .await
