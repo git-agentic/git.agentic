@@ -245,20 +245,32 @@ where
 /// shapes (`bigint`, `text`, `boolean`, `numeric`, `jsonb`). Arrays /
 /// nested objects bind as `jsonb` text.
 fn bind_json(args: &mut PgArguments, value: &Json) -> Result<()> {
+    // sqlx 0.8 changed `Arguments::add` to return
+    // `Result<(), BoxDynError>` so an encoder that exceeds Postgres'
+    // wire limit (or any other Encode failure) surfaces instead of
+    // silently truncating. Translate to MemoryError::Backend so the
+    // restore path's existing error chain carries it.
+    fn add<T>(args: &mut PgArguments, v: T) -> Result<()>
+    where
+        T: 'static + Send + sqlx::Encode<'static, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+    {
+        args.add(v)
+            .map_err(|e| Error::Backend(format!("binding argument: {e}")))
+    }
     match value {
-        Json::Null => args.add(Option::<&str>::None),
-        Json::Bool(b) => args.add(*b),
+        Json::Null => add(args, Option::<&str>::None)?,
+        Json::Bool(b) => add(args, *b)?,
         Json::Number(n) => {
             if let Some(i) = n.as_i64() {
-                args.add(i);
+                add(args, i)?;
             } else if let Some(f) = n.as_f64() {
-                args.add(f);
+                add(args, f)?;
             } else {
-                args.add(n.to_string());
+                add(args, n.to_string())?;
             }
         }
-        Json::String(s) => args.add(s.clone()),
-        other => args.add(sqlx::types::Json(other.clone())),
+        Json::String(s) => add(args, s.clone())?,
+        other => add(args, sqlx::types::Json(other.clone()))?,
     }
     Ok(())
 }
