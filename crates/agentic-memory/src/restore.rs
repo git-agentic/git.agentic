@@ -120,6 +120,19 @@ pub async fn restore_manifest<S: ObjectStore + ?Sized>(
 /// treated as `insert` — a future op added to the streamer side but
 /// not the restore side would otherwise be mis-replayed with no
 /// signal at all. Loud failure beats silent mis-restore.
+///
+/// **Exception — partial envelopes.** An object with neither `op`
+/// nor `row` falls through to the plain-row Insert path (older
+/// bootstrap segments wrote rows without the envelope wrapper).
+/// An object with EXACTLY ONE of the two keys also falls through:
+/// the streamer side always writes both, so a partial-envelope
+/// object is more plausibly a user-table row that happens to
+/// contain a column called `op` or `row`. Rejecting it would
+/// break valid bootstrap rows in user tables that use those names.
+/// If the streamer ever starts emitting partial envelopes (it
+/// shouldn't — both keys are required by construction), the right
+/// fix is to tighten the streamer side rather than to start
+/// rejecting plain rows here.
 fn peel_envelope(value: &Json) -> Result<(Op, &Json)> {
     if let Some(obj) = value.as_object() {
         if let (Some(op), Some(row)) = (obj.get("op"), obj.get("row")) {

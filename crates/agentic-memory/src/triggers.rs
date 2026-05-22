@@ -299,14 +299,16 @@ async fn drain_once(
     // it to the caller (`drain_to_completion` propagates with `?` to
     // `snapshot()`; the poller's loop logs and retries on the next
     // tick).
+    // Preserve the underlying `sqlx::Error` as the anyhow source so
+    // logs / error chains can show the exact decode/connection cause.
+    // Was: `.map_err(|e| Error::Backend(format!("...: {e}")))` which
+    // flattened to `String` and discarded `sqlx::Error`'s type.
     let schema_version: String = sqlx::query_scalar("SELECT agentic_schema_version()")
         .fetch_one(pool)
         .await
         .map_err(|e| {
-            Error::Backend(format!(
-                "drain: failed to fetch live schema_version via \
-                 agentic_schema_version(): {e}"
-            ))
+            anyhow::Error::new(e)
+                .context("drain: failed to fetch live schema_version via agentic_schema_version()")
         })?;
 
     // In `Strict` mode, walk every row in the batch FIRST and refuse
@@ -423,7 +425,8 @@ async fn drain_once(
                     change_log_id = id,
                     table = %table_name,
                     error = %e,
-                    "drain: failed to decode `row` JSONB; skipping (row dropped from change_log)"
+                    "drain: failed to decode `row` JSONB; skipping (will be dropped \
+                     by the bulk DELETE at end of this batch if drain completes)"
                 );
                 max_id = max_id.max(id);
                 processed += 1;
@@ -559,12 +562,20 @@ fn bare_name(s: &str) -> String {
 /// Build the two lookup maps the drain loop uses to resolve a
 /// trigger-emitted `table_name` to the streamer's head key.
 ///
-/// Both maps now hold the **configured** `TrackedTable.name` as the
+/// Both maps hold the **configured** `TrackedTable.name` as the
 /// VALUE — the streamer keys its `heads` map by that string, so the
 /// resolved key must match it exactly. `key_of` handles the
 /// exact-match case (configured form == what the trigger emitted);
 /// `bare_lookup` handles the cross-form case (configured `"episodes"`
 /// vs trigger `"public.episodes"` and vice versa).
+///
+/// Bare-name ambiguity is detected here: if two configured tables
+/// share a bare name (`schema_a.episodes` and `schema_b.episodes`),
+/// the bare-name fallback can't safely pick one. The colliding
+/// entry is dropped from `bare_lookup` and a `tracing::warn!` names
+/// both, so subsequent drain calls only resolve via exact match for
+/// either of the two — never silently misroute to whichever happens
+/// to win a `BTreeMap` overwrite.
 fn build_table_resolvers(
     tables: &[TrackedTable],
 ) -> (
@@ -575,10 +586,37 @@ fn build_table_resolvers(
         .iter()
         .map(|t| (t.name.clone(), t.name.clone()))
         .collect();
-    let bare_lookup: std::collections::BTreeMap<String, String> = tables
-        .iter()
-        .map(|t| (bare_name(&t.name), t.name.clone()))
-        .collect();
+
+    // First pass: count how many configured names share each bare
+    // form. Anything with count > 1 must NOT be reachable via the
+    // bare-name fallback — the resolver wouldn't know which schema's
+    // head to route the event to.
+    let mut bare_counts: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for t in tables {
+        bare_counts
+            .entry(bare_name(&t.name))
+            .or_default()
+            .push(t.name.clone());
+    }
+    let mut bare_lookup: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (bare, owners) in bare_counts {
+        if owners.len() == 1 {
+            bare_lookup.insert(bare, owners.into_iter().next().expect("len == 1"));
+        } else {
+            tracing::warn!(
+                bare = %bare,
+                owners = ?owners,
+                "build_table_resolvers: multiple TrackedTable entries share the bare name; \
+                 bare-name fallback disabled for this name — events from the trigger must \
+                 emit the fully-qualified configured form to route correctly"
+            );
+            // Intentionally do NOT insert into bare_lookup; the drain
+            // loop will treat ambiguous trigger emissions as untracked.
+        }
+    }
+
     (key_of, bare_lookup)
 }
 
@@ -599,5 +637,65 @@ mod tests {
     fn bare_name_handles_qualified_and_bare() {
         assert_eq!(bare_name("episodes"), "episodes");
         assert_eq!(bare_name("public.episodes"), "episodes");
+    }
+
+    fn tt(name: &str) -> TrackedTable {
+        TrackedTable {
+            name: name.into(),
+            pk: "id".into(),
+        }
+    }
+
+    #[test]
+    fn build_table_resolvers_canonical_keys() {
+        // VALUE of both maps must be the configured TrackedTable.name
+        // so the streamer's `heads` map (keyed by t.name) finds the
+        // head. Pre-fix `key_of`'s VALUE was bare_name(t.name) which
+        // routed schema-qualified configs to the wrong head.
+        let (key_of, bare_lookup) = build_table_resolvers(&[tt("public.episodes")]);
+        assert_eq!(
+            key_of.get("public.episodes"),
+            Some(&"public.episodes".to_string()),
+            "exact-match value must be the configured name (not the bare form)"
+        );
+        assert_eq!(
+            bare_lookup.get("episodes"),
+            Some(&"public.episodes".to_string()),
+            "bare-name fallback must resolve to the configured name"
+        );
+    }
+
+    #[test]
+    fn build_table_resolvers_drops_ambiguous_bare_names() {
+        // Two configured tables sharing a bare name (across schemas)
+        // must NOT be resolvable via the bare-name fallback — there's
+        // no way to know which schema's head to route to. Exact match
+        // still works for both.
+        let (key_of, bare_lookup) =
+            build_table_resolvers(&[tt("schema_a.episodes"), tt("schema_b.episodes")]);
+        assert!(
+            key_of.contains_key("schema_a.episodes") && key_of.contains_key("schema_b.episodes"),
+            "exact match remains unaffected by bare-name ambiguity"
+        );
+        assert!(
+            !bare_lookup.contains_key("episodes"),
+            "bare 'episodes' must NOT resolve when two schemas claim it; \
+             pre-fix one would silently overwrite the other"
+        );
+    }
+
+    #[test]
+    fn build_table_resolvers_keeps_unambiguous_bare_names() {
+        // Single bare-name owner: bare-name fallback works as before.
+        let (_, bare_lookup) =
+            build_table_resolvers(&[tt("public.episodes"), tt("public.summaries")]);
+        assert_eq!(
+            bare_lookup.get("episodes"),
+            Some(&"public.episodes".to_string())
+        );
+        assert_eq!(
+            bare_lookup.get("summaries"),
+            Some(&"public.summaries".to_string())
+        );
     }
 }
