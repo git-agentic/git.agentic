@@ -358,3 +358,171 @@ async fn ac1_writes_during_restore_are_reverted() {
 
     drop_schema(&admin_pool, &schema).await;
 }
+
+// ── §9 performance smoke ──────────────────────────────────────────────────────
+//
+// Sprint item A3 / docs/architecture/benchmarks.md §9 targets: this test
+// captures snapshot / restore / diff timings at parameterised row count.
+// `#[ignore]` so default `cargo test` skips it; run explicitly:
+//
+//   docker compose -f examples/langgraph-rollback/docker-compose.yml up -d
+//   docker exec agentic-demo-pg psql -U agentic -d agentic \
+//       -c "CREATE EXTENSION IF NOT EXISTS vector"
+//   DATABASE_URL=postgres://agentic:agentic@localhost:54322/agentic \
+//   BENCH_ROWS=1000000 \
+//       cargo test -p agentic-memory --test integration -- \
+//       --ignored --test-threads=1 --nocapture pg_snapshot_perf_smoke
+//
+// Defaults `BENCH_ROWS=10000` so first-time runs finish in seconds. Larger
+// values trade time for fidelity to the §9-shaped 1M-row claim. Numbers
+// print to stderr (`eprintln!`) in a paste-into-markdown shape — the
+// operator copies them into `docs/architecture/benchmarks.md`.
+
+fn bench_rows() -> u64 {
+    std::env::var("BENCH_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Bulk-INSERT `n` rows into the schema's `episodes` table in a single
+/// statement. Postgres' single-statement INSERT with many VALUES is far
+/// faster than N round-trip statements; for 1M rows on a laptop this is
+/// the difference between "minutes" and "tens of seconds".
+async fn bulk_insert_episodes(pool: &PgPool, schema: &str, n: u64) {
+    // Cap the statement size to avoid hitting Postgres' max query length
+    // (~1GB but practical limit is much lower). 50k rows per batch keeps
+    // each statement well under any limit and gives the planner room.
+    const BATCH: u64 = 50_000;
+    let mut next_id: u64 = 100; // start past the 5 baseline rows make_schema seeds
+    let end = next_id + n;
+    while next_id < end {
+        let batch_end = (next_id + BATCH).min(end);
+        let mut sql = format!("INSERT INTO \"{schema}\".episodes (id, text) VALUES ");
+        for i in next_id..batch_end {
+            if i > next_id {
+                sql.push(',');
+            }
+            // Each row carries a short identifier so total table size scales
+            // with `n` rather than being dominated by a single huge text.
+            sql.push_str(&format!("({i}, 'ep-{i}')"));
+        }
+        pool.execute(sql.as_str())
+            .await
+            .expect("bulk INSERT failed");
+        next_id = batch_end;
+    }
+}
+
+/// Pretty-print a duration so the eprintln! output is easy to read in a
+/// terminal AND mechanically extractable. Trailing whitespace matters:
+/// numbers are right-aligned to a 12-char column.
+fn fmt_dur(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms >= 1000.0 {
+        format!("{:>10.3} s", ms / 1000.0)
+    } else if ms >= 1.0 {
+        format!("{:>9.2} ms", ms)
+    } else {
+        format!("{:>9.1} µs", ms * 1000.0)
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_snapshot_perf_smoke() {
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping perf smoke");
+            return;
+        }
+    };
+    let n = bench_rows();
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    // Hand-seed N rows on top of the 5 baseline make_schema inserts so
+    // the snapshot runs against a realistically-sized table.
+    let seed_t0 = std::time::Instant::now();
+    bulk_insert_episodes(&admin_pool, &schema, n).await;
+    let seed_elapsed = seed_t0.elapsed();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // ── snapshot ──────────────────────────────────────────────────────
+    // §9 target: < 2 s on 1M-row pgvector.
+    let t0 = std::time::Instant::now();
+    let handle_a = adapter.snapshot().await.unwrap();
+    let snapshot_elapsed = t0.elapsed();
+    let manifest_total: u64 = handle_a.manifest.entries.iter().map(|e| e.row_count).sum();
+
+    // ── restore (no-op: snapshot back into the same state) ────────────
+    // §9 target: < 5 s on 1M-row pgvector + 10 commits. This run is the
+    // single-snapshot lower bound; multi-commit rollback isn't modelled
+    // here because the perf cost of restore is dominated by the
+    // TRUNCATE + INSERT replay, which is what we measure.
+    let t0 = std::time::Instant::now();
+    adapter.restore(&handle_a).await.unwrap();
+    let restore_elapsed = t0.elapsed();
+
+    // ── second snapshot for diff ──────────────────────────────────────
+    let handle_b = adapter.snapshot().await.unwrap();
+
+    // ── diff ──────────────────────────────────────────────────────────
+    // §9 target: < 1 s on 1M-row pgvector. The diff is a content-addressed
+    // comparison of two SegmentManifests, so it doesn't touch Postgres at
+    // all — measured for completeness.
+    let t0 = std::time::Instant::now();
+    let manifest_a_hash = handle_a.manifest.hash();
+    let manifest_b_hash = handle_b.manifest.hash();
+    let identical = manifest_a_hash == manifest_b_hash;
+    let diff_elapsed = t0.elapsed();
+    assert!(
+        identical,
+        "snapshot→restore→snapshot must yield identical manifest hashes \
+         (no schema or row mutations in between); got {manifest_a_hash} vs {manifest_b_hash}"
+    );
+
+    // ── report (paste-into-markdown format) ───────────────────────────
+    eprintln!();
+    eprintln!("# pg_snapshot_perf_smoke (BENCH_ROWS={n}, manifest_total={manifest_total})");
+    eprintln!();
+    eprintln!("| Operation | Measured     | §9 target           |");
+    eprintln!("|---|---|---|");
+    eprintln!(
+        "| bulk seed (Postgres INSERTs, {n} rows)       | {} | n/a — setup cost            |",
+        fmt_dur(seed_elapsed)
+    );
+    eprintln!(
+        "| `snapshot()`                                   | {} | < 2 s @ 1M-row pgvector     |",
+        fmt_dur(snapshot_elapsed)
+    );
+    eprintln!(
+        "| `restore()` (no-op replay)                     | {} | < 5 s @ 1M-row + 10 commits |",
+        fmt_dur(restore_elapsed)
+    );
+    eprintln!(
+        "| `diff` (manifest hash compare)                 | {} | < 1 s @ 1M-row pgvector     |",
+        fmt_dur(diff_elapsed)
+    );
+    eprintln!();
+    eprintln!("Manifest A hash: {manifest_a_hash}");
+    eprintln!("Manifest B hash: {manifest_b_hash}");
+    eprintln!();
+
+    drop_schema(&admin_pool, &schema).await;
+}
