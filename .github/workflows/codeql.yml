@@ -22,6 +22,12 @@ jobs:
         language: [rust, python]
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        if: ${{ matrix.language == 'rust' }}
+      - uses: actions/setup-python@v5
+        if: ${{ matrix.language == 'python' }}
+        with:
+          python-version: "3.12"
       - name: initialize codeql
         uses: github/codeql-action/init@v3
         with:
