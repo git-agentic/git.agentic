@@ -187,8 +187,16 @@ pub fn spawn_poller(
             // restore window reaches the streamer.
             let _permit = pause_lock_for_task.lock().await;
             match drain_once(&pool, &streamer, &key_of, &bare_lookup).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(drained = n, "agentic_change_log drained"),
+                Ok(DrainOutcome { processed: 0, .. }) => {}
+                Ok(DrainOutcome {
+                    processed,
+                    forwarded,
+                }) => tracing::info!(
+                    processed,
+                    forwarded,
+                    skipped = processed - forwarded,
+                    "agentic_change_log drained"
+                ),
                 Err(e) => tracing::warn!(error = %e, "change-log drain failed"),
             }
         }
@@ -198,8 +206,21 @@ pub fn spawn_poller(
 }
 
 /// Synchronously drain every row in `agentic_change_log`, forwarding
-/// each to the streamer. Used by `snapshot()` as a fence so the
-/// streamer sees every committed change before sealing.
+/// each to the streamer. Used by `snapshot()` as a strict correctness
+/// fence: the streamer must see every committed change before sealing.
+///
+/// Strict semantics — if `drain_once` skipped any rows (decode failure,
+/// unknown op, untracked table), this function returns `Err` rather
+/// than `Ok`. The skip path is correct for the poller (loud log + don't
+/// poison the loop), but it would produce a snapshot manifest that
+/// doesn't reflect actual DB state — the user's row is still in the
+/// table, but our streamer never saw it. Refusing to snapshot in that
+/// case is the only honest contract.
+///
+/// Operator recovery from a skip-blocked snapshot: inspect the
+/// surrounding warn!/error! logs to identify the offending row(s),
+/// fix the underlying invariant (restore CHECK constraint, add
+/// missing TrackedTable, etc.), retry the snapshot.
 pub async fn drain_to_completion(
     pool: &PgPool,
     streamer: &StreamerHandle,
@@ -213,15 +234,38 @@ pub async fn drain_to_completion(
         .iter()
         .map(|t| (bare_name(&t.name), t.name.clone()))
         .collect();
-    let mut total: u64 = 0;
+    let mut total_forwarded: u64 = 0;
+    let mut total_skipped: u64 = 0;
     loop {
-        let n = drain_once(pool, streamer, &key_of, &bare_lookup).await?;
-        if n == 0 {
+        let DrainOutcome {
+            processed,
+            forwarded,
+        } = drain_once(pool, streamer, &key_of, &bare_lookup).await?;
+        if processed == 0 {
             break;
         }
-        total += n;
+        total_forwarded += forwarded;
+        total_skipped += processed - forwarded;
     }
-    Ok(total)
+    if total_skipped > 0 {
+        return Err(Error::Backend(format!(
+            "drain (snapshot fence): {total_skipped} change_log row(s) could not be forwarded \
+             to the streamer; a snapshot taken now would silently miss those changes. \
+             See the error!/warn! logs above to identify the offending rows; fix the \
+             underlying invariant (CHECK constraint, TrackedTable config, etc.) and retry."
+        )));
+    }
+    Ok(total_forwarded)
+}
+
+/// Per-batch drain result. `processed` counts every row removed from
+/// `agentic_change_log` (forwarded + skipped); `forwarded` counts only
+/// the rows actually sent to the streamer as `ChangeEvent`s. The
+/// snapshot fence treats `processed - forwarded > 0` as an error;
+/// the poller treats it as a logged-and-recovered condition.
+struct DrainOutcome {
+    processed: u64,
+    forwarded: u64,
 }
 
 async fn drain_once(
@@ -229,7 +273,7 @@ async fn drain_once(
     streamer: &StreamerHandle,
     key_of: &std::collections::BTreeMap<String, String>,
     bare_lookup: &std::collections::BTreeMap<String, String>,
-) -> Result<u64> {
+) -> Result<DrainOutcome> {
     let rows = sqlx::query(
         "SELECT id, table_name, op, row \
          FROM public.agentic_change_log \
@@ -240,7 +284,10 @@ async fn drain_once(
     .fetch_all(pool)
     .await?;
     if rows.is_empty() {
-        return Ok(0);
+        return Ok(DrainOutcome {
+            processed: 0,
+            forwarded: 0,
+        });
     }
     // Any error here — function absent (helper not installed),
     // transient DB failure, etc. — propagates instead of silently
@@ -417,11 +464,15 @@ async fn drain_once(
             "drain batch: some rows were skipped (see warn/error logs above)"
         );
     }
-    // Return `processed`, not `forwarded`. `drain_to_completion`
-    // terminates on `n == 0` — if we returned `forwarded`, a batch
-    // of only-skipped rows would falsely terminate the drain even
-    // though more tracked rows are still in the log.
-    Ok(processed)
+    // `processed` (not `forwarded`) drives `drain_to_completion`'s
+    // termination — a batch of only-skipped rows must NOT falsely
+    // terminate the loop while more tracked rows are still in the
+    // log. `forwarded` is reported separately so the snapshot fence
+    // can detect skips and refuse to seal an incomplete snapshot.
+    Ok(DrainOutcome {
+        processed,
+        forwarded,
+    })
 }
 
 fn validate_identifier(s: &str) -> Result<()> {
