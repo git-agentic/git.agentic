@@ -112,7 +112,7 @@ pip install -e ".[langgraph,dev]"
 pytest
 ```
 
-The broken-prompt walkthrough lives at [`examples/langgraph-rollback/`](examples/langgraph-rollback/). [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) starts Postgres+pgvector via the local `docker-compose.yml`, builds `agenticd` and the Python demo agent from the workspace, then drives the commit → break → rollback cycle end-to-end. `agenticd` and the agent run locally, not in containers.
+The broken-prompt walkthrough lives at [`examples/langgraph-rollback/`](examples/langgraph-rollback/). [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) starts Postgres+pgvector via the local `docker-compose.yml`, `cargo build`s `agenticd` + `agentic` from the workspace, then drives the commit → break → rollback cycle end-to-end through the Python LangGraph agent. The agent itself runs locally via `python agent.py` (invoked by `scripts/ask.sh`); follow the venv + pip-install step in the demo's own [`README`](examples/langgraph-rollback/README.md) before running the script. `agenticd` and the agent are both local processes, not containers.
 
 ## Design partners
 
