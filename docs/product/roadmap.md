@@ -1,13 +1,13 @@
 # 12-Week MVP Roadmap
 
 **Status:** Draft v0.1
-**Last updated:** 2026-05-21
-**Target ship:** 2026-05-26 (Tuesday) with the repo going public — pulled forward from the originally-planned 2026-08-11.
+**Last updated:** 2026-05-22
+**Public release:** 2026-05-22 — pulled in from the planned 2026-05-26, which itself was pulled forward from the originally-planned 2026-08-11.
 **Design partners:** moved post-launch (was roadmap Week 12). Full v1.0 scope preserved.
 
 This roadmap is organized around a single criterion: **at the end of each week, what works that didn't work before?** No invisible weeks. Each week ends with a checkpoint that is either visibly broken or visibly working.
 
-> **Schedule change (2026-05-21).** With weeks 1–11 already landed and the broken-prompt demo working end-to-end, the public release is going out 2026-05-26 alongside the v1.0 tag. Design-partner onboarding (originally Week 12) is sequenced after the public release rather than gating it. The 12-week narrative below is preserved as the historical record of how v1.0 was built; the "Week 12" section now describes post-launch work.
+> **Schedule change (2026-05-22).** With weeks 1–11 already landed and the broken-prompt demo working end-to-end, the public release went out 2026-05-22 — four days ahead of the planned 2026-05-26 ship target as the hardening sprint closed faster than expected. Design-partner onboarding (originally Week 12) is sequenced after the public release rather than gating it. The 12-week narrative below is preserved as the historical record of how v1.0 was built; the "Week 12" section now describes post-launch work.
 
 ## Phase guideposts
 
@@ -184,7 +184,7 @@ Touch points across the existing weeks:
 
 *Status, 2026-05-20:* the API-contract bar is met against **both** fake-gcs and real GCS — `crates/agentic-core/tests/gcs_integration.rs` runs green against `fsouza/fake-gcs-server` in the `gcs` CI job (PR #20), and the same four tests have been run once against a real GCS bucket in `newcrm-493107` with bearer auth from `gcloud auth print-access-token` and all four passed (bucket + token ephemeral; teardown verified). **Production-readiness validation** — concurrent writers (multiple in-flight commits against the same bucket, per the ADR-0002 §3 2PC staging order), partial-upload failure injection (verify the 2PC boundary holds when GCS returns 5xx mid-stream), service-account auth (instead of user-account bearer), and large-blob streaming — is explicitly **not** gated by this kill-criterion. Those land as separate hardening work in v1.0 → v1.1 with their own milestones; see `docs/product/sprint-2026-05-20.md` for the immediate follow-up framing.
 
-**Negative slack on this track.** Atomic in v1.0 means the plan no longer has zero slack — it has *negative* slack on the Executor track relative to the original 12-week budget. Closing the gap requires one of: additional engineering capacity dedicated to the Executor workstream, cutting another piece of MVP scope, or accepting that the ship date is at higher risk than ADR-0001 assumed. With the ship now 2026-05-26 (pulled forward from 2026-08-11), the Executor sidecar work that hasn't already landed is the most exposed item; treat any Executor-track slip as a candidate for the documented ADR-0003 escape hatch rather than a ship-date slip. Surface this to design partners up front; do not pretend the plan is unchanged.
+**Negative slack on this track.** Atomic in v1.0 means the plan no longer has zero slack — it has *negative* slack on the Executor track relative to the original 12-week budget. Closing the gap requires one of: additional engineering capacity dedicated to the Executor workstream, cutting another piece of MVP scope, or accepting that the ship date is at higher risk than ADR-0001 assumed. With the ship now 2026-05-22 (pulled forward from 2026-08-11), the Executor sidecar work that hasn't already landed is the most exposed item; treat any Executor-track slip as a candidate for the documented ADR-0003 escape hatch rather than a ship-date slip. Surface this to design partners up front; do not pretend the plan is unchanged.
 
 ## Slip budget
 
@@ -192,7 +192,7 @@ The plan has zero slack. Slip will happen. Slip strategy:
 
 1. **Week 5 (atomic snapshot) is the most likely slip.** If it slips, push weeks 6–7 by the same amount; do not skip them.
 2. **Week 10 (SDK + LangGraph) cannot slip past week 11.** If we're behind by week 9, drop one diff feature, not the LangGraph integration.
-3. **Post-launch design partners must land even if MVP features are reduced.** Three users on a smaller MVP is better than zero users on a perfect MVP. (Originally a Week 12 gate; with the 2026-05-26 ship, partners come in the eight weeks after public release.)
+3. **Post-launch design partners must land even if MVP features are reduced.** Three users on a smaller MVP is better than zero users on a perfect MVP. (Originally a Week 12 gate; with the 2026-05-22 ship, partners come in the eight weeks after public release.)
 4. **The Executor atomic-integration track (ADR-0003 Decision 2 + ADR-0004) is the highest slip risk in the plan.** If the GCS-backed `ObjectStore` + sidecar work cannot land with API-contract integration tests passing by **end of week 8** (see the §"Executor integration workstream" escape-hatch paragraph for what "passing" means here — roundtrip contract, NOT production-scale concurrent / failure-injection coverage), revert to the originally-drafted manifest-export shape and defer atomic Executor to v1.1. Do not let this track compromise the broken-prompt demo.
 
 ## Kill criteria
@@ -201,7 +201,7 @@ If at the **week 6 checkpoint** we cannot produce a commit object containing all
 
 If at the **week 11 checkpoint** the demo takes more than 15 minutes to set up from `git clone`, design partners will not adopt. We stop and fix the setup story before week 12.
 
-If at **eight weeks post-launch (2026-07-21)** zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope. (Originally tied to Week 12; with the 2026-05-26 ship, the kill-criterion clock starts at the public release.)
+If at **eight weeks post-launch (2026-07-21)** zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope. (Originally tied to Week 12; with the 2026-05-22 ship, the kill-criterion clock starts at the public release.)
 
 ## Out of scope for the 12 weeks (will be asked about)
 
@@ -239,7 +239,7 @@ Detailed plan in [`docs/product/v1.1-plan.md`](./v1.1-plan.md). Governing ADRs: 
 ### Timeline shape (12-week budget, same cadence as v1.0)
 
 ```
-2026-05-26   v1.0 ships (broken-prompt demo, public repo release; design partners post-launch)
+2026-05-22   v1.0 ships (broken-prompt demo, public repo release; design partners post-launch)
 2026-05-27   v1.1 opens. No celebratory pause.
 2026-06-09   W1.1.1, W1.1.2, W1.2.1, W1.2.2 done in parallel.
 2026-06-30   W1.2.3–W1.2.6 (promote + ephemeral CLI + Executor rehome). W1.3.1 (blob GC).
