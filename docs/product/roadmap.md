@@ -201,7 +201,7 @@ If at the **week 6 checkpoint** we cannot produce a commit object containing all
 
 If at the **week 11 checkpoint** the demo takes more than 15 minutes to set up from `git clone`, design partners will not adopt. We stop and fix the setup story before week 12.
 
-If at **eight weeks post-launch (2026-07-21)** zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope. (Originally tied to Week 12; with the 2026-05-22 ship, the kill-criterion clock starts at the public release.)
+If at **eight weeks post-launch (2026-07-17)** zero design partners are using the tool weekly in their own work, the wedge does not have product-market pull and we abandon the current scope. (Originally tied to Week 12; with the 2026-05-22 ship, the kill-criterion clock starts at the public release — eight weeks past 2026-05-22 is 2026-07-17.)
 
 ## Out of scope for the 12 weeks (will be asked about)
 

@@ -80,12 +80,12 @@ If a feature isn't in the demo path, it doesn't ship in MVP.
 
 ## What success looks like
 
-**At ship (2026-05-26):**
+**At ship (2026-05-22):**
 
 - **Technical:** The demo runs reliably on a fresh laptop in <5 minutes from `git clone`. Snapshot < 2s on a 1M-row pgvector table. Rollback < 5s end-to-end on the same.
 - **Narrative:** A blog post / video showing the broken-prompt demo that explains the wedge clearly enough that a hostile-but-fair YC partner gets it in under 90 seconds.
 
-**At eight weeks post-launch (2026-07-21):**
+**At eight weeks post-launch (2026-07-17):**
 
 - **Product:** Three design partners have run `agentic rollback` against their own staging environments and reported at least one "would have saved hours" moment.
 - **Kill criteria:** If after eight weeks zero design partners are using it weekly, we abandon the wedge and reassess. If two or more are, we raise.
