@@ -116,19 +116,38 @@ pub async fn restore_manifest<S: ObjectStore + ?Sized>(
 
 /// Strip the streamer's `{op, row}` envelope. Older bootstrap segments
 /// used plain row objects — those still work and default to `insert`.
-fn peel_envelope(value: &Json) -> (Op, &Json) {
+///
+/// Unknown op strings (anything other than "insert"/"update"/"delete")
+/// error rather than silently being treated as `insert` — a future op
+/// added to the streamer side but not the restore side would otherwise
+/// be mis-replayed with no signal at all. Loud failure beats silent
+/// mis-restore.
+fn peel_envelope(value: &Json) -> Result<(Op, &Json)> {
     if let Some(obj) = value.as_object() {
         if let (Some(op), Some(row)) = (obj.get("op"), obj.get("row")) {
             let op = match op.as_str() {
                 Some("insert") => Op::Insert,
                 Some("update") => Op::Update,
                 Some("delete") => Op::Delete,
-                _ => Op::Insert,
+                Some(other) => {
+                    return Err(Error::Backend(format!(
+                        "unknown op {other:?} in segment envelope; \
+                         restore can't safely replay this row. \
+                         The streamer side likely emits a new op type \
+                         that restore hasn't been taught to handle yet."
+                    )))
+                }
+                None => {
+                    return Err(Error::Backend(format!(
+                        "segment envelope has a non-string `op` field: {op}"
+                    )))
+                }
             };
-            return (op, row);
+            return Ok((op, row));
         }
     }
-    (Op::Insert, value)
+    // Plain row (older bootstrap segments) — treat as insert by convention.
+    Ok((Op::Insert, value))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +166,7 @@ async fn apply_envelope<'c, E>(
 where
     E: Executor<'c, Database = Postgres>,
 {
-    let (op, row) = peel_envelope(envelope);
+    let (op, row) = peel_envelope(envelope)?;
     match op {
         Op::Insert | Op::Update => upsert_row(executor, qualified, pk_col, row).await,
         Op::Delete => delete_row(executor, qualified, pk_col, row).await,
@@ -215,11 +234,29 @@ async fn delete_row<'c, E>(executor: E, qualified: &str, pk_col: &str, row: &Jso
 where
     E: Executor<'c, Database = Postgres>,
 {
-    let pk_value = row
-        .as_object()
-        .and_then(|o| o.get(pk_col))
-        .cloned()
-        .unwrap_or(Json::Null);
+    // DELETE … WHERE pk = NULL silently matches zero rows in SQL, so a
+    // delete envelope with a missing or NULL PK would no-op without
+    // any signal — the row stays in the user's table even though the
+    // manifest said it should be gone. Fail loudly instead.
+    let obj = row.as_object().ok_or_else(|| {
+        Error::Backend(format!("delete envelope row is not a JSON object: {row}"))
+    })?;
+    let pk_value = match obj.get(pk_col) {
+        Some(v) if !v.is_null() => v.clone(),
+        Some(_) => {
+            return Err(Error::Backend(format!(
+                "delete envelope for {qualified}: PK column {pk_col:?} is NULL; \
+                 DELETE … WHERE pk = NULL would silently match zero rows. \
+                 Refusing to no-op a delete."
+            )))
+        }
+        None => {
+            return Err(Error::Backend(format!(
+                "delete envelope for {qualified}: PK column {pk_col:?} is absent \
+                 from the envelope row; can't issue the DELETE."
+            )))
+        }
+    };
     validate_identifier(pk_col)?;
     let mut args = PgArguments::default();
     bind_json(&mut args, &pk_value)?;
@@ -282,5 +319,57 @@ fn quote_qualified(s: &str) -> String {
         format!("\"{schema}\".\"{table}\"")
     } else {
         format!("\"{s}\"")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn peel_envelope_decodes_known_ops() {
+        let env = json!({"op": "insert", "row": {"id": 1}});
+        let (op, _row) = peel_envelope(&env).unwrap();
+        assert_eq!(op, Op::Insert);
+
+        let env = json!({"op": "update", "row": {"id": 2}});
+        let (op, _row) = peel_envelope(&env).unwrap();
+        assert_eq!(op, Op::Update);
+
+        let env = json!({"op": "delete", "row": {"id": 3}});
+        let (op, _row) = peel_envelope(&env).unwrap();
+        assert_eq!(op, Op::Delete);
+    }
+
+    #[test]
+    fn peel_envelope_treats_plain_row_as_insert() {
+        // Older bootstrap segments stored rows without the envelope.
+        let plain = json!({"id": 1, "text": "hello"});
+        let (op, row) = peel_envelope(&plain).unwrap();
+        assert_eq!(op, Op::Insert);
+        assert_eq!(row, &plain);
+    }
+
+    #[test]
+    fn peel_envelope_rejects_unknown_op() {
+        let env = json!({"op": "frobnicate", "row": {"id": 1}});
+        let err = peel_envelope(&env).expect_err("unknown op must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("frobnicate") && msg.contains("unknown op"),
+            "must name the unknown op explicitly; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn peel_envelope_rejects_non_string_op() {
+        let env = json!({"op": 42, "row": {"id": 1}});
+        let err = peel_envelope(&env).expect_err("non-string op must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-string"),
+            "must say 'non-string'; got: {msg}"
+        );
     }
 }

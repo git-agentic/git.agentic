@@ -242,10 +242,21 @@ async fn drain_once(
     if rows.is_empty() {
         return Ok(0);
     }
+    // Was: `.unwrap_or_else(|_| "0.0.0".to_string())`. A drain-time
+    // failure to fetch the live schema version (transient DB error,
+    // helper-function dropped, etc.) silently stamped every event in
+    // the batch with `"0.0.0"`. The operator then saw a misleading
+    // SchemaMismatch at restore with no signal that the real cause
+    // was a drain-time connectivity blip. Propagate the error.
     let schema_version: String = sqlx::query_scalar("SELECT agentic_schema_version()")
         .fetch_one(pool)
         .await
-        .unwrap_or_else(|_| "0.0.0".to_string());
+        .map_err(|e| {
+            Error::Backend(format!(
+                "drain: failed to fetch live schema_version via \
+                 agentic_schema_version(): {e}"
+            ))
+        })?;
 
     let mut max_id: i64 = 0;
     let mut count: u64 = 0;
@@ -253,9 +264,18 @@ async fn drain_once(
         let id: i64 = row.try_get("id")?;
         let table_name: String = row.try_get("table_name")?;
         let op_str: String = row.try_get("op")?;
+        // Was: `.unwrap_or(Json::Null)`. A JSONB decode failure on the
+        // change_log row payload (wire mismatch, malformed JSON, type
+        // mismatch) silently forwarded a `Json::Null` row into the
+        // streamer, which then anchored a segment on a null payload.
+        // Propagate; the drain loop's caller logs + retries.
         let row_json: Json = row
             .try_get::<sqlx::types::JsonValue, _>("row")
-            .unwrap_or(Json::Null);
+            .map_err(|e| {
+                Error::Backend(format!(
+                    "drain: failed to decode `row` JSONB on change_log id={id}: {e}"
+                ))
+            })?;
 
         let key = key_of
             .get(&table_name)

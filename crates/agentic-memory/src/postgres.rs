@@ -316,7 +316,7 @@ impl PostgresAdapter {
         let mut envelope_buf: Vec<u8> = Vec::with_capacity(256);
 
         for row in &rows {
-            let row_json = row_to_json(row)?;
+            let row_json = row_to_json(row, &table.name)?;
             // The PK column must be present and non-NULL — pk_lo/pk_hi
             // anchor every segment's row range and a NULL PK would
             // corrupt the manifest's range metadata. A missing column
@@ -763,18 +763,21 @@ fn quote_qualified(s: &str) -> String {
 /// store with no signal to the operator. The pre-revisit behaviour
 /// (`.unwrap_or(Json::Null)` on every arm) was flagged in PR #88's
 /// review as a data-corruption-class bug.
-fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
+fn row_to_json(row: &sqlx::postgres::PgRow, table: &str) -> Result<Json> {
     use sqlx::postgres::PgRow;
     use sqlx::types::JsonValue;
     use sqlx::{Column, Row, TypeInfo};
 
-    fn decode_err(col: &str, ty: &str, e: sqlx::Error) -> Error {
+    // Table name is carried into the error so multi-table schemas can be
+    // diagnosed without grepping logs to figure out which `episodes` or
+    // `messages` table the decode failure came from.
+    fn decode_err(table: &str, col: &str, ty: &str, e: sqlx::Error) -> Error {
         Error::Backend(format!(
-            "column {col:?} (Postgres type {ty}) failed to decode: {e}"
+            "table {table:?} column {col:?} (Postgres type {ty}) failed to decode: {e}"
         ))
     }
 
-    fn json_for_column(row: &PgRow, idx: usize, col: &str, ty: &str) -> Result<Json> {
+    fn json_for_column(row: &PgRow, idx: usize, table: &str, col: &str, ty: &str) -> Result<Json> {
         // NULL short-circuit. `try_get::<Option<_>, _>` distinguishes the
         // "value is NULL" case (Ok(None)) from a decode failure
         // (Err(_)). Only Ok(None) is treated as NULL; an actual decode
@@ -793,22 +796,24 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
             "INT8" | "BIGINT" => row
                 .try_get::<i64, _>(idx)
                 .map(|i| Json::Number(i.into()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "INT4" | "INT" | "INTEGER" => row
                 .try_get::<i32, _>(idx)
                 .map(|i| Json::Number(i64::from(i).into()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "INT2" | "SMALLINT" => row
                 .try_get::<i16, _>(idx)
                 .map(|i| Json::Number(i64::from(i).into()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "OID" => row
                 .try_get::<sqlx::postgres::types::Oid, _>(idx)
                 .map(|o| Json::Number(i64::from(o.0).into()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── floats — JSON can't represent NaN/±Inf, error out ────
             "FLOAT4" | "REAL" => {
-                let raw: f32 = row.try_get(idx).map_err(|e| decode_err(col, ty, e))?;
+                let raw: f32 = row
+                    .try_get(idx)
+                    .map_err(|e| decode_err(table, col, ty, e))?;
                 serde_json::Number::from_f64(f64::from(raw))
                     .map(Json::Number)
                     .ok_or_else(|| {
@@ -819,7 +824,9 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
                     })
             }
             "FLOAT8" | "DOUBLE PRECISION" => {
-                let raw: f64 = row.try_get(idx).map_err(|e| decode_err(col, ty, e))?;
+                let raw: f64 = row
+                    .try_get(idx)
+                    .map_err(|e| decode_err(table, col, ty, e))?;
                 serde_json::Number::from_f64(raw)
                     .map(Json::Number)
                     .ok_or_else(|| {
@@ -833,39 +840,39 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
             "BOOL" | "BOOLEAN" => row
                 .try_get::<bool, _>(idx)
                 .map(Json::Bool)
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── nested JSON pass-through ────────────────────────────
             "JSON" | "JSONB" => row
                 .try_get::<JsonValue, _>(idx)
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── UUID via sqlx::types::Uuid; stringify ────────────────
             "UUID" => row
                 .try_get::<sqlx::types::Uuid, _>(idx)
                 .map(|u| Json::String(u.to_string()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── chrono date/time types; stringify ───────────────────
             "TIMESTAMPTZ" => row
                 .try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(idx)
                 .map(|t| Json::String(t.to_rfc3339()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "TIMESTAMP" => row
                 .try_get::<sqlx::types::chrono::NaiveDateTime, _>(idx)
                 .map(|t| Json::String(t.to_string()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "DATE" => row
                 .try_get::<sqlx::types::chrono::NaiveDate, _>(idx)
                 .map(|d| Json::String(d.to_string()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             "TIME" => row
                 .try_get::<sqlx::types::chrono::NaiveTime, _>(idx)
                 .map(|t| Json::String(t.to_string()))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── BYTEA — hex-encode (Postgres' bytea_output = hex
             // convention) so JSON can carry it round-trippably ──────
             "BYTEA" => row
                 .try_get::<Vec<u8>, _>(idx)
                 .map(|b| Json::String(format!("\\x{}", hex_encode(&b))))
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
             // ── text family — TEXT/VARCHAR/BPCHAR/NAME/CHAR/CITEXT —
             // and any unrecognised type: try String. NUMERIC falls
             // here today; without sqlx's `bigdecimal` or `rust_decimal`
@@ -874,7 +881,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
             _ => row
                 .try_get::<String, _>(idx)
                 .map(Json::String)
-                .map_err(|e| decode_err(col, ty, e)),
+                .map_err(|e| decode_err(table, col, ty, e)),
         }
     }
 
@@ -882,7 +889,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow) -> Result<Json> {
     for (idx, col) in row.columns().iter().enumerate() {
         let name = col.name().to_string();
         let ty = col.type_info().name().to_uppercase();
-        let value = json_for_column(row, idx, &name, &ty)?;
+        let value = json_for_column(row, idx, table, &name, &ty)?;
         map.insert(name, value);
     }
     Ok(Json::Object(map))
