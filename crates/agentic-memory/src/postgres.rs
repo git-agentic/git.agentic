@@ -296,15 +296,20 @@ impl PostgresAdapter {
             let row_json = row_to_json(row);
             let pk_value = row_json.get(&table.pk).cloned().unwrap_or(Json::Null);
 
-            if !have_lo {
+            let first_row_of_segment = !have_lo;
+            if first_row_of_segment {
                 current.pk_lo = pk_value.clone();
                 have_lo = true;
-                // Rebaseline now that `pk_lo` is set — captures the PK
-                // bytes in the header that the blank-segment baseline
-                // missed. One re-serialise per segment, not per row.
-                running_bytes = current.canonical_size();
             }
             current.pk_hi = pk_value.clone();
+            if first_row_of_segment {
+                // Rebaseline now that BOTH `pk_lo` and `pk_hi` carry
+                // their real values (blank_segment initialised both to
+                // null, so the size delta from null → first PK value
+                // applies on both ends of the first row). One
+                // re-serialise per segment, not per row.
+                running_bytes = current.canonical_size();
+            }
             // Wrap in the streamer's envelope shape so the restore code
             // path is uniform across bootstrap and delta segments.
             let envelope = serde_json::json!({"op": "insert", "row": row_json});
