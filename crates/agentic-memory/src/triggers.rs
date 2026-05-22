@@ -273,16 +273,54 @@ async fn drain_once(
     let mut processed: u64 = 0;
     let mut forwarded: u64 = 0;
     for row in &rows {
+        // `id` is the inescapable case: without it `max_id` can't
+        // advance, so the same skip-and-continue pattern below isn't
+        // available. A failure here means the change_log table's
+        // schema has been damaged in a way that we genuinely can't
+        // recover from row-by-row; propagate and let the poller
+        // surface it on its next tick.
         let id: i64 = row.try_get("id")?;
-        let table_name: String = row.try_get("table_name")?;
-        let op_str: String = row.try_get("op")?;
+
+        // table_name / op_str / row_json decode failures all use the
+        // same skip-and-continue pattern: log at error! (the CHECK
+        // constraint or NOT NULL must have been dropped, or the
+        // column type altered — all invariant breaks), advance
+        // max_id past the bad row so the bulk DELETE cleans it up,
+        // and bump `processed` so termination still works.
+        let table_name: String = match row.try_get("table_name") {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    change_log_id = id,
+                    error = %e,
+                    "drain: failed to decode change_log.table_name; skipping. \
+                     NOT NULL or column type on `table_name` may have been altered."
+                );
+                max_id = max_id.max(id);
+                processed += 1;
+                continue;
+            }
+        };
+        let op_str: String = match row.try_get("op") {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    change_log_id = id,
+                    table = %table_name,
+                    error = %e,
+                    "drain: failed to decode change_log.op; skipping. \
+                     NOT NULL or column type on `op` may have been altered."
+                );
+                max_id = max_id.max(id);
+                processed += 1;
+                continue;
+            }
+        };
 
         // JSONB decode failure on the change_log row payload — wire
-        // mismatch, malformed JSON, type mismatch. Was previously
-        // `.unwrap_or(Json::Null)` which silently forwarded a null
-        // row to the streamer (segment anchored on null). Now skip
-        // with a loud error log so the operator sees the problem
-        // without poisoning the poller.
+        // mismatch, malformed JSON, type mismatch. Skip with a loud
+        // error log so the operator sees the problem without
+        // poisoning the poller.
         let row_json: Json = match row.try_get::<sqlx::types::JsonValue, _>("row") {
             Ok(v) => v,
             Err(e) => {
@@ -363,11 +401,11 @@ async fn drain_once(
     }
 
     // Bulk-delete everything we processed (forwarded OR skipped).
-    // `max_id` is the max id we saw in this batch — sqlx's ORDER BY
-    // ASC in the SELECT plus the per-row `max_id.max(id)` updates
-    // mean it's also the last id we saw. Any rows still in the log
-    // are strictly newer than max_id and will be picked up on the
-    // next tick.
+    // `max_id` is the max id we saw in this batch — the `ORDER BY
+    // id` (ASC) in the SELECT plus the per-row `max_id.max(id)`
+    // updates mean it's also the last id we saw. Any rows still in
+    // the log are strictly newer than max_id and will be picked up
+    // on the next tick.
     sqlx::query("DELETE FROM public.agentic_change_log WHERE id <= $1")
         .bind(max_id)
         .execute(pool)
