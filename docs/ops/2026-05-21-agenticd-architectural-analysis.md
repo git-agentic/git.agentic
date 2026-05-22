@@ -27,7 +27,7 @@ This document is the durable evidence behind the v1.0 hardening + v1.1 architect
 
 **Dimensions that found NO inaction risk:** lock ordering ([C13](#c13) — globally consistent, no deadlock cycle), advisory-lock cancellation safety ([C12](#c12)), `spawn_local` panic isolation ([C11](#c11)), `FsObjectStore` TOCTOU ([C7](#c7) — benign by content-addressing). The daemon's basic concurrency machinery is sound; the failures are in *what it does inside the locks*, not in the lock structure.
 
-**ADR overlap:** ADR-0005 (SessionStore amendment, Proposed) is the natural place to add the missing trait methods on `MemoryAdapter` ([A9](#a9) — deferred). ADR-0010 (planned: wire-protocol error model) unblocks [A6](#a6). ADR-0011 (planned: ObjectStore async-trait shape) is where the full async-trait redesign that solves [R3](#r3) lives — [A5](#a5) has a tactical `spawn_blocking` patch that lands now without waiting on the ADR. ADR-0007 (ephemeral branches, Proposed) governs the diff-atomicity question ([C6](#c6), [A11](#a11) — deferred).
+**ADR overlap:** ADR-0005 (SessionStore amendment, Proposed) is the natural place to add the missing trait methods on `MemoryAdapter` ([A9](#a9) — deferred). ADR-0010 (planned: wire-protocol error model) unblocks [A6](#a6). ADR-0011 (planned: ObjectStore async-trait shape) is where the full async-trait redesign that solves [R3](#r3) lives — [A5](#a5) has a tactical `spawn_blocking` patch that lands now without waiting on the ADR. ADR-0007 (ephemeral branches, Accepted 2026-05-22) governs the diff-atomicity question ([C6](#c6), [A11](#a11) — implementation tracked on [#45](https://github.com/git-agentic/git.agentic/issues/45), now unblocked).
 
 ---
 
@@ -402,7 +402,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 <a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
-<a name="a11"></a>**A11 — Defer: diff atomicity** ([C6](#c6)) — blocked by ADR-0007 (ephemeral branches semantics decided first).
+<a name="a11"></a>**A11 — Diff atomicity** ([C6](#c6)) — unblocked 2026-05-22 (ADR-0007 Accepted). Implementation tracked on [#45](https://github.com/git-agentic/git.agentic/issues/45).
 
 <a name="a12"></a>**A12 — Intentionally not addressed:** [C7](#c7), [C11](#c11), [C12](#c12), [C13](#c13) (correct/benign per analyst); [B12](#b12) (idempotent GCS uploads — performance only, YAGNI); [B15](#b15) (per-snapshot PgConnection — tactical patch inside `PostgresAdapter`, no architectural change); [C4](#c4), [C5](#c5) (correct under current single-writer assumption; revisit when goals change).
 
@@ -444,6 +444,6 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
-| A11 | `Diff` atomicity (blocked by ADR-0007) | (TBD) | `v1.1` | — |
+| A11 | `Diff` atomicity (unblocked 2026-05-22 — ADR-0007 Accepted) | [#45](https://github.com/git-agentic/git.agentic/issues/45) | `v1.1` | — |
 
 This doc will be updated with the issue numbers once they are created.
