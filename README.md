@@ -81,7 +81,7 @@ git.agentic/
 ├── sdk/
 │   └── python/                   `agentic-sdk` package + LangGraph integration
 ├── examples/
-│   └── langgraph-rollback/       the "broken prompt" demo (placeholder)
+│   └── langgraph-rollback/       the "broken prompt" demo (run-demo.sh)
 ├── docs/
 │   ├── product/
 │   │   ├── mvp-spec.md           what we ship and for whom
@@ -112,7 +112,7 @@ pip install -e ".[langgraph,dev]"
 pytest
 ```
 
-A `docker-compose.yml` under [`examples/langgraph-rollback/`](examples/langgraph-rollback/) brings up Postgres + `agenticd` + the demo agent in one command; [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) drives the broken-prompt scenario end-to-end.
+The broken-prompt walkthrough lives at [`examples/langgraph-rollback/`](examples/langgraph-rollback/). [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) starts Postgres+pgvector via the local `docker-compose.yml`, builds `agenticd` and the Python demo agent from the workspace, then drives the commit → break → rollback cycle end-to-end. `agenticd` and the agent run locally, not in containers.
 
 ## Design partners
 
