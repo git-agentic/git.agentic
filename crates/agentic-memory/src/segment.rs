@@ -134,6 +134,18 @@ impl SegmentManifest {
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("Manifest serialization cannot fail")
     }
+
+    /// Inverse of [`Self::to_canonical_bytes`]. Decodes the raw bytes
+    /// the object store carries for a `SegmentManifest`. Centralising
+    /// this here (rather than letting consumers call
+    /// `serde_json::from_slice` directly) keeps the wire-format
+    /// assumption inside one type — a future switch to MessagePack
+    /// changes one method, not every call site.
+    ///
+    /// Audit §A10 / [issue #44](https://github.com/git-agentic/git.agentic/issues/44).
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
 }
 
 /// Map a JSON primary-key value to a comparable sort key. Numbers and
@@ -268,6 +280,48 @@ mod tests {
         m2.push(r_b);
         m2.push(r_a);
         assert_eq!(m1.hash(), m2.hash());
+    }
+
+    #[test]
+    fn manifest_canonical_bytes_round_trip() {
+        // Audit §A10 / #44: `from_canonical_bytes` is the inverse of
+        // `to_canonical_bytes`, so the hash survives a round-trip
+        // through bytes. This pins the wire-format contract that the
+        // object store and the rollback loaders depend on.
+        let mut m = SegmentManifest::new("003_add_embeddings");
+        m.push(SegmentRef {
+            table: "messages".into(),
+            pk_lo: json!(0),
+            pk_hi: json!(99),
+            segment: Hash::of(b"seg-a"),
+            row_count: 100,
+        });
+        m.push(SegmentRef {
+            table: "messages".into(),
+            pk_lo: json!(100),
+            pk_hi: json!(199),
+            segment: Hash::of(b"seg-b"),
+            row_count: 100,
+        });
+        let bytes = m.to_canonical_bytes();
+        let decoded = SegmentManifest::from_canonical_bytes(&bytes)
+            .expect("canonical bytes must round-trip cleanly");
+        assert_eq!(decoded, m);
+        assert_eq!(decoded.hash(), m.hash());
+    }
+
+    #[test]
+    fn manifest_from_canonical_bytes_rejects_corrupt_input() {
+        // Garbage bytes must surface as an Err rather than panicking.
+        let bad = b"{not-json";
+        assert!(
+            SegmentManifest::from_canonical_bytes(bad).is_err(),
+            "corrupt bytes must return Err, not panic or succeed"
+        );
+        // Well-formed JSON of the wrong shape also fails: schema_version
+        // is required, entries is required.
+        let wrong_shape = br#"{"not_a_manifest": true}"#;
+        assert!(SegmentManifest::from_canonical_bytes(wrong_shape).is_err());
     }
 
     #[test]

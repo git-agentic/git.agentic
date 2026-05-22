@@ -40,7 +40,10 @@ pub(super) fn load_blob(state: &DaemonState, hash: &Hash) -> anyhow::Result<Blob
 
 pub(super) fn load_manifest(state: &DaemonState, hash: &Hash) -> anyhow::Result<SegmentManifest> {
     let bytes = state.store.get_raw(hash)?;
-    let manifest: SegmentManifest =
-        serde_json::from_slice(&bytes).with_context(|| format!("decoding manifest {hash}"))?;
-    Ok(manifest)
+    // Audit §A10 / #44: route the decode through SegmentManifest's own
+    // method so the wire-format assumption lives inside the type. A
+    // future switch to MessagePack changes one method, not every
+    // consumer.
+    SegmentManifest::from_canonical_bytes(&bytes)
+        .with_context(|| format!("decoding manifest {hash}"))
 }
