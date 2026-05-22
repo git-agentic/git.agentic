@@ -685,6 +685,12 @@ async fn init_rejects_non_finite_float() {
         msg.contains("non-finite") && msg.contains("score"),
         "error message must name the offending column and the reason; got: {msg}"
     );
+    // Table name must appear too — without this assertion, removing
+    // `table: &str` from row_to_json/decode_err breaks no test.
+    assert!(
+        msg.contains("episodes"),
+        "error message must name the table for multi-table diagnostics; got: {msg}"
+    );
 
     drop_schema(&admin_pool, &schema).await;
 }
@@ -888,4 +894,162 @@ async fn init_rejects_positive_and_negative_infinity() {
 
         drop_schema(&admin_pool, &schema).await;
     }
+}
+
+/// A delete envelope with a NULL or absent PK must fail restore loudly
+/// rather than silently no-op via `DELETE … WHERE pk = NULL`. Construct
+/// the segment by hand, write it to the object store, then call
+/// `restore` with a manifest pointing at it.
+#[tokio::test]
+#[ignore]
+async fn restore_rejects_delete_envelope_with_null_pk() {
+    use agentic_core::{ObjectKind, ObjectStore as _};
+    use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
+    use agentic_memory::segment::{Segment, SegmentManifest, SegmentRef};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    // Build a segment with one delete envelope whose row has a NULL
+    // PK. This mimics what a buggy streamer could otherwise persist.
+    let mut seg = Segment {
+        table: "episodes".into(),
+        schema_version: "0.0.0".into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        row_count: 1,
+        rows: Vec::new(),
+        embeddings: Vec::new(),
+        metadata: Default::default(),
+    };
+    seg.rows.push(serde_json::json!({
+        "op": "delete",
+        "row": {"id": serde_json::Value::Null},
+    }));
+    let bytes = seg.to_canonical_bytes();
+    let seg_hash = store.put_raw(ObjectKind::Segment, &bytes).unwrap();
+
+    let mut manifest = SegmentManifest::new("0.0.0".to_string());
+    manifest.push(SegmentRef {
+        table: "episodes".into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        segment: seg_hash,
+        row_count: 1,
+    });
+    let handle = SnapshotHandle {
+        manifest,
+        schema_version: "0.0.0".to_string(),
+    };
+
+    let err = adapter
+        .restore(&handle)
+        .await
+        .expect_err("restore must reject a delete envelope with NULL PK");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("PK column") && msg.contains("NULL"),
+        "error must name the NULL PK and refuse the no-op DELETE; got: {msg}"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
+}
+
+/// Same shape but with the PK column absent from the delete row
+/// payload entirely.
+#[tokio::test]
+#[ignore]
+async fn restore_rejects_delete_envelope_with_absent_pk() {
+    use agentic_core::{ObjectKind, ObjectStore as _};
+    use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
+    use agentic_memory::segment::{Segment, SegmentManifest, SegmentRef};
+
+    let url = match database_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("DATABASE_URL not set — skipping integration test");
+            return;
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
+
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let schema = fresh_schema_name();
+    make_schema(&admin_pool, &schema).await.unwrap();
+
+    let cfg = PgConfig::new(
+        schema_scoped_url(&url, &schema),
+        vec![TrackedTable {
+            name: "episodes".into(),
+            pk: "id".into(),
+        }],
+    );
+    let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await.unwrap();
+    adapter.init().await.unwrap();
+
+    let mut seg = Segment {
+        table: "episodes".into(),
+        schema_version: "0.0.0".into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        row_count: 1,
+        rows: Vec::new(),
+        embeddings: Vec::new(),
+        metadata: Default::default(),
+    };
+    seg.rows.push(serde_json::json!({
+        "op": "delete",
+        "row": {"text": "no id field"},
+    }));
+    let bytes = seg.to_canonical_bytes();
+    let seg_hash = store.put_raw(ObjectKind::Segment, &bytes).unwrap();
+
+    let mut manifest = SegmentManifest::new("0.0.0".to_string());
+    manifest.push(SegmentRef {
+        table: "episodes".into(),
+        pk_lo: serde_json::Value::Null,
+        pk_hi: serde_json::Value::Null,
+        segment: seg_hash,
+        row_count: 1,
+    });
+    let handle = SnapshotHandle {
+        manifest,
+        schema_version: "0.0.0".to_string(),
+    };
+
+    let err = adapter
+        .restore(&handle)
+        .await
+        .expect_err("restore must reject a delete envelope with absent PK");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("PK column") && msg.contains("absent"),
+        "error must name the absent PK column; got: {msg}"
+    );
+
+    drop_schema(&admin_pool, &schema).await;
 }

@@ -242,12 +242,13 @@ async fn drain_once(
     if rows.is_empty() {
         return Ok(0);
     }
-    // Was: `.unwrap_or_else(|_| "0.0.0".to_string())`. A drain-time
-    // failure to fetch the live schema version (transient DB error,
-    // helper-function dropped, etc.) silently stamped every event in
-    // the batch with `"0.0.0"`. The operator then saw a misleading
+    // A drain-time failure to fetch the live schema version
+    // (transient DB error, helper-function dropped, etc.) must not
+    // silently fall back to "0.0.0" — that would stamp every event in
+    // the batch with the baseline, surfacing later as a misleading
     // SchemaMismatch at restore with no signal that the real cause
-    // was a drain-time connectivity blip. Propagate the error.
+    // was a drain-time connectivity blip. Propagate the error;
+    // drain_to_completion bubbles it to snapshot() via `?`.
     let schema_version: String = sqlx::query_scalar("SELECT agentic_schema_version()")
         .fetch_one(pool)
         .await
@@ -264,11 +265,10 @@ async fn drain_once(
         let id: i64 = row.try_get("id")?;
         let table_name: String = row.try_get("table_name")?;
         let op_str: String = row.try_get("op")?;
-        // Was: `.unwrap_or(Json::Null)`. A JSONB decode failure on the
-        // change_log row payload (wire mismatch, malformed JSON, type
-        // mismatch) silently forwarded a `Json::Null` row into the
-        // streamer, which then anchored a segment on a null payload.
-        // Propagate; the drain loop's caller logs + retries.
+        // A JSONB decode failure on the change_log row payload
+        // (wire mismatch, malformed JSON, type mismatch) must not
+        // silently forward `Json::Null` to the streamer — that would
+        // anchor a segment on a null payload. Propagate.
         let row_json: Json = row
             .try_get::<sqlx::types::JsonValue, _>("row")
             .map_err(|e| {
@@ -277,17 +277,48 @@ async fn drain_once(
                 ))
             })?;
 
-        let key = key_of
+        // Map the trigger's `<schema>.<table>` form to whatever string
+        // the caller registered in `TrackedTable.name`. If neither
+        // form matches, the table was written to but isn't tracked —
+        // forwarding to the streamer would anchor a segment under a
+        // key no head exists for. Log + skip; the change_log row gets
+        // cleaned up by the bulk DELETE below since max_id still moves
+        // forward (untracked-table rows can't accumulate forever).
+        let key = match key_of
             .get(&table_name)
             .cloned()
             .or_else(|| bare_lookup.get(&bare_name(&table_name)).cloned())
-            .unwrap_or_else(|| table_name.clone());
+        {
+            Some(k) => k,
+            None => {
+                tracing::warn!(
+                    table = %table_name,
+                    change_log_id = id,
+                    "drain: change_log row references untracked table; skipping"
+                );
+                max_id = max_id.max(id);
+                continue;
+            }
+        };
 
         let op = match op_str.as_str() {
             "insert" => Op::Insert,
             "update" => Op::Update,
             "delete" => Op::Delete,
-            _ => continue,
+            // An op outside the CHECK-constrained set ("insert"/"update"/
+            // "delete") shouldn't be reachable — the change_log CHECK
+            // constraint rejects it. If we see one anyway something is
+            // wrong (constraint dropped, trigger function rewritten);
+            // surface it loudly rather than silently `continue`'ing
+            // (which would also delete the offending row when max_id
+            // advances past it).
+            other => {
+                return Err(Error::Backend(format!(
+                    "drain: change_log id={id} table={table_name:?} has unknown op {other:?}; \
+                     the CHECK constraint on agentic_change_log.op may have been dropped \
+                     or the capture trigger rewritten"
+                )));
+            }
         };
         streamer
             .send_event(ChangeEvent {

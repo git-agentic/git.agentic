@@ -437,10 +437,19 @@ impl PostgresAdapter {
     }
 
     async fn current_schema_version_inner(&self) -> Result<String> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT agentic_schema_version()")
-            .fetch_optional(&self.pool)
+        // `agentic_schema_version()` is a SQL function installed by
+        // `install_helpers` that always returns exactly one row
+        // (COALESCE → `'0.0.0'` when no migrations are recorded), so
+        // zero rows here would mean the helper wasn't installed —
+        // a precondition violation, not a "no migrations applied"
+        // signal. `fetch_one` surfaces that loudly instead of
+        // silently falling back to `"0.0.0"` and tagging snapshots
+        // with the baseline (which would then pass the equality
+        // check at restore and skip reverse migrations).
+        let (v,): (String,) = sqlx::query_as("SELECT agentic_schema_version()")
+            .fetch_one(&self.pool)
             .await?;
-        Ok(row.map(|r| r.0).unwrap_or_else(|| "0.0.0".to_string()))
+        Ok(v)
     }
 }
 
@@ -769,8 +778,8 @@ fn row_to_json(row: &sqlx::postgres::PgRow, table: &str) -> Result<Json> {
     use sqlx::{Column, Row, TypeInfo};
 
     // Table name is carried into the error so multi-table schemas can be
-    // diagnosed without grepping logs to figure out which `episodes` or
-    // `messages` table the decode failure came from.
+    // diagnosed without grepping logs to figure out which table the
+    // decode failure came from.
     fn decode_err(table: &str, col: &str, ty: &str, e: sqlx::Error) -> Error {
         Error::Backend(format!(
             "table {table:?} column {col:?} (Postgres type {ty}) failed to decode: {e}"
@@ -818,7 +827,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow, table: &str) -> Result<Json> {
                     .map(Json::Number)
                     .ok_or_else(|| {
                         Error::Backend(format!(
-                            "column {col:?} ({ty}) is non-finite ({raw}); \
+                            "table {table:?} column {col:?} ({ty}) is non-finite ({raw}); \
                              JSON cannot represent NaN/Inf"
                         ))
                     })
@@ -831,7 +840,7 @@ fn row_to_json(row: &sqlx::postgres::PgRow, table: &str) -> Result<Json> {
                     .map(Json::Number)
                     .ok_or_else(|| {
                         Error::Backend(format!(
-                            "column {col:?} ({ty}) is non-finite ({raw}); \
+                            "table {table:?} column {col:?} ({ty}) is non-finite ({raw}); \
                              JSON cannot represent NaN/Inf"
                         ))
                     })

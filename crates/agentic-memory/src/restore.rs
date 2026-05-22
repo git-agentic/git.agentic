@@ -114,14 +114,12 @@ pub async fn restore_manifest<S: ObjectStore + ?Sized>(
     Ok(())
 }
 
-/// Strip the streamer's `{op, row}` envelope. Older bootstrap segments
-/// used plain row objects — those still work and default to `insert`.
+/// Strip the streamer's `{op, row}` envelope.
 ///
-/// Unknown op strings (anything other than "insert"/"update"/"delete")
-/// error rather than silently being treated as `insert` — a future op
-/// added to the streamer side but not the restore side would otherwise
-/// be mis-replayed with no signal at all. Loud failure beats silent
-/// mis-restore.
+/// Unknown or non-string op values error rather than silently being
+/// treated as `insert` — a future op added to the streamer side but
+/// not the restore side would otherwise be mis-replayed with no
+/// signal at all. Loud failure beats silent mis-restore.
 fn peel_envelope(value: &Json) -> Result<(Op, &Json)> {
     if let Some(obj) = value.as_object() {
         if let (Some(op), Some(row)) = (obj.get("op"), obj.get("row")) {
@@ -370,6 +368,32 @@ mod tests {
         assert!(
             msg.contains("non-string"),
             "must say 'non-string'; got: {msg}"
+        );
+    }
+
+    /// A partial envelope (only one of `op`/`row` present) falls through
+    /// the inner `if let` and is treated as a plain bootstrap row. The
+    /// result is "treat the partial-envelope object as a row to upsert
+    /// under Insert". Documents the corner case so a future change to
+    /// peel_envelope notices when it shifts.
+    ///
+    /// The next behaviour change worth considering: reject partial
+    /// envelopes loudly. Held off in this PR because no current
+    /// producer emits them — the streamer always writes both keys —
+    /// so making it an error would just add code without a real
+    /// failure mode to prevent.
+    #[test]
+    fn peel_envelope_partial_envelope_falls_through_to_plain_row() {
+        let partial = json!({"op": "delete"}); // no `row` key
+        let (op, row) = peel_envelope(&partial).unwrap();
+        assert_eq!(
+            op,
+            Op::Insert,
+            "partial envelope falls through to plain-row path"
+        );
+        assert_eq!(
+            row, &partial,
+            "the partial-envelope object itself becomes the row"
         );
     }
 }
