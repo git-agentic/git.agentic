@@ -1,7 +1,8 @@
 # ADR-0010: Wire-Protocol Error Model and Binary Payload Carriage
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-21
+**Accepted:** 2026-05-22
 **Deciders:** Toni
 **Extends:** [ADR-0002](./0002-substrate-and-supercommit.md) Decision 2 (Commit object as platform API contract)
 **Relates to:** [`docs/ops/2026-05-21-agenticd-architectural-analysis.md`](../ops/2026-05-21-agenticd-architectural-analysis.md) §A6 / §B6 / §B13 / §B14 / §R7 (the recommendations and risk this ADR unblocks)
