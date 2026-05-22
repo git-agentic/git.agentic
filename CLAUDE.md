@@ -67,6 +67,20 @@ mypy agentic
 
 `examples/langgraph-rollback/docker-compose.yml` brings up Postgres + pgvector for the demo on port 54322. `agenticd` and the Python agent are started by `scripts/run-demo.sh` (built locally from the Rust workspace, not containerised).
 
+## Worktree discipline
+
+Any time you are about to modify, create, or delete files in this repo you MUST do the work in a git worktree under `.worktrees/<slug>/`, never directly in the main checkout. Toni edits this repo in parallel on the same machine, so `HEAD` in the main checkout can move under an agent at any moment — see [[feedback_check_git_state_before_amend]]. Worktrees isolate agent edits from that movement, keep each conceptual change on its own branch, and make abandoned attempts cheap to discard.
+
+How to apply:
+
+- Create with `git worktree add .worktrees/<slug> -b <slug> <base-branch>`. Base is usually `main`; use the existing branch name (without `-b`) when continuing prior work. The slug is kebab-case and descriptive: `.worktrees/a8-reverse-migrations/`, `.worktrees/fix-clippy-warnings/`, `.worktrees/adr-0006-draft/`.
+- Run `cargo`, `pytest`, `ruff`, `mypy`, and `scripts/run-demo.sh` from inside the worktree. Build artifacts (`target/`, `.venv/`, `.agentic/`) belong to the worktree, not the main checkout.
+- When the branch is merged or abandoned, tear it down: `git worktree remove .worktrees/<slug>` and `git branch -D <slug>` if the branch is no longer needed.
+- Read-only operations may run in the main checkout. The rule is about *writes* — `git log`, `git diff`, `grep`, `cargo check` for inspection, and reading files are all fine in the main checkout.
+- Exceptions, narrowly scoped: trivial single-line edits to `CLAUDE.md` itself or to ADR `Status:` lines may be made in the main checkout, because they are metadata maintenance and not code/doc work that warrants its own branch.
+
+`.worktrees/` is in `.gitignore` so worktree paths never leak into a parent tree.
+
 ## Code style
 
 - **Rust.** `rustfmt` defaults; `clippy` with `-D warnings`. No `unwrap()` in non-test code without a `// SAFETY:` or `// INVARIANT:` comment explaining why it cannot panic. `thiserror` for library crates, `anyhow` for binary crates.
@@ -84,6 +98,7 @@ mypy agentic
 - **Don't expose storage-layer concepts to platform integrators.** Per ADR-0002 Decision 6, the SDK's public surface trades in `Commit` objects only. No Git ref names, no object store paths, no internal segment IDs in public types — those preclude the v2+ storage swap.
 - **Don't add a web UI.** CLI-first is a deliberate ADR-0001 Decision 9. v1.1 distribution lever, not MVP product.
 - **Don't commit secrets.** [ADR-0013](docs/adr/0013-secret-scanner.md) specifies a `put_raw`-time pattern + entropy scanner that hard-rejects matched blobs with a typed `SecretDetected` error. The implementation lands in the v1.0 hardening sprint (PR-3); until it does, treat this control as not yet enforced and do not commit secrets to prompts or memory.
+- **Don't edit files in the main checkout.** Use a worktree under `.worktrees/<slug>/` — see "Worktree discipline" above. Toni works in parallel on the same machine, so `HEAD` can move under you mid-edit.
 
 ## The demo is the discipline
 
