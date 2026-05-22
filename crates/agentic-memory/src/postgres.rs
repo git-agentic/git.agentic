@@ -278,17 +278,19 @@ impl PostgresAdapter {
         // plus a per-row envelope-size add.
         //
         // Accuracy: the segment's encoded size has four moving parts —
-        // `pk_lo`/`pk_hi` (both set on the first row; pk_hi may also be
-        // rewritten every row but its encoded length only changes when
-        // the value's text form does), `row_count` (the JSON integer
-        // grows by a digit at 10, 100, 1000, …), and the row envelopes
-        // themselves (incremented exactly). We rebaseline once *after
-        // both `pk_lo` AND `pk_hi` are set on the first row* so the
-        // null → first-PK delta on both ends of the segment is caught;
-        // after that the header-field deltas (pk_hi reshape on later
-        // rows, row_count digit growth) are bounded by a few tens of
-        // bytes per segment — negligible against `segment_target_bytes`
-        // (default 64 MiB) and bounded by the seal check itself.
+        // `pk_lo` (set once on the first row), `pk_hi` (set on the
+        // first row, then potentially reshaped on every later row when
+        // the value's encoded text form changes — unbounded for
+        // variable-length text PKs), `row_count` (JSON integer grows by
+        // a digit at 10, 100, 1000, …), and the row envelopes themselves
+        // (incremented exactly). We rebaseline once after both pk_lo
+        // and pk_hi are set on the first row, then track the pk_hi
+        // delta explicitly across subsequent rows so a text PK that
+        // grows from "a" to "zzzzzzzz…" within one segment can't drift
+        // the counter unboundedly. `row_count` digit growth and the
+        // per-row `+ 1` JSON-array comma over-count remain bounded by
+        // tens of bytes per segment — negligible against
+        // `segment_target_bytes` (default 64 MiB).
         //
         // Per-row envelope-bytes add includes `+ 1` for the JSON-array
         // comma; the very first row of a segment doesn't actually have
@@ -296,12 +298,22 @@ impl PostgresAdapter {
         // intentionally over-counts by 1 byte per segment. Safe
         // direction: seals one byte early at worst, never late.
         //
+        // Allocation hygiene: envelope encoding reuses a single Vec
+        // buffer across iterations to avoid a fresh allocation per row.
+        // At 1M+ rows the per-row alloc adds up; reusing the buffer
+        // keeps the bootstrap loop's allocator pressure minimal.
+        //
         // Maintenance caveat: if `bootstrap_table` is ever extended to
         // populate `embeddings` or `metadata` mid-segment, the running
         // counter would silently under-count those fields. Rebaseline
         // again at the change site, or grow this comment to call them
         // out.
         let mut running_bytes: usize = current.canonical_size();
+        // Encoded length of pk_hi as it currently sits in `current`. We
+        // track the delta across rows so subsequent pk_hi rewrites are
+        // accounted for without re-serialising the whole segment.
+        let mut prev_pk_hi_bytes: usize = encoded_len(&current.pk_hi);
+        let mut envelope_buf: Vec<u8> = Vec::with_capacity(256);
 
         for row in &rows {
             let row_json = row_to_json(row);
@@ -313,6 +325,7 @@ impl PostgresAdapter {
                 have_lo = true;
             }
             current.pk_hi = pk_value.clone();
+            let new_pk_hi_bytes = encoded_len(&current.pk_hi);
             if first_row_of_segment {
                 // Rebaseline now that BOTH `pk_lo` and `pk_hi` carry
                 // their real values (blank_segment initialised both to
@@ -320,29 +333,33 @@ impl PostgresAdapter {
                 // applies on both ends of the first row). One
                 // re-serialise per segment, not per row.
                 running_bytes = current.canonical_size();
+            } else if new_pk_hi_bytes != prev_pk_hi_bytes {
+                // Apply the pk_hi delta. `saturating_add_signed` keeps
+                // us out of underflow if pk_hi shrinks (rare but
+                // possible if a row's PK is shorter than the previous).
+                let delta = new_pk_hi_bytes as isize - prev_pk_hi_bytes as isize;
+                running_bytes = running_bytes.saturating_add_signed(delta);
             }
+            prev_pk_hi_bytes = new_pk_hi_bytes;
+
             // Wrap in the streamer's envelope shape so the restore code
             // path is uniform across bootstrap and delta segments.
             let envelope = serde_json::json!({"op": "insert", "row": row_json});
-            // Account for the envelope's encoded bytes BEFORE pushing
-            // so the next per-row branch sees the correct running total.
-            // `serde_json::to_vec(&envelope).len()` is the row body; the
-            // `+ 1` covers the comma that joins rows inside the segment's
-            // JSON array.
+            // Account for the envelope's encoded bytes BEFORE pushing.
+            // Reuse `envelope_buf` rather than allocating per row.
             //
             // INVARIANT: `envelope` is a `serde_json::Value` we just
             // constructed from `{"op": "insert", "row": <row_json>}`.
             // `row_json` is the output of `row_to_json`, which only
             // produces Value variants serde_json can encode. The same
             // discipline `Segment::to_canonical_bytes` already relies on
-            // for its `.expect(...)`. Swallowing a serialise failure as
-            // 0 bytes would under-count `running_bytes`, prevent
-            // sealing, and produce oversized segments silently — fail
-            // loudly instead.
-            let envelope_bytes = serde_json::to_vec(&envelope)
-                .expect("envelope JSON encoding cannot fail; see INVARIANT above")
-                .len()
-                + 1;
+            // for its `.expect(...)`. Swallowing a serialise failure
+            // would under-count `running_bytes`, prevent sealing, and
+            // produce oversized segments silently — fail loudly.
+            envelope_buf.clear();
+            serde_json::to_writer(&mut envelope_buf, &envelope)
+                .expect("envelope JSON encoding cannot fail; see INVARIANT above");
+            let envelope_bytes = envelope_buf.len() + 1;
             running_bytes = running_bytes.saturating_add(envelope_bytes);
 
             current.rows.push(envelope);
@@ -351,13 +368,15 @@ impl PostgresAdapter {
             if running_bytes >= self.cfg.segment_target_bytes {
                 self.seal_segment(&mut current, schema_version, manifest)?;
                 have_lo = false;
-                // The `first_row_of_segment` branch above will overwrite
-                // `running_bytes` from `current.canonical_size()` on the
-                // very next iteration once it sets pk_lo + pk_hi, so any
-                // value we assign here is dead in practice. Leaving it
-                // unset would be load-bearing only if a `break` lands
-                // between the seal and the next row, which doesn't
-                // happen today; not worth a defensive reset.
+                // After seal the segment is reset to its blank shape
+                // with pk_hi = null. Reset the prev-pk_hi tracker so
+                // the next row's delta is computed against the new
+                // baseline rather than carrying over the previous
+                // segment's last pk_hi length.
+                prev_pk_hi_bytes = encoded_len(&current.pk_hi);
+                // `running_bytes` is left as-is; the
+                // `first_row_of_segment` branch overwrites it on the
+                // next iteration via `current.canonical_size()`.
             }
         }
 
@@ -649,6 +668,16 @@ impl PostgresAdapter {
         }
         Ok(())
     }
+}
+
+/// Encoded JSON byte length of a single `Value`. Used by the bootstrap
+/// loop to track `pk_hi` size deltas across rows without re-serialising
+/// the whole segment. Returns 4 ("null") on serialise failure — the
+/// shape is restricted to outputs of `row_to_json`, which only emits
+/// encodable variants, so the fallback is never reached in practice
+/// but staying total beats panicking inside a hot loop on a hypothetical.
+fn encoded_len(v: &Json) -> usize {
+    serde_json::to_vec(v).map(|b| b.len()).unwrap_or(4)
 }
 
 fn blank_segment(table: &str, schema_version: &str) -> Segment {
