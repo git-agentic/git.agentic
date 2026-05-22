@@ -17,6 +17,7 @@
 use crate::hash::{Hash, ParseHashError};
 use crate::{Error, Result};
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -148,6 +149,109 @@ impl Refs {
         }
         self.read_branch(name)
     }
+
+    /// Take a consistent-read snapshot of HEAD and every branch ref. The
+    /// returned [`RefsSnapshot`] resolves names from its frozen map
+    /// rather than re-reading the filesystem — so repeated `resolve`
+    /// calls against the same snapshot can never disagree about which
+    /// commit a branch points at, even if a concurrent writer advances
+    /// the branch ref between calls.
+    ///
+    /// Atomicity caveat: `snapshot()` itself reads files sequentially.
+    /// Callers must hold a serialising lock (in agenticd, that's
+    /// `DaemonState.commit_lock` — every ref-writing operation, commit
+    /// and rollback alike, acquires it before writing refs, so taking
+    /// the snapshot under the same lock is sufficient) to guarantee the
+    /// snapshot's contents reflect a single point in time. Without
+    /// external serialisation a concurrent commit can still interleave
+    /// between two `read_branch` calls inside `snapshot()`; the
+    /// snapshot then describes one ref's pre-commit state and
+    /// another's post-commit state. The lock is the discipline that
+    /// closes that window.
+    pub fn snapshot(&self) -> Result<RefsSnapshot> {
+        let head = self.read_head()?;
+        let mut branches = BTreeMap::new();
+        for name in self.list_branches()? {
+            match self.read_branch(&name)? {
+                Some(hash) => {
+                    branches.insert(name, hash);
+                }
+                None => {
+                    // TOCTOU: between `list_branches` and `read_branch`
+                    // an external writer (or a test fixture) deleted the
+                    // file. Under `commit_lock` no in-daemon writer can
+                    // do this; if we see it, surface the gap loudly so
+                    // operators can correlate a "ref not found" with the
+                    // race instead of staring at a silently incomplete
+                    // snapshot.
+                    tracing::warn!(
+                        target: "agentic_core::refs",
+                        branch = %name,
+                        "branch listed but missing at read time; dropping from snapshot"
+                    );
+                }
+            }
+        }
+        Ok(RefsSnapshot { head, branches })
+    }
+}
+
+/// Frozen view of HEAD + every branch ref as of [`Refs::snapshot`].
+///
+/// Use when two or more ref resolutions must agree on a single point
+/// in time (e.g. `agentic diff from..to` — without the snapshot, a
+/// commit landing between the two `resolve` calls would produce a
+/// diff that mixes one branch's pre-commit state with another's
+/// post-commit state).
+#[derive(Debug, Clone)]
+pub struct RefsSnapshot {
+    head: Option<HeadRef>,
+    branches: BTreeMap<String, Hash>,
+}
+
+impl RefsSnapshot {
+    /// Resolve a ref name from the frozen view. Accepts `"HEAD"`, a
+    /// branch name, or a raw 64-hex hash. Mirrors [`Refs::resolve`]'s
+    /// semantics — but without any filesystem read.
+    pub fn resolve(&self, name: &str) -> Result<Option<Hash>> {
+        if name == "HEAD" {
+            return Ok(match &self.head {
+                None => None,
+                Some(HeadRef::Detached(h)) => Some(*h),
+                Some(HeadRef::Branch(b)) => self.branches.get(b).copied(),
+            });
+        }
+        if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            // INVARIANT: 64 ASCII hex chars — `Hash::from_str` only
+            // rejects non-hex chars or wrong length, both ruled out by
+            // the guard above. `map_err` stays as a defensive backstop
+            // so a future Hash parser change can't silently corrupt
+            // resolutions.
+            let h: Hash = name
+                .parse()
+                .map_err(|e: ParseHashError| Error::Other(anyhow::anyhow!(e)))?;
+            return Ok(Some(h));
+        }
+        Ok(self.branches.get(name).copied())
+    }
+
+    /// What `HEAD` pointed at when the snapshot was taken.
+    pub fn head(&self) -> Option<&HeadRef> {
+        self.head.as_ref()
+    }
+
+    /// Iterate over `(branch_name, commit_hash)` pairs at snapshot
+    /// time, sorted by branch name. Doesn't leak the concrete
+    /// collection type so callers (and `branches()`-like accessors
+    /// added later) don't pin a semver contract to `BTreeMap`.
+    pub fn branches(&self) -> impl Iterator<Item = (&str, &Hash)> {
+        self.branches.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Number of branch refs captured by the snapshot.
+    pub fn branch_count(&self) -> usize {
+        self.branches.len()
+    }
 }
 
 /// Walk `dir` (recursively) collecting branch names relative to `root`.
@@ -162,10 +266,27 @@ fn collect_branch_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Resul
             continue;
         }
         if !ft.is_file() {
+            // Symlinks, FIFOs, sockets: not branches. Warn so an
+            // operator who put one in `refs/heads/` finds out about
+            // it instead of silently losing the ref.
+            tracing::warn!(
+                target: "agentic_core::refs",
+                path = %entry.path().display(),
+                "non-regular file under refs/heads/; skipping"
+            );
             continue;
         }
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
+            // Non-UTF-8 filename: we have no way to round-trip it
+            // through Refs::read_branch / write_branch (both take
+            // `&str`). Warn loudly — silently dropping it means a
+            // physically-present branch goes invisible.
+            tracing::warn!(
+                target: "agentic_core::refs",
+                path = %entry.path().display(),
+                "branch filename is not valid UTF-8; skipping"
+            );
             continue;
         };
         if name.ends_with(".tmp") {
@@ -285,5 +406,100 @@ mod tests {
         let refs = Refs::open(dir.path()).unwrap();
         let h = Hash::of(b"raw");
         assert_eq!(refs.resolve(&h.to_hex()).unwrap(), Some(h));
+    }
+
+    #[test]
+    fn snapshot_captures_head_and_all_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        let main = Hash::of(b"main");
+        let feature = Hash::of(b"feature");
+        refs.write_branch("main", &main).unwrap();
+        refs.write_branch("feature/x", &feature).unwrap();
+        refs.write_head_symbolic("main").unwrap();
+
+        let snap = refs.snapshot().unwrap();
+        assert_eq!(snap.resolve("main").unwrap(), Some(main));
+        assert_eq!(snap.resolve("feature/x").unwrap(), Some(feature));
+        assert_eq!(
+            snap.resolve("HEAD").unwrap(),
+            Some(main),
+            "HEAD must chase through the snapshot's frozen branch map"
+        );
+        assert_eq!(snap.resolve("nonexistent").unwrap(), None);
+        // Branches accessor sees both refs.
+        assert_eq!(snap.branch_count(), 2);
+        let names: Vec<&str> = snap.branches().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["feature/x", "main"]);
+    }
+
+    #[test]
+    fn snapshot_handles_unborn_head_to_missing_branch() {
+        // After `agentic init` writes HEAD -> refs/heads/main but
+        // before the first commit lands, `main` does not exist. The
+        // snapshot must surface this as `Ok(None)` rather than
+        // erroring or panicking — agentic-cli's `status` command
+        // relies on this to print "(no commits yet)".
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        refs.write_head_symbolic("main").unwrap();
+        // No write_branch("main", ...) call.
+        let snap = refs.snapshot().unwrap();
+        assert_eq!(
+            snap.resolve("HEAD").unwrap(),
+            None,
+            "unborn HEAD must resolve to None, not error"
+        );
+    }
+
+    #[test]
+    fn snapshot_resolve_uses_frozen_map_not_filesystem() {
+        // The whole point of the snapshot: after we capture it, writes to
+        // the underlying ref files must NOT be observable through the
+        // snapshot. A concurrent commit landing between two resolves on
+        // the same snapshot can't yield disagreeing results — that's
+        // the diff-atomicity invariant #45 lands.
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        let v1 = Hash::of(b"v1");
+        let v2 = Hash::of(b"v2");
+        refs.write_branch("main", &v1).unwrap();
+
+        let snap = refs.snapshot().unwrap();
+        // Simulate a concurrent commit advancing main to v2.
+        refs.write_branch("main", &v2).unwrap();
+
+        // The snapshot still sees v1 — frozen at construction time.
+        assert_eq!(snap.resolve("main").unwrap(), Some(v1));
+        // The live Refs sees v2.
+        assert_eq!(refs.resolve("main").unwrap(), Some(v2));
+    }
+
+    #[test]
+    fn snapshot_resolve_accepts_raw_hex_without_filesystem_read() {
+        // A 64-hex name resolves to itself even if it's not a stored ref.
+        // Mirrors Refs::resolve's behaviour so callers can pass commit
+        // hashes directly to `agentic diff <hash> HEAD`.
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        let snap = refs.snapshot().unwrap();
+        let h = Hash::of(b"some-commit");
+        assert_eq!(snap.resolve(&h.to_hex()).unwrap(), Some(h));
+    }
+
+    #[test]
+    fn snapshot_handles_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        let h = Hash::of(b"detached");
+        // Manually write a detached HEAD (no symbolic ref).
+        std::fs::write(
+            dir.path().join("HEAD"),
+            format!("{}\n", h.to_hex()).as_bytes(),
+        )
+        .unwrap();
+
+        let snap = refs.snapshot().unwrap();
+        assert_eq!(snap.resolve("HEAD").unwrap(), Some(h));
     }
 }

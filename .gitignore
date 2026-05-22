@@ -47,3 +47,7 @@ Thumbs.db
 # One-off scratch prompts pasted into the working tree for execution.
 # Not long-term reference material; should not be tracked.
 PROMPT-*.md
+
+# Agent worktrees — see CLAUDE.md "Worktree discipline".
+# Each branch lives in .worktrees/<slug>/; never tracked in the parent tree.
+.worktrees/
