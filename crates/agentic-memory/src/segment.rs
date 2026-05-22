@@ -136,15 +136,68 @@ impl SegmentManifest {
     }
 
     /// Inverse of [`Self::to_canonical_bytes`]. Decodes the raw bytes
-    /// the object store carries for a `SegmentManifest`. Centralising
-    /// this here (rather than letting consumers call
-    /// `serde_json::from_slice` directly) keeps the wire-format
-    /// assumption inside one type — a future switch to MessagePack
-    /// changes one method, not every call site.
+    /// the object store carries for a `SegmentManifest`, then checks
+    /// the structural invariants the restore path depends on:
     ///
-    /// Audit §A10 / [issue #44](https://github.com/git-agentic/git.agentic/issues/44).
-    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+    /// * `schema_version` is non-empty.
+    /// * `entries` has no duplicate `(table, pk_lo, pk_hi)` ranges
+    ///   (a duplicate would later trip a Postgres unique-constraint
+    ///   violation mid-restore, with no thread back to the decode site).
+    /// * `entries` is sorted by `(table, pk_sort_key(pk_lo))` — the
+    ///   same order [`Self::push`] maintains for live construction. The
+    ///   restore loop assumes sorted order for table-range iteration.
+    ///
+    /// The return type is `anyhow::Result<Self>` rather than
+    /// `serde_json::Error` so changing the encoding (e.g. to
+    /// MessagePack) or adding new invariant checks is not a breaking
+    /// API change for callers.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let manifest: Self = serde_json::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("manifest is not valid JSON: {e}"))?;
+        manifest.validate_invariants()?;
+        Ok(manifest)
+    }
+
+    /// Check the structural invariants documented on
+    /// [`Self::from_canonical_bytes`]. Pulled out so the decode path and
+    /// any future construction-from-parts path can both reach it.
+    fn validate_invariants(&self) -> anyhow::Result<()> {
+        if self.schema_version.is_empty() {
+            anyhow::bail!("manifest schema_version is empty");
+        }
+        let key_of = |e: &SegmentRef| {
+            (
+                e.table.clone(),
+                pk_sort_key(&e.pk_lo),
+                pk_sort_key(&e.pk_hi),
+            )
+        };
+        // Walk pairwise: each entry must sort after the previous one
+        // (strictly, since duplicates are also forbidden). Combining
+        // both checks in one pass keeps O(n).
+        for pair in self.entries.windows(2) {
+            let prev = key_of(&pair[0]);
+            let next = key_of(&pair[1]);
+            if next < prev {
+                anyhow::bail!(
+                    "manifest entries are out of order: {:?} appears after {:?}",
+                    next,
+                    prev
+                );
+            }
+            // Equal keys here means same (table, pk_lo, pk_hi) — a
+            // duplicate range that would later trip the unique
+            // constraint during restore.
+            if next == prev {
+                anyhow::bail!(
+                    "manifest has duplicate entry for table={:?} pk_lo={} pk_hi={}",
+                    pair[1].table,
+                    pair[1].pk_lo,
+                    pair[1].pk_hi
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -284,10 +337,8 @@ mod tests {
 
     #[test]
     fn manifest_canonical_bytes_round_trip() {
-        // Audit §A10 / #44: `from_canonical_bytes` is the inverse of
-        // `to_canonical_bytes`, so the hash survives a round-trip
-        // through bytes. This pins the wire-format contract that the
-        // object store and the rollback loaders depend on.
+        // The hash survives a round-trip through bytes — this is the
+        // load-bearing invariant the rollback path depends on.
         let mut m = SegmentManifest::new("003_add_embeddings");
         m.push(SegmentRef {
             table: "messages".into(),
@@ -313,15 +364,97 @@ mod tests {
     #[test]
     fn manifest_from_canonical_bytes_rejects_corrupt_input() {
         // Garbage bytes must surface as an Err rather than panicking.
-        let bad = b"{not-json";
+        assert!(SegmentManifest::from_canonical_bytes(b"{not-json").is_err());
+        // Well-formed JSON of the wrong shape (missing required fields)
+        // also fails. Implicit because neither `schema_version` nor
+        // `entries` carries `#[serde(default)]`; if either grows one,
+        // this test goes vacuous — covered separately by the
+        // empty-schema-version invariant test below.
+        assert!(SegmentManifest::from_canonical_bytes(br#"{"not_a_manifest": true}"#).is_err());
+    }
+
+    #[test]
+    fn manifest_from_canonical_bytes_tolerates_unknown_fields() {
+        // Forward-compat: a future revision of `SegmentManifest` may
+        // grow new fields. Older daemons must keep loading their
+        // manifests without panicking. If someone adds
+        // `#[serde(deny_unknown_fields)]` to "harden" the type, this
+        // test catches it before the next rollback breaks.
+        let future_bytes = br#"{
+            "schema_version": "1",
+            "entries": [],
+            "future_field": "hello",
+            "another_one": [1, 2, 3]
+        }"#;
+        let m = SegmentManifest::from_canonical_bytes(future_bytes)
+            .expect("unknown fields must not break decode");
+        assert_eq!(m.schema_version, "1");
+        assert!(m.entries.is_empty());
+    }
+
+    #[test]
+    fn manifest_from_canonical_bytes_rejects_empty_schema_version() {
+        // An empty schema_version would cause cryptic downstream
+        // failures (e.g. `migrations_after("")`). Caught at decode.
+        let bytes = br#"{"schema_version":"","entries":[]}"#;
+        let err = SegmentManifest::from_canonical_bytes(bytes).unwrap_err();
         assert!(
-            SegmentManifest::from_canonical_bytes(bad).is_err(),
-            "corrupt bytes must return Err, not panic or succeed"
+            err.to_string().contains("schema_version is empty"),
+            "got: {err:#}"
         );
-        // Well-formed JSON of the wrong shape also fails: schema_version
-        // is required, entries is required.
-        let wrong_shape = br#"{"not_a_manifest": true}"#;
-        assert!(SegmentManifest::from_canonical_bytes(wrong_shape).is_err());
+    }
+
+    #[test]
+    fn manifest_from_canonical_bytes_rejects_duplicate_ranges() {
+        // Two entries with the same (table, pk_lo, pk_hi) would later
+        // trip a Postgres unique constraint mid-restore, with no
+        // connection back to the manifest. Caught at decode instead.
+        let dup_ref = SegmentRef {
+            table: "messages".into(),
+            pk_lo: json!(0),
+            pk_hi: json!(99),
+            segment: Hash::of(b"seg-a"),
+            row_count: 100,
+        };
+        // Construct the bytes by hand because `push` would sort the
+        // dupes adjacent (which is the worst case the validator must
+        // catch).
+        let m_with_dup = SegmentManifest {
+            schema_version: "1".to_string(),
+            entries: vec![dup_ref.clone(), dup_ref],
+        };
+        let bytes = m_with_dup.to_canonical_bytes();
+        let err = SegmentManifest::from_canonical_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("duplicate entry"), "got: {err:#}");
+    }
+
+    #[test]
+    fn manifest_from_canonical_bytes_rejects_unsorted_entries() {
+        // The restore path iterates `entries` assuming sorted order.
+        // A manifest stored in the wrong order would silently corrupt
+        // the restored state.
+        let unsorted = SegmentManifest {
+            schema_version: "1".to_string(),
+            entries: vec![
+                SegmentRef {
+                    table: "b".into(),
+                    pk_lo: json!(0),
+                    pk_hi: json!(10),
+                    segment: Hash::of(b"b0"),
+                    row_count: 1,
+                },
+                SegmentRef {
+                    table: "a".into(),
+                    pk_lo: json!(0),
+                    pk_hi: json!(10),
+                    segment: Hash::of(b"a0"),
+                    row_count: 1,
+                },
+            ],
+        };
+        let bytes = unsorted.to_canonical_bytes();
+        let err = SegmentManifest::from_canonical_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("out of order"), "got: {err:#}");
     }
 
     #[test]
