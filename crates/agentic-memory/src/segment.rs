@@ -143,9 +143,12 @@ impl SegmentManifest {
     /// * `entries` has no duplicate `(table, pk_lo, pk_hi)` ranges
     ///   (a duplicate would later trip a Postgres unique-constraint
     ///   violation mid-restore, with no thread back to the decode site).
-    /// * `entries` is sorted by `(table, pk_sort_key(pk_lo))` — the
-    ///   same order [`Self::push`] maintains for live construction. The
-    ///   restore loop assumes sorted order for table-range iteration.
+    /// * `entries` is sorted by `(table, pk_sort_key(pk_lo),
+    ///   pk_sort_key(pk_hi))`. This is slightly stricter than
+    ///   [`Self::push`]'s 2-tuple sort key — including `pk_hi` lets the
+    ///   same pass detect duplicate `(table, pk_lo, pk_hi)` triples
+    ///   without a second walk. The restore loop assumes sorted order
+    ///   for table-range iteration.
     ///
     /// The return type is `anyhow::Result<Self>` rather than
     /// `serde_json::Error` so changing the encoding (e.g. to
