@@ -30,11 +30,7 @@ async fn ping(sock_path: &std::path::Path) -> anyhow::Result<()> {
     let (read, write) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read);
     let mut writer = tokio::io::BufWriter::new(write);
-    write_frame(
-        &mut writer,
-        &Envelope::new("t1", Request::Ping),
-    )
-    .await?;
+    write_frame(&mut writer, &Envelope::new("t1", Request::Ping)).await?;
     let reply: Envelope<Response> = read_frame(&mut reader).await?.expect("response frame");
     assert!(matches!(reply.payload, Response::Pong));
     Ok(())
@@ -82,14 +78,26 @@ async fn non_allowlisted_uid_is_rejected() {
         // Try to send a Ping; if write succeeds, expect read to hit EOF.
         let _ = write_frame(&mut writer, &Envelope::new("rej", Request::Ping)).await;
         // Read should fail or return None (EOF) because the daemon dropped
-        // the socket. Unwrap the FrameError here so the outer assertion
-        // sees `Option<Envelope<Response>>` directly (and `frame.is_none()`
-        // is type-correct). A transport error and a clean EOF are both
-        // acceptable signals that the daemon dropped us — collapse both
-        // into `Ok(None)` so the test reads as "no response delivered".
+        // the socket. The test must distinguish three outcomes:
+        //   * `Ok(None)`        — clean EOF: daemon dropped, no response. PASS.
+        //   * `Err(FrameError::Io(_))` — transport reset/closed mid-read:
+        //                       still consistent with "daemon dropped us".
+        //                       Treat as `None` for the assertion below.
+        //   * `Err(FrameError::Json(_))` / `Err(FrameError::TooLarge(_))` —
+        //                       daemon DID send bytes, just malformed or
+        //                       oversized. That's a real regression in
+        //                       the rejection path; bubble it up as
+        //                       `Err` so the test fails loudly with the
+        //                       reason instead of green-passing.
         let frame: Option<Envelope<Response>> = match read_frame(&mut reader).await {
             Ok(opt) => opt,
-            Err(_) => None,
+            Err(agentic_proto::framing::FrameError::Io(_)) => None,
+            Err(other) => {
+                return Err(anyhow::anyhow!(
+                    "daemon delivered a malformed frame to a non-allowlisted UID; \
+                     rejection path is broken: {other}"
+                ));
+            }
         };
         Ok::<_, anyhow::Error>(frame)
     })
@@ -100,7 +108,12 @@ async fn non_allowlisted_uid_is_rejected() {
 
     let frame = result
         .expect("connection attempt timed out — daemon hung instead of dropping")
-        .expect("inner closure cannot fail — only returns Ok");
+        .expect(
+            "inner closure failed: either UnixStream::connect errored \
+             before the daemon dropped us, or read_frame returned a \
+             malformed-frame error (Json/TooLarge) indicating the \
+             rejection path is broken — see error chain above",
+        );
     assert!(
         frame.is_none(),
         "daemon responded to a non-allowlisted UID; rejection path is broken. Got: {frame:?}"
