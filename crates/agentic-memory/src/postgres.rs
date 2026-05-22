@@ -672,12 +672,20 @@ impl PostgresAdapter {
 
 /// Encoded JSON byte length of a single `Value`. Used by the bootstrap
 /// loop to track `pk_hi` size deltas across rows without re-serialising
-/// the whole segment. Returns 4 ("null") on serialise failure — the
-/// shape is restricted to outputs of `row_to_json`, which only emits
-/// encodable variants, so the fallback is never reached in practice
-/// but staying total beats panicking inside a hot loop on a hypothetical.
+/// the whole segment.
+///
+/// INVARIANT: callers pass either `Json::Null` (from `blank_segment`) or
+/// a value extracted from a `row_to_json` output, which only produces
+/// Value variants `serde_json` can encode — the same discipline
+/// `Segment::to_canonical_bytes` and the envelope-encoding site above
+/// rely on. A silent fallback to a default would let `prev_pk_hi_bytes`
+/// drift, `running_bytes` lose accuracy, and oversized segments seal
+/// — exactly the failure mode the envelope-site `.expect()` was added
+/// to prevent. Fail loudly here too.
 fn encoded_len(v: &Json) -> usize {
-    serde_json::to_vec(v).map(|b| b.len()).unwrap_or(4)
+    serde_json::to_vec(v)
+        .expect("Json value JSON encoding cannot fail; see INVARIANT above")
+        .len()
 }
 
 fn blank_segment(table: &str, schema_version: &str) -> Segment {
