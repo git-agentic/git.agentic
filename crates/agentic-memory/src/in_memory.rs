@@ -155,12 +155,29 @@ impl MemoryAdapter for InMemoryAdapter {
         Ok(self.state.lock().await.schema_version.clone())
     }
 
-    async fn migrations_after(&self, _target_name: &str) -> Result<Vec<String>> {
-        // The fixture doesn't model schema migrations; callers that
-        // exercise the migration path against this backend get an empty
-        // plan and the schema-gate in `restore_with_guard` decides
-        // whether the snapshot is loadable.
-        Ok(Vec::new())
+    async fn migrations_after(&self, target_name: &str) -> Result<Vec<String>> {
+        // The fixture doesn't track applied migrations, but the trait
+        // contract says: "If target_name is not the baseline and not
+        // in the adapter's bookkeeping, error." The only target the
+        // fixture can honestly say it knows is `0.0.0` (the baseline)
+        // and the current `schema_version` set via `set_schema_version`.
+        // Anything else is treated as unknown so migration-path code
+        // tested against this backend doesn't silently get an empty
+        // plan and skip every reverse step.
+        if target_name == "0.0.0" {
+            return Ok(Vec::new());
+        }
+        let state = self.state.lock().await;
+        if target_name == state.schema_version {
+            return Ok(Vec::new());
+        }
+        Err(Error::Other(anyhow::anyhow!(
+            "InMemoryAdapter::migrations_after: target schema_version {target_name:?} \
+             is not the baseline ('0.0.0') and not the live schema ({:?}); \
+             this fixture doesn't track applied migrations so reversing past the \
+             live version is unsafe",
+            state.schema_version
+        )))
     }
 
     async fn begin_restore(&self) -> Result<RestoreGuard> {
@@ -276,10 +293,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_after_returns_empty_for_fixture() {
+    async fn migrations_after_baseline_returns_empty() {
+        // The "0.0.0" baseline always returns empty — the fixture
+        // hasn't applied anything past it.
         let adapter = fixture();
         adapter.set_schema_version("v3").await;
-        assert!(adapter.migrations_after("v1").await.unwrap().is_empty());
+        assert!(adapter.migrations_after("0.0.0").await.unwrap().is_empty());
+        // The live version also returns empty (nothing applied after it).
+        assert!(adapter.migrations_after("v3").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn migrations_after_errors_on_unknown_target() {
+        // Trait contract: unknown non-baseline targets must error so
+        // migration-path code doesn't silently get an empty plan and
+        // skip every reverse step. The fixture's bookkeeping is
+        // intentionally narrow, but the error path is real.
+        let adapter = fixture();
+        adapter.set_schema_version("v3").await;
+        let err = adapter
+            .migrations_after("v1_does_not_exist")
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not the baseline") && msg.contains("not the live schema"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -289,6 +329,76 @@ mod tests {
         // doesn't error and the guard can be dropped freely.
         let guard = adapter.begin_restore().await.unwrap();
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn restore_guard_drops_inner_payload_on_drop() {
+        // Pins the RAII chain that makes the quiesce window work:
+        // dropping the guard drops the payload, which fires the
+        // payload's Drop. Without this property, Postgres's poller
+        // would never resume and TRUNCATE+INSERT during restore
+        // would happen against a paused-but-then-leaked token.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Sentinel {
+            counter: Arc<AtomicUsize>,
+        }
+        impl Drop for Sentinel {
+            fn drop(&mut self) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let counter = Arc::new(AtomicUsize::new(0));
+        let guard = RestoreGuard::new(Sentinel {
+            counter: Arc::clone(&counter),
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "guard's Drop must have run the payload's Drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trips_multiple_tables() {
+        // The single-table tests above don't exercise the sort-before-
+        // hash path or multi-segment manifest assembly. Two tables in
+        // non-alphabetical insertion order, restored, all rows
+        // accounted for.
+        let adapter = fixture();
+        adapter.set_schema_version("v1").await;
+        adapter
+            .insert_rows(
+                "zeta",
+                vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})],
+            )
+            .await;
+        adapter
+            .insert_rows("alpha", vec![serde_json::json!({"id": 100})])
+            .await;
+
+        let handle = adapter.snapshot().await.unwrap();
+        // Manifest entries are sorted by (table, pk_lo) regardless of
+        // insertion order — "alpha" before "zeta".
+        assert_eq!(handle.manifest.entries.len(), 2);
+        assert_eq!(handle.manifest.entries[0].table, "alpha");
+        assert_eq!(handle.manifest.entries[1].table, "zeta");
+
+        // Contaminate then restore.
+        adapter
+            .insert_rows("zeta", vec![serde_json::json!({"id": 999})])
+            .await;
+        adapter
+            .insert_rows("alpha", vec![serde_json::json!({"id": 999})])
+            .await;
+        adapter.restore(&handle).await.unwrap();
+
+        assert_eq!(adapter.rows_of("zeta").await.len(), 2);
+        assert_eq!(adapter.rows_of("alpha").await.len(), 1);
+        assert_eq!(adapter.rows_of("alpha").await[0]["id"], 100);
     }
 
     #[tokio::test]

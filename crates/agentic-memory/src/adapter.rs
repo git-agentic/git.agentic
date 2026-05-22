@@ -25,12 +25,17 @@ pub struct SnapshotHandle {
 /// (Postgres pauses its trigger poller so user-side TRUNCATE+INSERT
 /// doesn't get re-streamed) wrap their internal token here; backends
 /// with no quiesce requirement return [`RestoreGuard::noop`]. In either
-/// case the guard's `Drop` runs the adapter's resume side — there is no
-/// `resume()` method, only `drop`.
+/// case the guard's `Drop` runs the adapter's resume side — there is
+/// no `resume()` method, only `drop`.
+///
+/// **`Send + Sync` is required of the inner payload, but Rust runs an
+/// owned type's `Drop` impl whenever a `Box<T>` is dropped (drop glue,
+/// not a vtable method).** So dropping the guard drops the payload,
+/// which fires the adapter's resume `Drop`.
+#[must_use = "dropping this guard immediately resumes the adapter's background work; \
+              hold it for the entire restore window or the restored state may diverge \
+              from actual storage"]
 pub struct RestoreGuard {
-    // Box of trait-object payload: the vtable carries the inner type's
-    // destructor, so when the guard drops the payload drops, which fires
-    // the adapter-specific resume Drop impl.
     _payload: Box<dyn Send + Sync>,
 }
 
@@ -38,14 +43,23 @@ impl RestoreGuard {
     /// Construct a guard that owns `payload`. When the guard drops,
     /// `payload`'s `Drop` impl runs — adapters put their resume logic
     /// in the payload's destructor.
-    pub fn new<T: Send + Sync + 'static>(payload: T) -> Self {
+    ///
+    /// `pub(crate)` so external callers can't forge a "quiesced" guard
+    /// and hand it to an adapter's `restore_with_guard`. Adapters
+    /// inside this crate construct their own guards; outside callers
+    /// only ever get one from `MemoryAdapter::begin_restore` or
+    /// [`RestoreGuard::noop`].
+    pub(crate) fn new<T: Send + Sync + 'static>(payload: T) -> Self {
         Self {
             _payload: Box::new(payload),
         }
     }
 
     /// No-op guard for backends that don't pause anything (in-memory,
-    /// stub, test fixture).
+    /// stub, test fixture). Safe to hand to any
+    /// [`MemoryAdapter::restore_with_guard`] *whose backend itself does
+    /// not require quiescing* — passing a `noop` to a Postgres-backed
+    /// adapter is a logic error.
     pub fn noop() -> Self {
         Self::new(())
     }
@@ -104,7 +118,11 @@ pub trait MemoryAdapter: Send + Sync {
 
     /// Begin a restore window. Returns a [`RestoreGuard`] whose existence
     /// proves background work (trigger polling, write streaming) is
-    /// paused. The guard's `Drop` resumes it.
+    /// paused. The guard's `Drop` resumes it — drop it too early and
+    /// the adapter's data-capture machinery runs concurrently with the
+    /// restore's TRUNCATE+INSERT.
+    #[must_use = "the returned guard must be held for the entire restore window; \
+                  see RestoreGuard's #[must_use] for the failure mode"]
     async fn begin_restore(&self) -> Result<RestoreGuard>;
 
     /// Restore the snapshot while holding a `RestoreGuard`. The schema
@@ -112,6 +130,16 @@ pub trait MemoryAdapter: Send + Sync {
     /// the live schema is not the same as the target's. Backends are
     /// responsible for replaying the manifest atomically (so a partial
     /// failure does not leave the user database in an intermediate state).
+    ///
+    /// **Precondition (not enforceable at compile time):** `guard` must
+    /// have been produced by *this adapter's* [`Self::begin_restore`].
+    /// Passing a guard from a different adapter, or a
+    /// [`RestoreGuard::noop`] to a backend whose data capture needs
+    /// quiescing, is a logic error — the type system can't catch it
+    /// because the guard is opaque. Callers thread the guard straight
+    /// from `begin_restore` to `restore_with_guard`; agenticd's
+    /// `rollback::execute` is the only production caller and follows
+    /// this pattern.
     async fn restore_with_guard(&self, guard: &RestoreGuard, target: &SnapshotHandle)
         -> Result<()>;
 }
