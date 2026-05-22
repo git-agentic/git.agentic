@@ -400,7 +400,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 <a name="a9"></a>**A9 — Defer: `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — blocked by ADR-0005; single backend today (Rule-of-Three fails).
 
-<a name="a10"></a>**A10 — Defer: `SegmentManifest::from_canonical_bytes`** ([S4](#s4)) — aesthetic; address on next manifest schema change.
+<a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
 <a name="a11"></a>**A11 — Defer: diff atomicity** ([C6](#c6)) — blocked by ADR-0007 (ephemeral branches semantics decided first).
 
@@ -443,7 +443,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A6 | Structured `Response::Error` + framing-error envelope | [#41](https://github.com/git-agentic/git.agentic/issues/41) **DONE** | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
-| A10 | Add `SegmentManifest::from_canonical_bytes` | (TBD) | `v1.1` | — |
+| A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
 | A11 | `Diff` atomicity (blocked by ADR-0007) | (TBD) | `v1.1` | — |
 
 This doc will be updated with the issue numbers once they are created.

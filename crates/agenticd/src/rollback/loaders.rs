@@ -40,7 +40,6 @@ pub(super) fn load_blob(state: &DaemonState, hash: &Hash) -> anyhow::Result<Blob
 
 pub(super) fn load_manifest(state: &DaemonState, hash: &Hash) -> anyhow::Result<SegmentManifest> {
     let bytes = state.store.get_raw(hash)?;
-    let manifest: SegmentManifest =
-        serde_json::from_slice(&bytes).with_context(|| format!("decoding manifest {hash}"))?;
-    Ok(manifest)
+    SegmentManifest::from_canonical_bytes(&bytes)
+        .with_context(|| format!("decoding manifest {hash}"))
 }
