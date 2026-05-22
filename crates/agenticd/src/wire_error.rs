@@ -98,20 +98,7 @@ fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) 
         // non-retryable; the default remains retryable so transient
         // outages still get the retry loop they need. Tracked separately
         // as a v1.1 cleanup.
-        MemoryError::Backend(msg) => {
-            let lower = msg.to_ascii_lowercase();
-            let is_permanent_config_bug = lower.contains("empty identifier")
-                || lower.contains("called before init")
-                || lower.contains("not initialised")
-                || lower.contains("not initialized")
-                || lower.contains("misconfigured")
-                || lower.contains("invalid configuration");
-            if is_permanent_config_bug {
-                (ErrorClass::Memory, "backend_misconfigured", false)
-            } else {
-                (ErrorClass::Memory, "backend_failure", true)
-            }
-        }
+        MemoryError::Backend(msg) => classify_memory_backend_message(msg),
         MemoryError::SchemaMismatch { .. } => (ErrorClass::Memory, "schema_mismatch", false),
         MemoryError::MissingReverseMigration(_) => {
             (ErrorClass::Memory, "missing_reverse_migration", false)
@@ -122,6 +109,62 @@ fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) 
         MemoryError::Sqlx(sqlx) => classify_sqlx_like(sqlx),
         MemoryError::Other(_) => (ErrorClass::Internal, "memory_other", false),
     }
+}
+
+/// Classify a `MemoryError::Backend(String)` payload. The list is
+/// derived from every `Error::Backend(...)` callsite in
+/// `crates/agentic-memory` as of the audit on 2026-05-22 — keep it in
+/// sync when new callsites land. Anything not matched here is treated
+/// as transient (retryable=true) because the safer default for the
+/// memory backend is the same as for sqlx: an unrecognised failure
+/// usually means a hiccup, and retry is cheaper than surfacing a
+/// permanent failure to the agent.
+///
+/// TODO(v1.1): split `agentic_memory::Error::Backend(String)` into
+/// typed variants upstream so this string-sniffing can be deleted.
+fn classify_memory_backend_message(msg: &str) -> (ErrorClass, &'static str, bool) {
+    let lower = msg.to_ascii_lowercase();
+
+    // pgvector missing — fires on the very first `init()` against a
+    // Postgres without the extension. Permanent until an operator
+    // runs `CREATE EXTENSION vector;`.
+    if lower.contains("pgvector extension is not installed") {
+        return (ErrorClass::Memory, "pgvector_not_installed", false);
+    }
+    // Identifier / configuration validation — caller passed a bad
+    // table name or column. Permanent until input changes.
+    if lower.contains("empty identifier") || lower.contains("invalid character in identifier") {
+        return (ErrorClass::Validation, "invalid_identifier", false);
+    }
+    // Init-ordering bugs — adapter used before init() ran. Permanent
+    // until the daemon's startup path is fixed.
+    if lower.contains("called before init")
+        || lower.contains("not initialised")
+        || lower.contains("not initialized")
+    {
+        return (ErrorClass::Memory, "backend_not_initialised", false);
+    }
+    // Static configuration errors.
+    if lower.contains("misconfigured") || lower.contains("invalid configuration") {
+        return (ErrorClass::Memory, "backend_misconfigured", false);
+    }
+    // Streamer task died — does not self-restart in v1.0; the daemon
+    // must be restarted. Permanent until then; retrying makes no
+    // progress.
+    if lower.contains("streamer task has shut down")
+        || lower.contains("streamer dropped reply channel")
+    {
+        return (ErrorClass::Memory, "streamer_dead", false);
+    }
+    // Stored segment row is malformed JSON. Retrying can't change
+    // bytes already at rest.
+    if lower.contains("segment row is not a json object") {
+        return (ErrorClass::Storage, "segment_row_corrupt", false);
+    }
+
+    // Fallback: assume transient. See doc comment above for the
+    // rationale (same safe-default reasoning as `classify_sqlx_like`).
+    (ErrorClass::Memory, "backend_failure", true)
 }
 
 /// Classify a `sqlx::Error` that arrives via `MemoryError::Sqlx`.
@@ -299,17 +342,71 @@ mod tests {
     }
 
     #[test]
-    fn memory_backend_permanent_config_bug_is_not_retryable() {
-        // The known-permanent shapes (TODO upstream: split the
-        // Backend(String) variant) must not flip AgenticSessionStore
-        // into retry-forever.
-        for msg in [
-            "empty identifier on memory snapshot",
-            "snapshot called before init",
-            "Postgres adapter not initialised",
-            "memory adapter misconfigured",
-            "invalid configuration: missing url",
-        ] {
+    fn memory_backend_permanent_messages_classify_with_specific_codes() {
+        // Every known permanent shape from `crates/agentic-memory/src/`
+        // routes to a code more specific than the catchall, and is
+        // marked retryable=false. The triples are
+        // (message, expected_class, expected_code).
+        // TODO(v1.1): collapse this when MemoryError::Backend is split
+        // into typed variants upstream.
+        let cases: &[(&str, ErrorClass, &str)] = &[
+            (
+                "pgvector extension is not installed; run CREATE EXTENSION vector;",
+                ErrorClass::Memory,
+                "pgvector_not_installed",
+            ),
+            (
+                "empty identifier",
+                ErrorClass::Validation,
+                "invalid_identifier",
+            ),
+            (
+                "invalid character in identifier: \"weird name\"",
+                ErrorClass::Validation,
+                "invalid_identifier",
+            ),
+            (
+                "snapshot called before init",
+                ErrorClass::Memory,
+                "backend_not_initialised",
+            ),
+            (
+                "begin_restore called before init() — no trigger poller is running",
+                ErrorClass::Memory,
+                "backend_not_initialised",
+            ),
+            (
+                "Postgres adapter not initialised",
+                ErrorClass::Memory,
+                "backend_not_initialised",
+            ),
+            (
+                "memory adapter misconfigured",
+                ErrorClass::Memory,
+                "backend_misconfigured",
+            ),
+            (
+                "invalid configuration: missing url",
+                ErrorClass::Memory,
+                "backend_misconfigured",
+            ),
+            (
+                "streamer task has shut down",
+                ErrorClass::Memory,
+                "streamer_dead",
+            ),
+            (
+                "streamer dropped reply channel",
+                ErrorClass::Memory,
+                "streamer_dead",
+            ),
+            (
+                "segment row is not a JSON object: {\"bad\":1}",
+                ErrorClass::Storage,
+                "segment_row_corrupt",
+            ),
+        ];
+        for (msg, expected_class, expected_code) in cases {
             let err: anyhow::Error = anyhow::Error::new(MemoryError::Backend(msg.to_string()));
             match map_anyhow_to_response_error(err) {
                 Response::Error {
@@ -318,9 +415,9 @@ mod tests {
                     retryable,
                     ..
                 } => {
-                    assert_eq!(class, ErrorClass::Memory);
-                    assert_eq!(code, "backend_misconfigured");
-                    assert!(!retryable, "permanent config bug must not retry; msg={msg}");
+                    assert_eq!(&class, expected_class, "wrong class for: {msg}");
+                    assert_eq!(&code, expected_code, "wrong code for: {msg}");
+                    assert!(!retryable, "permanent shape must not retry; msg={msg}");
                 }
                 _ => panic!("expected Response::Error"),
             }

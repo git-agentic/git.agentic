@@ -130,6 +130,14 @@ pub enum ErrorClass {
     /// than failing the whole envelope. Treat as non-retryable until the
     /// client upgrades to the proto version that names the class
     /// concretely.
+    ///
+    /// **Caveat for proxy authors:** `#[serde(other)]` only affects the
+    /// deserialiser. If you receive `class = "auth"` from a future
+    /// daemon, decode it through `ErrorClass::Unknown`, and re-serialise
+    /// the same value back onto the wire, the output will be
+    /// `class = "unknown"` — the original tag is lost. Proxies that
+    /// need to preserve unknown tags should keep the original JSON
+    /// alongside the typed enum.
     #[serde(other)]
     Unknown,
 }

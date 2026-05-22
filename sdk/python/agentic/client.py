@@ -47,7 +47,12 @@ class AgenticError(Exception):
 
     code: str = ""
     retryable: bool = False
-    _class_token: str = ""  # ErrorClass tag from the wire; populated on raise.
+    # ErrorClass tag from the wire; populated on raise. Public attribute
+    # because forward-compat callers (a Python SDK at version N talking
+    # to a daemon at version N+1 that introduced a new ErrorClass) need
+    # to read it off the AgenticInternalError fallback to recover the
+    # original tag.
+    class_token: str = ""
 
     def __init__(
         self,
@@ -60,7 +65,7 @@ class AgenticError(Exception):
         super().__init__(message)
         self.code = code
         self.retryable = retryable
-        self._class_token = class_token
+        self.class_token = class_token
 
 
 class AgenticProtocolError(AgenticError):
@@ -105,7 +110,12 @@ class AgenticConcurrencyError(AgenticError):
             retryable=True,
             class_token=class_token,
         )
-        del retryable  # ignored on purpose; see comment above.
+        # The caller-supplied `retryable` is intentionally ignored; the
+        # parent constructor has already pinned `self.retryable = True`.
+        # Assert the invariant here so a refactor that re-introduces a
+        # silent override is caught at construction time, not when an
+        # agent run silently stops retrying.
+        assert self.retryable is True, "Concurrency-class errors must remain retryable"
 
 
 class AgenticInternalError(AgenticError):

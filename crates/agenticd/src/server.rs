@@ -248,8 +248,23 @@ pub async fn handle_connection(
                 map_anyhow_to_response_error(e)
             }
         };
+        // Hold a clone of the correlation_id so the error log on a
+        // write failure can include it. Without this, a successful
+        // dispatch followed by a socket reset during write would close
+        // the connection with no record of which request the client
+        // never got a reply for.
+        let correlation_id_for_log = correlation_id.clone();
         let reply = Envelope::new(correlation_id, response);
-        write_frame(&mut writer, &reply).await?;
+        if let Err(e) = write_frame(&mut writer, &reply).await {
+            tracing::warn!(
+                target: "agenticd::dispatch",
+                peer_uid = ?peer_uid,
+                correlation_id = %correlation_id_for_log,
+                write_error = %e,
+                "failed to deliver dispatch reply; closing connection"
+            );
+            return Err(e.into());
+        }
     }
 }
 
@@ -648,6 +663,74 @@ mod tests {
             Err(EnvelopeParseError::Unattributable(_)) => {}
             other => panic!("expected Unattributable, got {other:?}"),
         }
+    }
+
+    /// Helper: assert that the given envelope JSON triggers an
+    /// attributable `malformed_protocol_version` reply. Used by the
+    /// four cases below that exercise the strict decoding path.
+    async fn assert_malformed_protocol_version(envelope: &[u8], expected_cid: &str) {
+        match parse_envelope_with_v0_shim(envelope, None).await {
+            Err(EnvelopeParseError::Attributable {
+                correlation_id,
+                response: Response::Error { class, code, .. },
+            }) => {
+                assert_eq!(correlation_id, expected_cid);
+                assert_eq!(class, agentic_proto::ErrorClass::Protocol);
+                assert_eq!(code, "malformed_protocol_version");
+            }
+            other => {
+                panic!("expected attributable malformed_protocol_version reply, got {other:?}")
+            }
+        }
+    }
+
+    /// ADR-0010 Decision 5 (strict): a `protocol_version` outside the
+    /// u16 wire range must surface as `malformed_protocol_version`,
+    /// not silently wrap modulo 65536 (65537 → 1 was the silent path
+    /// the round-1 review caught).
+    #[tokio::test]
+    async fn parse_envelope_rejects_oversize_protocol_version() {
+        let bytes = br#"{
+            "correlation_id": "c-oversize",
+            "protocol_version": 65537,
+            "payload": {"op": "ping"}
+        }"#;
+        assert_malformed_protocol_version(bytes, "c-oversize").await;
+    }
+
+    /// A JSON *string* `"1"` must not silently downgrade to v0 (which
+    /// `as_u64().unwrap_or(0)` would have done). Treated as a
+    /// Protocol-class malformed envelope instead.
+    #[tokio::test]
+    async fn parse_envelope_rejects_string_protocol_version() {
+        let bytes = br#"{
+            "correlation_id": "c-string",
+            "protocol_version": "1",
+            "payload": {"op": "ping"}
+        }"#;
+        assert_malformed_protocol_version(bytes, "c-string").await;
+    }
+
+    /// A JSON boolean `protocol_version: true` is invalid.
+    #[tokio::test]
+    async fn parse_envelope_rejects_boolean_protocol_version() {
+        let bytes = br#"{
+            "correlation_id": "c-bool",
+            "protocol_version": true,
+            "payload": {"op": "ping"}
+        }"#;
+        assert_malformed_protocol_version(bytes, "c-bool").await;
+    }
+
+    /// A negative integer is rejected on the `as_u64()` step.
+    #[tokio::test]
+    async fn parse_envelope_rejects_negative_protocol_version() {
+        let bytes = br#"{
+            "correlation_id": "c-neg",
+            "protocol_version": -1,
+            "payload": {"op": "ping"}
+        }"#;
+        assert_malformed_protocol_version(bytes, "c-neg").await;
     }
 
     /// A v1 envelope with a base64-encoded prompt deserialises into
