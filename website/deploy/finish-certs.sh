@@ -12,7 +12,7 @@ exec >>"$LOG" 2>&1
 echo
 echo "=== $(date -u +%FT%TZ) run ==="
 
-EMAIL=toni.bergholm@gmail.com
+EMAIL=toni@git-agentic.com
 WEBROOT=/var/www/certbot
 
 issue() {

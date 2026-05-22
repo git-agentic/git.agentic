@@ -116,7 +116,7 @@ A `docker-compose.yml` lands in week 11 to bring up Postgres + agenticd + the de
 
 ## Design partners
 
-If you're running a stateful LangGraph agent in production and have been burned by a prompt or schema change that you couldn't cleanly revert, we want to talk. The MVP is being co-designed with three teams. Reach out to Toni (toni.bergholm@gmail.com).
+If you're running a stateful LangGraph agent in production and have been burned by a prompt or schema change that you couldn't cleanly revert, we want to talk. The MVP is being co-designed with three teams. Reach out to Toni (toni@git-agentic.com).
 
 ## License
 
