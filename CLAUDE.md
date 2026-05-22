@@ -124,7 +124,7 @@ When in doubt, these are authoritative:
 - [`docs/adr/0002-substrate-and-supercommit.md`](docs/adr/0002-substrate-and-supercommit.md) — substrate, extended Commit, 2PC staging order
 - [`docs/adr/0003-claude-agent-sdk-integration.md`](docs/adr/0003-claude-agent-sdk-integration.md) — first non-LangGraph integration target (the first platform-partner integration / Claude Agent SDK), layered session-manifest path
 - [`docs/adr/0004-realtime-agenticd-for-executor.md`](docs/adr/0004-realtime-agenticd-for-executor.md) — sidecar `agenticd` topology for the Executor's real-time atomic integration: deployment shape, snapshot triggers, failure semantics, GCS-backed `ObjectStore` (Decisions 3 and 4 amended by ADR-0005)
-- [`docs/adr/0005-sessionstore-amendment-to-adr-0004.md`](docs/adr/0005-sessionstore-amendment-to-adr-0004.md) — Proposed amendment: snapshot primitive is the Claude Agent SDK's `SessionStore.append`; loud-fail preserved via a synchronising `PreToolUse` hook
+- [`docs/adr/0005-sessionstore-amendment-to-adr-0004.md`](docs/adr/0005-sessionstore-amendment-to-adr-0004.md) — Accepted amendment (2026-05-22): snapshot primitive is the Claude Agent SDK's `SessionStore.append`; loud-fail preserved via a synchronising `PreToolUse` hook
 - [`docs/architecture/overview.md`](docs/architecture/overview.md) — runtime topology
 - [`docs/architecture/snapshot-model.md`](docs/architecture/snapshot-model.md) — the technical heart
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — what's accepted right now, code style, ADR process
