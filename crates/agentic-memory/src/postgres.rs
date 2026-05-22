@@ -269,6 +269,20 @@ impl PostgresAdapter {
 
         let mut current = blank_segment(&table.name, schema_version);
         let mut have_lo = false;
+        // Track the running encoded size incrementally rather than calling
+        // `current.canonical_size()` on every iteration — that method
+        // re-serialises the entire segment to JSON, which makes the
+        // per-row loop O(n²) on segment size. For a 64 MiB segment_target
+        // that turns 100K-row bootstraps into a >10-minute hang on a
+        // laptop. The running counter slightly over-counts per-row
+        // overhead (we add the envelope size plus a `,` byte rather than
+        // doing the exact JSON encoding), which means segments seal a
+        // few bytes early — that's a no-op for downstream readers and
+        // keeps the assembly linear.
+        // Baseline overhead = the encoded size of an empty segment for
+        // this table/schema. Computed once, then we add row-encoded
+        // bytes incrementally below.
+        let mut running_bytes: usize = current.canonical_size();
 
         for row in &rows {
             let row_json = row_to_json(row);
@@ -281,14 +295,26 @@ impl PostgresAdapter {
             current.pk_hi = pk_value.clone();
             // Wrap in the streamer's envelope shape so the restore code
             // path is uniform across bootstrap and delta segments.
-            current
-                .rows
-                .push(serde_json::json!({"op": "insert", "row": row_json}));
+            let envelope = serde_json::json!({"op": "insert", "row": row_json});
+            // Account for the envelope's encoded bytes BEFORE pushing
+            // so the next per-row branch sees the correct running total.
+            // `serde_json::to_vec(&envelope).len()` is the row body; the
+            // `+ 1` covers the comma that joins rows inside the segment's
+            // JSON array.
+            let envelope_bytes = serde_json::to_vec(&envelope)
+                .map(|v| v.len() + 1)
+                .unwrap_or(0);
+            running_bytes = running_bytes.saturating_add(envelope_bytes);
+
+            current.rows.push(envelope);
             current.row_count = current.rows.len() as u64;
 
-            if current.canonical_size() >= self.cfg.segment_target_bytes {
+            if running_bytes >= self.cfg.segment_target_bytes {
                 self.seal_segment(&mut current, schema_version, manifest)?;
                 have_lo = false;
+                // After seal_segment the segment is reset; recompute the
+                // baseline overhead for the fresh segment shape.
+                running_bytes = current.canonical_size();
             }
         }
 
