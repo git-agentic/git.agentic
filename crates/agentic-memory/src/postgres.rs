@@ -274,14 +274,22 @@ impl PostgresAdapter {
         // re-serialises the entire segment to JSON, which makes the
         // per-row loop O(n²) on segment size. For a 64 MiB segment_target
         // that turns 100K-row bootstraps into a >10-minute hang on a
-        // laptop. The running counter slightly over-counts per-row
-        // overhead (we add the envelope size plus a `,` byte rather than
-        // doing the exact JSON encoding), which means segments seal a
-        // few bytes early — that's a no-op for downstream readers and
-        // keeps the assembly linear.
-        // Baseline overhead = the encoded size of an empty segment for
-        // this table/schema. Computed once, then we add row-encoded
-        // bytes incrementally below.
+        // laptop. The running counter is *one re-serialise per segment*
+        // plus a per-row envelope-size add.
+        //
+        // Accuracy: the segment's encoded size has three moving parts —
+        // `pk_lo` (set once, on the first row), `pk_hi` (rewritten every
+        // row but its encoded length changes only when the value's text
+        // form does), `row_count` (the JSON integer grows by a digit at
+        // 10, 100, 1000, …), and the row envelopes themselves
+        // (incremented exactly). We rebaseline once *after* `pk_lo` is
+        // set on the first row so its bytes are caught; after that the
+        // header-field deltas (pk_hi reshape, row_count digit growth)
+        // are bounded by a few tens of bytes per segment — negligible
+        // against `segment_target_bytes` (default 64 MiB) and against
+        // the bound the seal check itself enforces. The counter is
+        // therefore correct to within ~tens of bytes per segment, never
+        // O(rows).
         let mut running_bytes: usize = current.canonical_size();
 
         for row in &rows {
@@ -291,6 +299,10 @@ impl PostgresAdapter {
             if !have_lo {
                 current.pk_lo = pk_value.clone();
                 have_lo = true;
+                // Rebaseline now that `pk_lo` is set — captures the PK
+                // bytes in the header that the blank-segment baseline
+                // missed. One re-serialise per segment, not per row.
+                running_bytes = current.canonical_size();
             }
             current.pk_hi = pk_value.clone();
             // Wrap in the streamer's envelope shape so the restore code
