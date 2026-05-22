@@ -89,13 +89,18 @@ pub async fn restore_manifest<S: ObjectStore + ?Sized>(
         // Apply every envelope in seal order. Later events for the same
         // primary key supersede earlier ones via INSERT ON CONFLICT;
         // deletes drop the row.
+        //
+        // Batched: `apply_segment_rows` groups consecutive same-shape
+        // envelopes (same column-set + same upsert-vs-delete mode) and
+        // emits one multi-row SQL statement per group. At 1M rows this
+        // is ~100× fewer round-trips than the previous one-INSERT-per-row
+        // path; see docs/architecture/benchmarks.md §"Postgres-integration
+        // smoke" for the impact on §9 rollback timing.
         for entry in manifest.entries.iter().filter(|e| e.table == table.name) {
             let seg = segments_by_hash
                 .get(&entry.segment)
                 .expect("pre-loaded above");
-            for envelope in &seg.rows {
-                apply_envelope(&mut *tx, &qualified, &table.pk, envelope).await?;
-            }
+            apply_segment_rows(&mut tx, &qualified, &table.pk, &seg.rows).await?;
         }
     }
 
@@ -168,111 +173,266 @@ enum Op {
     Delete,
 }
 
-async fn apply_envelope<'c, E>(
-    executor: E,
+/// Apply a whole segment's rows in batched SQL.
+///
+/// Walks `rows` once and emits multi-row statements over runs of
+/// envelopes that share both their mode (upsert vs delete) and (for
+/// upserts) their column-set. Order across runs is preserved — a
+/// `(Insert id=1) (Delete id=1) (Insert id=1)` sequence still goes
+/// through Postgres as three statements in that order, because the
+/// shape changes twice. Within a same-shape run, the SQL is one
+/// `INSERT … VALUES (...), (...), … ON CONFLICT` (or one `DELETE …
+/// WHERE pk IN (...)`).
+///
+/// Batch-size cap: at most `BATCH_MAX_ROWS` rows per statement, OR
+/// `BATCH_MAX_PARAMS / col_count` rows — whichever is smaller. Keeps
+/// us well clear of Postgres's 65535-parameter ceiling per statement.
+///
+/// Pre-validates every envelope before any SQL — same
+/// fail-loudly-before-side-effects discipline used by
+/// `drain_to_completion` in strict mode.
+async fn apply_segment_rows(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
     qualified: &str,
     pk_col: &str,
-    envelope: &Json,
-) -> Result<()>
-where
-    E: Executor<'c, Database = Postgres>,
-{
-    let (op, row) = peel_envelope(envelope)?;
-    match op {
-        Op::Insert | Op::Update => upsert_row(executor, qualified, pk_col, row).await,
-        Op::Delete => delete_row(executor, qualified, pk_col, row).await,
+    rows: &[Json],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
     }
-}
+    validate_identifier(pk_col)?;
 
-async fn upsert_row<'c, E>(executor: E, qualified: &str, pk_col: &str, row: &Json) -> Result<()>
-where
-    E: Executor<'c, Database = Postgres>,
-{
-    let obj = row
-        .as_object()
-        .ok_or_else(|| Error::Backend(format!("segment row is not a JSON object: {row}")))?;
-    if obj.is_empty() {
+    // Decode every envelope up-front. Catches malformed segments
+    // before we've issued any SQL — restore aborts cleanly and the
+    // outer transaction rolls back. Each entry's row must be an
+    // object (segments record row state as JSON objects keyed by
+    // column name).
+    let mut entries: Vec<(Op, &serde_json::Map<String, Json>)> = Vec::with_capacity(rows.len());
+    for env in rows {
+        let (op, row) = peel_envelope(env)?;
+        let obj = row
+            .as_object()
+            .ok_or_else(|| Error::Backend(format!("segment row is not a JSON object: {row}")))?;
+        if obj.is_empty() {
+            // Empty row payload would produce a zero-column INSERT,
+            // which is invalid SQL anyway. Skip — matches what the
+            // single-row upsert path did via early-return.
+            continue;
+        }
+        entries.push((op, obj));
+    }
+    if entries.is_empty() {
         return Ok(());
     }
 
-    let sorted: BTreeMap<&String, &Json> = obj.iter().collect();
-    let mut columns = String::new();
-    let mut placeholders = String::new();
-    let mut update_set = String::new();
-    let mut args = PgArguments::default();
+    // Walk consecutive same-shape runs.
+    let mut i = 0;
+    while i < entries.len() {
+        let (first_op, first_obj) = entries[i];
+        let first_mode = batch_mode_of(first_op);
+        let first_cols: Vec<&str> = first_obj.keys().map(String::as_str).collect();
+        // Cap by both row count AND param count. For upserts param
+        // count == col_count * rows; for deletes it's just rows.
+        // The smaller cap controls.
+        let per_row_params = match first_mode {
+            BatchMode::Upsert => first_cols.len(),
+            BatchMode::Delete => 1,
+        };
+        let cap = BATCH_MAX_ROWS.min(BATCH_MAX_PARAMS / per_row_params.max(1));
 
-    for (i, (col, val)) in sorted.iter().enumerate() {
-        validate_identifier(col)?;
-        if i > 0 {
-            columns.push_str(", ");
-            placeholders.push_str(", ");
-        }
-        columns.push('"');
-        columns.push_str(col);
-        columns.push('"');
-        placeholders.push('$');
-        placeholders.push_str(&(i + 1).to_string());
-        if col.as_str() != pk_col {
-            if !update_set.is_empty() {
-                update_set.push_str(", ");
+        // Find the run end: same mode, same column-set (for upserts),
+        // and within the cap.
+        let mut j = i + 1;
+        while j < entries.len() && j - i < cap {
+            let (next_op, next_obj) = entries[j];
+            if batch_mode_of(next_op) != first_mode {
+                break;
             }
-            update_set.push('"');
-            update_set.push_str(col);
-            update_set.push_str("\" = EXCLUDED.\"");
-            update_set.push_str(col);
-            update_set.push('"');
+            if first_mode == BatchMode::Upsert {
+                // Column-sets must match. Cheap check first: equal length.
+                if next_obj.len() != first_cols.len() {
+                    break;
+                }
+                // Same keys in same canonical (BTreeMap) order — since
+                // serde_json::Map preserves insertion order, compare
+                // the sorted column lists.
+                let next_cols: Vec<&str> = next_obj.keys().map(String::as_str).collect();
+                if !same_column_set(&first_cols, &next_cols) {
+                    break;
+                }
+            }
+            j += 1;
         }
-        bind_json(&mut args, val)?;
+
+        // Slice `entries[i..j]` is one batch.
+        match first_mode {
+            BatchMode::Upsert => {
+                batch_upsert(tx, qualified, pk_col, &first_cols, &entries[i..j]).await?
+            }
+            BatchMode::Delete => batch_delete(tx, qualified, pk_col, &entries[i..j]).await?,
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+/// Max rows per batched SQL statement. 1000 is well under Postgres's
+/// query-length limit at typical schema widths and small enough that
+/// a partial failure (rare — restore is single-tx) doesn't waste a
+/// huge amount of work on rollback.
+const BATCH_MAX_ROWS: usize = 1000;
+/// Postgres caps a single statement at 65535 parameters. Stay well
+/// under to leave headroom for any future helper columns / placeholders.
+const BATCH_MAX_PARAMS: usize = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchMode {
+    /// `Insert` and `Update` share the SQL shape (multi-row INSERT
+    /// ON CONFLICT DO UPDATE), so they batch together.
+    Upsert,
+    /// `Delete` becomes one `DELETE … WHERE pk IN (...)`; only the PK
+    /// matters, other columns in the envelope are ignored.
+    Delete,
+}
+
+fn batch_mode_of(op: Op) -> BatchMode {
+    match op {
+        Op::Insert | Op::Update => BatchMode::Upsert,
+        Op::Delete => BatchMode::Delete,
+    }
+}
+
+/// Compare two column-name slices irrespective of order. `serde_json::Map`
+/// preserves insertion order, so we can't rely on identical iteration
+/// order across two row objects from different sources. Cheap because
+/// each segment's rows almost always share the same column-set, so the
+/// check is at most O(n²) per row-pair in the *very* unusual mixed case;
+/// the common case is identical iteration order and the loop short-circuits.
+fn same_column_set(a: &[&str], b: &[&str]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|c| b.contains(c))
+}
+
+async fn batch_upsert(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    qualified: &str,
+    pk_col: &str,
+    cols: &[&str],
+    rows: &[(Op, &serde_json::Map<String, Json>)],
+) -> Result<()> {
+    debug_assert!(!rows.is_empty());
+    for c in cols {
+        validate_identifier(c)?;
     }
 
-    validate_identifier(pk_col)?;
+    // Build `(c1, c2, ..., cN)` once.
+    let mut columns_sql = String::new();
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            columns_sql.push_str(", ");
+        }
+        columns_sql.push('"');
+        columns_sql.push_str(c);
+        columns_sql.push('"');
+    }
+    // `ON CONFLICT DO UPDATE` set list (non-PK columns only). If the
+    // only column is the PK, fall back to DO NOTHING — there's nothing
+    // to update on conflict.
+    let mut update_set = String::new();
+    for c in cols.iter().filter(|c| **c != pk_col) {
+        if !update_set.is_empty() {
+            update_set.push_str(", ");
+        }
+        update_set.push('"');
+        update_set.push_str(c);
+        update_set.push_str("\" = EXCLUDED.\"");
+        update_set.push_str(c);
+        update_set.push('"');
+    }
+
+    // Build the multi-row VALUES list `($1, $2, ...), ($N+1, ...), ...`
+    // and bind args in lock-step.
+    let mut values_sql = String::new();
+    let mut args = PgArguments::default();
+    let mut next_placeholder: usize = 1;
+    for (row_idx, (_op, obj)) in rows.iter().enumerate() {
+        if row_idx > 0 {
+            values_sql.push_str(", ");
+        }
+        values_sql.push('(');
+        for (col_idx, col) in cols.iter().enumerate() {
+            if col_idx > 0 {
+                values_sql.push_str(", ");
+            }
+            values_sql.push('$');
+            values_sql.push_str(&next_placeholder.to_string());
+            next_placeholder += 1;
+            // Column-set was already verified equal across rows; the
+            // map lookup must succeed.
+            let val = obj.get(*col).ok_or_else(|| {
+                Error::Backend(format!(
+                    "row {row_idx} unexpectedly missing column {col:?} \
+                     after column-set match; this is a bug in apply_segment_rows"
+                ))
+            })?;
+            bind_json(&mut args, val)?;
+        }
+        values_sql.push(')');
+    }
+
     let sql = if update_set.is_empty() {
         format!(
-            "INSERT INTO {qualified} ({columns}) VALUES ({placeholders}) \
+            "INSERT INTO {qualified} ({columns_sql}) VALUES {values_sql} \
              ON CONFLICT (\"{pk_col}\") DO NOTHING"
         )
     } else {
         format!(
-            "INSERT INTO {qualified} ({columns}) VALUES ({placeholders}) \
+            "INSERT INTO {qualified} ({columns_sql}) VALUES {values_sql} \
              ON CONFLICT (\"{pk_col}\") DO UPDATE SET {update_set}"
         )
     };
-    sqlx::query_with(&sql, args).execute(executor).await?;
+    sqlx::query_with(&sql, args).execute(&mut **tx).await?;
     Ok(())
 }
 
-async fn delete_row<'c, E>(executor: E, qualified: &str, pk_col: &str, row: &Json) -> Result<()>
-where
-    E: Executor<'c, Database = Postgres>,
-{
-    // DELETE … WHERE pk = NULL silently matches zero rows in SQL, so a
-    // delete envelope with a missing or NULL PK would no-op without
-    // any signal — the row stays in the user's table even though the
-    // manifest said it should be gone. Fail loudly instead.
-    let obj = row.as_object().ok_or_else(|| {
-        Error::Backend(format!("delete envelope row is not a JSON object: {row}"))
-    })?;
-    let pk_value = match obj.get(pk_col) {
-        Some(v) if !v.is_null() => v.clone(),
-        Some(_) => {
-            return Err(Error::Backend(format!(
-                "delete envelope for {qualified}: PK column {pk_col:?} is NULL; \
-                 DELETE … WHERE pk = NULL would silently match zero rows. \
-                 Refusing to no-op a delete."
-            )))
-        }
-        None => {
-            return Err(Error::Backend(format!(
-                "delete envelope for {qualified}: PK column {pk_col:?} is absent \
-                 from the envelope row; can't issue the DELETE."
-            )))
-        }
-    };
-    validate_identifier(pk_col)?;
+async fn batch_delete(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    qualified: &str,
+    pk_col: &str,
+    rows: &[(Op, &serde_json::Map<String, Json>)],
+) -> Result<()> {
+    debug_assert!(!rows.is_empty());
+    // Build the placeholder list `$1, $2, ..., $N` and bind PKs.
+    let mut placeholders = String::new();
     let mut args = PgArguments::default();
-    bind_json(&mut args, &pk_value)?;
-    let sql = format!("DELETE FROM {qualified} WHERE \"{pk_col}\" = $1");
-    sqlx::query_with(&sql, args).execute(executor).await?;
+    for (idx, (_op, obj)) in rows.iter().enumerate() {
+        let pk_value = match obj.get(pk_col) {
+            Some(v) if !v.is_null() => v,
+            Some(_) => {
+                return Err(Error::Backend(format!(
+                    "batch delete for {qualified}: PK column {pk_col:?} is NULL in one \
+                     of the envelope rows; DELETE … WHERE pk IN (NULL) silently matches \
+                     zero rows. Refusing to no-op a delete."
+                )));
+            }
+            None => {
+                return Err(Error::Backend(format!(
+                    "batch delete for {qualified}: PK column {pk_col:?} is absent from \
+                     one of the envelope rows; can't issue the DELETE."
+                )));
+            }
+        };
+        if idx > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push('$');
+        placeholders.push_str(&(idx + 1).to_string());
+        bind_json(&mut args, pk_value)?;
+    }
+    let sql = format!("DELETE FROM {qualified} WHERE \"{pk_col}\" IN ({placeholders})");
+    sqlx::query_with(&sql, args).execute(&mut **tx).await?;
     Ok(())
 }
 
