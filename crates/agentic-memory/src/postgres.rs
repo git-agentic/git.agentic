@@ -22,8 +22,7 @@ use serde_json::Value as Json;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
-use crate::adapter::{MemoryAdapter, SnapshotHandle};
-use crate::restore::RestoreGuard;
+use crate::adapter::{MemoryAdapter, RestoreGuard, SnapshotHandle};
 use crate::segment::{Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::streamer::{self, StreamerHandle};
 use crate::triggers::{self, Quiesceable};
@@ -457,65 +456,8 @@ impl MemoryAdapter for PostgresAdapter {
     async fn current_schema_version(&self) -> Result<String> {
         self.current_schema_version_inner().await
     }
-}
 
-impl PostgresAdapter {
-    /// Begin a restore window. Returns a [`RestoreGuard`] whose presence
-    /// proves the trigger poller is paused; the poller resumes when the
-    /// guard is dropped.
-    ///
-    /// Audit anchor:
-    /// [§A1](../../../../docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1).
-    /// Errors if the adapter has not been initialised (no poller running).
-    pub async fn begin_restore(&self) -> Result<RestoreGuard> {
-        let poller = self.poller_handle.as_ref().ok_or_else(|| {
-            Error::Backend(
-                "begin_restore called before init() — no trigger poller is running".into(),
-            )
-        })?;
-        let token = poller.pause().await;
-        Ok(RestoreGuard::new(token))
-    }
-
-    /// Restore the snapshot into the user's database while holding a
-    /// [`RestoreGuard`]. The schema-version gate fires first, then the
-    /// manifest replay runs inside a transaction that also wipes
-    /// `agentic_change_log` (see [`crate::restore::restore_manifest`]).
-    ///
-    /// Callers in a rollback path use this method directly so the quiesce
-    /// window is visible at the call site; other callers can use the
-    /// [`MemoryAdapter::restore`] trait method, which wraps `begin_restore`
-    /// + `restore_with_guard` for convenience.
-    pub async fn restore_with_guard(
-        &self,
-        guard: &RestoreGuard,
-        target: &SnapshotHandle,
-    ) -> Result<()> {
-        let live = self.current_schema_version_inner().await?;
-        if live != target.schema_version {
-            return Err(Error::SchemaMismatch {
-                live,
-                target: target.schema_version.clone(),
-            });
-        }
-        crate::restore::restore_manifest(
-            guard,
-            &self.pool,
-            self.store.as_ref(),
-            &target.manifest,
-            &self.cfg.tables,
-        )
-        .await
-    }
-
-    /// Return migration names applied after `target_name`, ordered from
-    /// most-recent to least-recent (i.e. the order they must be reversed).
-    ///
-    /// If `target_name` is `"0.0.0"` (the baseline value returned when no
-    /// migrations have been applied), all recorded migrations are returned.
-    /// If `target_name` is not found in `agentic_migrations` and is not the
-    /// baseline, an error is returned — reversing an unknown target is unsafe.
-    pub async fn migrations_after(&self, target_name: &str) -> Result<Vec<String>> {
+    async fn migrations_after(&self, target_name: &str) -> Result<Vec<String>> {
         if target_name == "0.0.0" {
             let rows: Vec<(String,)> =
                 sqlx::query_as("SELECT name FROM agentic_migrations ORDER BY id DESC")
@@ -549,17 +491,58 @@ impl PostgresAdapter {
         Ok(rows.into_iter().map(|(n,)| n).collect())
     }
 
+    /// Begin a restore window. The Postgres backend pauses its trigger
+    /// poller so user-side TRUNCATE+INSERT during restore isn't
+    /// re-streamed; the abstract [`RestoreGuard`] holds the
+    /// resume-on-drop token. Audit anchor:
+    /// [§A1](../../../../docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1).
+    /// Errors if the adapter has not been initialised (no poller running).
+    async fn begin_restore(&self) -> Result<RestoreGuard> {
+        let poller = self.poller_handle.as_ref().ok_or_else(|| {
+            Error::Backend(
+                "begin_restore called before init() — no trigger poller is running".into(),
+            )
+        })?;
+        let token = poller.pause().await;
+        Ok(RestoreGuard::new(token))
+    }
+
+    async fn restore_with_guard(
+        &self,
+        guard: &RestoreGuard,
+        target: &SnapshotHandle,
+    ) -> Result<()> {
+        let live = self.current_schema_version_inner().await?;
+        if live != target.schema_version {
+            return Err(Error::SchemaMismatch {
+                live,
+                target: target.schema_version.clone(),
+            });
+        }
+        crate::restore::restore_manifest(
+            guard,
+            &self.pool,
+            self.store.as_ref(),
+            &target.manifest,
+            &self.cfg.tables,
+        )
+        .await
+    }
+}
+
+impl PostgresAdapter {
     /// Begin a Postgres transaction for an atomic reverse-migration sequence.
     ///
     /// The caller threads the returned `Transaction` through one or more
     /// [`Self::apply_down_migration_tx`] calls and finishes with `tx.commit()`.
     /// Dropping the transaction without committing rolls back every step.
     ///
-    /// This is the only path that `migrate::run_reverse` uses — the older
-    /// per-step `apply_down_migration` was removed because each step opening
-    /// its own `pool.begin()` would land on a different Postgres session,
-    /// breaking the atomicity an outer transaction is supposed to provide
-    /// (see issue #37 / audit B8 / docs/plans/a8-reverse-migration/).
+    /// Not a trait method in v1.0: sqlx 0.8's `Executor<'c>` HRTBs don't
+    /// unify across async_trait's boxed-future elision when a
+    /// `Transaction<'_, Postgres>` is borrowed across awaits inside the
+    /// elaborated `Pin<Box<dyn Future + Send + '_>>`. `agenticd::migrate::run_reverse`
+    /// uses these inherent methods directly. When a second real backend
+    /// lands we revisit the trait shape with the right abstraction.
     pub async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
         Ok(self.pool.begin().await?)
     }

@@ -9,13 +9,14 @@
 //! trees over segments; see `docs/architecture/snapshot-model.md`.
 
 pub mod adapter;
+pub mod in_memory;
 pub mod postgres;
 pub mod restore;
 pub mod segment;
 pub mod streamer;
 pub mod triggers;
 
-pub use adapter::{MemoryAdapter, SnapshotHandle};
+pub use adapter::{MemoryAdapter, RestoreGuard, SnapshotHandle};
 pub use segment::{Embedding, Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 
 #[derive(Debug, thiserror::Error)]

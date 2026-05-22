@@ -26,30 +26,18 @@ use serde_json::Value as Json;
 use sqlx::postgres::PgArguments;
 use sqlx::{Arguments, Executor, PgPool, Postgres};
 
+use crate::adapter::RestoreGuard;
 use crate::postgres::TrackedTable;
 use crate::segment::{Segment, SegmentManifest};
-use crate::triggers::QuiesceToken;
 use crate::{Error, Result};
 
-/// Proof that the trigger poller is paused for the duration of a restore.
-///
-/// Created by [`crate::postgres::PostgresAdapter::begin_restore`] and
-/// threaded into [`restore_manifest`]. While alive, no row written to
-/// `agentic_change_log` is forwarded to the streamer; dropping the guard
-/// releases the poller. See audit
-/// [§A1](../../../../docs/ops/2026-05-21-agenticd-architectural-analysis.md#a1)
-/// and the planning notes in
-/// [`docs/plans/`](../../../../docs/plans/) for the design rationale.
-pub struct RestoreGuard {
-    /// Held for the lifetime of the guard; drop releases the poller pause.
-    _token: QuiesceToken,
-}
-
-impl RestoreGuard {
-    pub(crate) fn new(token: QuiesceToken) -> Self {
-        Self { _token: token }
-    }
-}
+// `RestoreGuard` lives in `crate::adapter` so the trait surface in
+// `MemoryAdapter::begin_restore` / `restore_with_guard` is reachable
+// without depending on `crate::triggers`'s Postgres-specific quiesce
+// token directly. `PostgresAdapter` constructs its own
+// `RestoreGuard::new(QuiesceToken)` and threads it into
+// `restore_manifest` below; backends without a quiesce requirement
+// pass `RestoreGuard::noop()`.
 
 /// Restore the database state captured by `manifest` into `pool`.
 ///
