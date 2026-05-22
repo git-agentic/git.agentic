@@ -1,3 +1,10 @@
+# OpenWolf
+
+@.wolf/OPENWOLF.md
+
+This project uses OpenWolf for context management. Read and follow .wolf/OPENWOLF.md every session. Check .wolf/cerebrum.md before generating code. Check .wolf/anatomy.md before reading files.
+
+
 # CLAUDE.md — git.agentic
 
 > **Identity.** `git.agentic` is "Git for agent behavior" — atomic, reversible snapshots of the full `(code + prompts + tools + model + memory + schema)` tuple that determines how an AI agent acts. `git revert` knows about code; we version everything else that determines behavior, and roll it back coherently.
