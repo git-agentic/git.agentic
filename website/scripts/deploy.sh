@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Deploy the static site to bergholm.net.
+# Deploy the static site.
 #
 # Usage: ./scripts/deploy.sh
 #
+# Requires a .env file in the website/ directory (copy from .env.example).
+#
 # Assumes:
 #   - npm and astro are available locally
-#   - SSH access to toni@bergholm.net:2222 is configured
+#   - SSH access to $SSH_TARGET on port $SSH_PORT is configured
 #   - /var/www/git-agentic.com exists on the server (idempotent: created on first run)
 #   - /etc/nginx/sites-available/git-agentic exists on the server (one-time bootstrap; see deploy/nginx/git-agentic.conf)
 
@@ -13,8 +15,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SSH_TARGET="toni@bergholm.net"
-SSH_PORT="2222"
+if [[ -f .env ]]; then
+  # shellcheck source=/dev/null
+  source .env
+fi
+
+: "${SSH_TARGET:?Set SSH_TARGET in website/.env (see .env.example)}"
+: "${SSH_PORT:=22}"
 DOCROOT="/var/www/git-agentic.com"
 
 echo "→ Building Astro site..."
