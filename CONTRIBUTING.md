@@ -1,6 +1,6 @@
 # Contributing to git.agentic
 
-`git.agentic` is in its final MVP hardening pass; v1.0 ships 2026-05-26 with the repo going public. MVP code is complete on `main`; the remaining work is verification, performance numbers, and the broken-prompt demo running cleanly from `git clone`. The bar this week is **demo-readiness**, not feature breadth. Contributions are welcome but scoped tightly.
+`git.agentic` went public 2026-05-22 with the v1.0 MVP code on `main`. The hardening sprint closed faster than expected; what remains is the verification half — published performance numbers against `snapshot-model.md` §9, a fresh-machine cold-start timing for the broken-prompt demo, and partner-environment validation. The bar is still **demo-readiness**, not feature breadth — contributions are welcome but scoped tightly.
 
 ## What we will merge right now
 

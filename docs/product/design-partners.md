@@ -1,7 +1,7 @@
 # Design Partners — outreach brief (v1.0)
 
 **Owner:** Toni
-**Target:** 3 onboarded teams by 2026-07-21 (eight weeks post-launch). Originally a roadmap Week 12 gate; with v1.0 shipping 2026-05-26, partner onboarding sequences after the public release rather than before it.
+**Target:** 3 onboarded teams by 2026-07-17 (eight weeks post-launch). Originally a roadmap Week 12 gate; with v1.0 shipped 2026-05-22, partner onboarding sequences after the public release rather than before it.
 **Status:** Draft. Candidate list and outreach status start empty — fill in inline.
 
 ## Why this exists now

@@ -14,7 +14,7 @@ A commit captures all six dimensions atomically. A rollback restores all six coh
 
 ## Status
 
-**MVP code complete; v1.0 ships 2026-05-26 alongside the public repo release.** The 12-week build landed weeks 1–11 on `main`; the final week is verification and demo polish. See [`docs/product/roadmap.md`](docs/product/roadmap.md) for week-by-week progress and what's safe to depend on.
+**MVP code complete; repo went public 2026-05-22.** The 12-week build landed weeks 1–11 on `main`; the final week is verification, design-partner outreach, and demo polish. The cold-start "under 5 minutes from `git clone`" line in the demo is verified on developer machines with warm cargo caches; a fresh-machine timing is still in flight. See [`docs/product/roadmap.md`](docs/product/roadmap.md) for week-by-week progress and what's safe to depend on.
 
 ## Why this exists
 
@@ -35,7 +35,7 @@ We build it.
 
 Explicitly **not** in MVP scope: web UI, hosted SaaS, eval/CI/AE pipelines, MCP registry hosting, sandbox execution, A2A routing, more than one memory backend, more than one framework. See [`docs/adr/0001-architecture-foundations.md`](docs/adr/0001-architecture-foundations.md) §9–§10 for why.
 
-## The demo (target week 11)
+## The demo
 
 ```bash
 # baseline: agent works
@@ -81,11 +81,11 @@ git.agentic/
 ├── sdk/
 │   └── python/                   `agentic-sdk` package + LangGraph integration
 ├── examples/
-│   └── langgraph-rollback/       the "broken prompt" demo (placeholder)
+│   └── langgraph-rollback/       the "broken prompt" demo (run-demo.sh)
 ├── docs/
 │   ├── product/
 │   │   ├── mvp-spec.md           what we ship and for whom
-│   │   ├── roadmap.md            12-week build narrative; v1.0 ships 2026-05-26
+│   │   ├── roadmap.md            12-week build narrative; repo went public 2026-05-22
 │   │   └── demo-scenario.md      the canonical demo
 │   ├── adr/
 │   │   └── 0001-architecture-foundations.md
@@ -112,7 +112,12 @@ pip install -e ".[langgraph,dev]"
 pytest
 ```
 
-A `docker-compose.yml` lands in week 11 to bring up Postgres + agenticd + the demo agent in one command.
+The broken-prompt walkthrough lives at [`examples/langgraph-rollback/`](examples/langgraph-rollback/). Everything below is rooted there:
+
+- [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) starts Postgres+pgvector via the local `docker-compose.yml`, `cargo build`s `agenticd` + `agentic` from the workspace, then drives the commit → break → rollback cycle end-to-end.
+- The Python LangGraph agent runs locally via `python agent.py`, invoked by [`scripts/ask.sh`](examples/langgraph-rollback/scripts/ask.sh). Follow the venv + pip-install step in the demo's own [`README`](examples/langgraph-rollback/README.md) before running the script — the script itself does not bring up a Python environment.
+
+`agenticd` and the agent are both local processes, not containers.
 
 ## Design partners
 
