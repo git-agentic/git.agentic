@@ -25,7 +25,12 @@ from pathlib import Path
 
 import pytest
 
-from agentic import AgenticClient, AgenticError
+from agentic import (
+    AgenticClient,
+    AgenticConcurrencyError,
+    AgenticError,
+    AgenticNotFoundError,
+)
 from agentic._framing import read_frame, write_frame
 
 
@@ -105,7 +110,9 @@ def test_correlation_mismatch_raises(short_tmp: Path):
         client.ping()
 
 
-def test_error_response_raises(short_tmp: Path):
+def test_error_response_raises_class_specific(short_tmp: Path):
+    """ADR-0010 Decision 1: the SDK raises a class-specific subclass of
+    AgenticError so callers can route on it without substring-matching."""
     sock_path = short_tmp / "mock.sock"
 
     def handler(conn: socket.socket) -> None:
@@ -114,14 +121,141 @@ def test_error_response_raises(short_tmp: Path):
             conn,
             {
                 "correlation_id": envelope["correlation_id"],
-                "payload": {"kind": "error", "message": "boom"},
+                "payload": {
+                    "kind": "error",
+                    "class": "not_found",
+                    "code": "ref_not_found",
+                    "message": "ref not found: foo",
+                    "retryable": False,
+                },
             },
         )
 
     _spawn_mock_daemon(sock_path, handler)
     client = AgenticClient(socket_path=sock_path)
-    with pytest.raises(AgenticError, match="boom"):
+    with pytest.raises(AgenticNotFoundError) as excinfo:
         client.ping()
+    # Subclass relationship preserved for catch-all callers.
+    assert isinstance(excinfo.value, AgenticError)
+    assert excinfo.value.code == "ref_not_found"
+    assert excinfo.value.retryable is False
+    assert "ref not found: foo" in str(excinfo.value)
+
+
+def test_retryable_attribute_surfaces(short_tmp: Path):
+    """ADR-0010 Decision 1: the retryable flag is the load-bearing hint
+    AgenticSessionStore reads to decide whether to back off and retry."""
+    sock_path = short_tmp / "mock.sock"
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "error",
+                    "class": "concurrency",
+                    "code": "commit_lock_busy",
+                    "message": "another commit in progress",
+                    "retryable": True,
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    with pytest.raises(AgenticConcurrencyError) as excinfo:
+        client.ping()
+    assert excinfo.value.retryable is True
+
+
+def test_unknown_class_falls_back_to_internal(short_tmp: Path):
+    """Forward-compat: an ErrorClass added in a future ADR that this SDK
+    hasn't seen yet should still surface as a subclass of AgenticError."""
+    from agentic import AgenticInternalError
+
+    sock_path = short_tmp / "mock.sock"
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "error",
+                    "class": "future_class_not_yet_known",
+                    "code": "x",
+                    "message": "hi",
+                    "retryable": False,
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    with pytest.raises(AgenticInternalError):
+        client.ping()
+
+
+def test_envelope_carries_protocol_version(short_tmp: Path):
+    """ADR-0010 Decision 5: every outbound envelope carries
+    protocol_version=1 so the daemon doesn't route through the v0
+    coexistence shim."""
+    sock_path = short_tmp / "mock.sock"
+    captured: dict[str, object] = {}
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        captured["envelope"] = envelope
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {"kind": "pong"},
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    client.ping()
+    assert captured["envelope"]["protocol_version"] == 1
+
+
+def test_commit_base64_encodes_prompts(short_tmp: Path):
+    """ADR-0010 Decision 3: prompts cross the wire as base64-encoded
+    bytes. The SDK accepts str or bytes from callers and encodes."""
+    import base64
+
+    sock_path = short_tmp / "mock.sock"
+    captured: dict[str, object] = {}
+
+    def handler(conn: socket.socket) -> None:
+        envelope = read_frame(conn)
+        captured["payload"] = envelope["payload"]
+        write_frame(
+            conn,
+            {
+                "correlation_id": envelope["correlation_id"],
+                "payload": {
+                    "kind": "commit",
+                    "commit_hash": "f" * 64,
+                    "branch": "main",
+                },
+            },
+        )
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path)
+    client.commit(
+        message="hi",
+        prompts={"system.md": "you are helpful", "blob.bin": b"\x00\x01\xff"},
+        no_memory=True,
+    )
+    sent = captured["payload"]["prompts"]
+    assert sent["system.md"] == base64.b64encode(b"you are helpful").decode("ascii")
+    assert sent["blob.bin"] == base64.b64encode(b"\x00\x01\xff").decode("ascii")
 
 
 def test_daemon_not_running_raises(short_tmp: Path):

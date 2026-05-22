@@ -335,9 +335,12 @@ This frees the LocalSet thread to poll other connections' Ping / Log / Diff / Re
 - `slow_get_does_not_block_local_set_thread` — **AC for §A5**. Constructs a `SlowStore` (delegates to `FsObjectStore` but sleeps 500ms in `get`/`get_raw`). Runs on a real `tokio::task::LocalSet`. Spawns two `spawn_local` tasks: A calls `store_async::get_raw` (slow), B calls `store.has` (fast, sync). Asserts B completes within 100ms while A is still in-flight — proves the LocalSet thread polled B during A's wait.
 - `put_raw_round_trips_through_async_wrapper` — sanity round-trip with `FsObjectStore`.
 
-<a name="a6"></a>**A6 — `Response::Error` becomes a structured variant; framing errors get an envelope** *(unblocked 2026-05-22 — ADR-0010 Accepted)*
+<a name="a6"></a>**A6 — `Response::Error` becomes a structured variant; framing errors get an envelope** — **DONE 2026-05-22** (issue [#41](https://github.com/git-agentic/git.agentic/issues/41), full ADR-0010 implementation).
 *Addresses:* [B6](#b6), [B13](#b13), [B14](#b14), [R7](#r7). *Principle:* ISP + LSP. *Effort:* S after wire-shape decision.
-**Wire-protocol shape pinned by [ADR-0010](../adr/0010-wire-protocol-error-model.md) (Accepted 2026-05-22).** Daemon-side implementation is tracked in [#41](https://github.com/git-agentic/git.agentic/issues/41), now unblocked.
+
+The full ADR-0010 wire-protocol overhaul shipped together: structured `Response::Error { class, code, message, retryable }` (Decision 1), closed `ErrorClass` taxonomy (Decision 2), base64-encoded `BTreeMap<String, Vec<u8>>` prompts (Decision 3), best-effort framing-error envelope with v0 vs unattributable split (Decision 4), explicit `Envelope.protocol_version` (Decision 5), and v0/v1 coexistence shim (Decision 6).
+
+The daemon-side implementation lives in `crates/agenticd/src/wire_error.rs` (typed-error classification via `map_anyhow_to_response_error`) and `crates/agenticd/src/server.rs` (`parse_envelope_with_v0_shim` plus the dispatch-loop integration). Class-specific exceptions and `retryable` are surfaced in the Python SDK (`AgenticNotFoundError`, `AgenticStorageError`, …) and the CLI prints `[class:code] message` for every daemon error.
 
 <a name="a7"></a>**A7 — Parallelise MCP fingerprinting** — **DONE 2026-05-21** (issue [#42](https://github.com/git-agentic/git.agentic/issues/42)).
 *Addresses:* [B1](#b1), [C3](#c3), [R9](#r9). *Effort:* S.
@@ -409,7 +412,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 3. **A2** — operational safety
 4. **A3 + A4** — give the algorithms a home (unlocks the others)
 5. **A5, A7** — hardening sprint
-6. **A6** — ADR-0010 Accepted 2026-05-22; daemon-side implementation tracked in [#41](https://github.com/git-agentic/git.agentic/issues/41)
+6. **A6** — **DONE 2026-05-22** ([#41](https://github.com/git-agentic/git.agentic/issues/41)). Full ADR-0010 implementation: structured `Response::Error`, base64 prompts, framing-error envelope, v0/v1 coexistence shim.
 
 ---
 
@@ -417,7 +420,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 These cross a service or wire-protocol boundary; they get their own ADRs:
 
-1. **[ADR-0010](../adr/0010-wire-protocol-error-model.md) — Wire-protocol error model + binary payloads** *(Accepted 2026-05-22)* (addresses [A6](#a6) / [R7](#r7) / [B6](#b6), [B13](#b13), [B14](#b14)). The daemon-side patch is now actionable on [#41](https://github.com/git-agentic/git.agentic/issues/41); the wire-shape decisions live in the ADR's Decisions 1–6.
+1. **[ADR-0010](../adr/0010-wire-protocol-error-model.md) — Wire-protocol error model + binary payloads** *(Accepted 2026-05-22, implementation shipped 2026-05-22 via [#41](https://github.com/git-agentic/git.agentic/issues/41))* (addresses [A6](#a6) / [R7](#r7) / [B6](#b6), [B13](#b13), [B14](#b14)). Daemon, SDK, and CLI all speak the v1 wire; the v0/v1 coexistence shim lets pre-v1 clients keep working through the v1.0.0 release window.
 2. **ADR-0011 — `ObjectStore` async-trait shape** (addresses [A5](#a5) / [R3](#r3)). The tactical `spawn_blocking` patch (A5) lands immediately, but the trait-level cleanup that fully removes the LocalSet freeze risk is cross-crate and is exactly what ADR-0006 Decision 2 already proposes. ADR-0011 pins down the actual async-trait shape.
 3. **Cross-daemon coordination** ([C13](#c13)'s "out of scope for v1.0 single-daemon" footnote). If/when the deployment model grows beyond a single daemon sharing one `.agentic/` directory + one Postgres instance, branch-ref atomicity needs a coordinator. Not a v1.0 concern; no ADR yet.
 
@@ -437,7 +440,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A3 | Extract `handle_commit` into `commit.rs` orchestrator | [#38](https://github.com/git-agentic/git.agentic/issues/38) **DONE** | `hardening-sprint` | — |
 | A4 | Split `rollback.rs` into `mod` / `loaders` / `writeback` | [#39](https://github.com/git-agentic/git.agentic/issues/39) **DONE** | `hardening-sprint` | — |
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | [#40](https://github.com/git-agentic/git.agentic/issues/40) **DONE** | `hardening-sprint` | — |
-| A6 | Structured `Response::Error` + framing-error envelope (unblocked 2026-05-22 — ADR-0010 Accepted) | [#41](https://github.com/git-agentic/git.agentic/issues/41) | `hardening-sprint` | — |
+| A6 | Structured `Response::Error` + framing-error envelope | [#41](https://github.com/git-agentic/git.agentic/issues/41) **DONE** | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
 | A9 | Complete `MemoryAdapter` trait (blocked by ADR-0005) | (TBD) | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | (TBD) | `v1.1` | — |

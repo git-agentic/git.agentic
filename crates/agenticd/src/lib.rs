@@ -17,3 +17,4 @@ pub mod peer_auth;
 pub mod rollback;
 pub mod server;
 pub(crate) mod store_async;
+pub mod wire_error;

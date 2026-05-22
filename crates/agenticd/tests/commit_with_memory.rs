@@ -57,7 +57,7 @@ async fn drop_schema(pool: &PgPool, schema: &str) {
 
 fn commit_input_with_memory(message: &str) -> CommitInput {
     let mut prompts = std::collections::BTreeMap::new();
-    prompts.insert("system.md".to_string(), "you are helpful".to_string());
+    prompts.insert("system.md".to_string(), b"you are helpful".to_vec());
     CommitInput {
         message: message.to_string(),
         author: Some("tester".to_string()),

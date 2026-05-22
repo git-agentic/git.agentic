@@ -8,11 +8,29 @@ mod client;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use agentic_proto::{CommitInput, Request, Response};
+use agentic_proto::{CommitInput, ErrorClass, Request, Response};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 
 use crate::client::{resolve_repo, round_trip};
+
+/// Format a structured `Response::Error` as a human-readable error string
+/// suitable for `anyhow!`. The shape is `[class:code] message`, e.g.
+/// `[not_found:ref_not_found] ref 'feature-x' not found`. Per ADR-0010
+/// Decision 1 / Implementation plan step 4.
+fn daemon_error(class: ErrorClass, code: &str, message: &str, retryable: bool) -> anyhow::Error {
+    let cls = match class {
+        ErrorClass::Protocol => "protocol",
+        ErrorClass::Validation => "validation",
+        ErrorClass::NotFound => "not_found",
+        ErrorClass::Storage => "storage",
+        ErrorClass::Memory => "memory",
+        ErrorClass::Concurrency => "concurrency",
+        ErrorClass::Internal => "internal",
+    };
+    let suffix = if retryable { " (retryable)" } else { "" };
+    anyhow!("[{cls}:{code}]{suffix} {message}")
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "agentic", version, about = "Git for agent behavior")]
@@ -165,7 +183,12 @@ async fn cmd_rollback(
         .await?
         {
             Response::Rollback(p) => p,
-            Response::Error { message } => return Err(anyhow!(message)),
+            Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
             other => return Err(anyhow!("unexpected response: {other:?}")),
         };
         println!("Planned rollback to {target}:");
@@ -203,7 +226,12 @@ async fn cmd_rollback(
                 (false, _) => println!("(dry run; nothing executed)"),
             }
         }
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -246,7 +274,12 @@ async fn cmd_cat_object(repo: &Path, hash: String, raw: bool) -> anyhow::Result<
                 }
             }
         }
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -257,7 +290,12 @@ async fn cmd_diff(repo: &Path, from: String, to: String, json: bool) -> anyhow::
     match resp {
         Response::Diff(d) if json => println!("{}", serde_json::to_string(&d)?),
         Response::Diff(d) => render_diff(&d),
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -319,7 +357,12 @@ async fn cmd_ping(repo: &Path, json: bool) -> anyhow::Result<()> {
     match resp {
         Response::Pong if json => println!("{{\"pong\":true}}"),
         Response::Pong => println!("pong"),
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -361,7 +404,12 @@ async fn cmd_commit(
             out.branch,
             out.commit_hash
         ),
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -388,7 +436,12 @@ async fn cmd_log(repo: &Path, limit: usize, oneline: bool, json: bool) -> anyhow
                 println!();
             }
         }
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -399,7 +452,12 @@ async fn cmd_resolve(repo: &Path, name: String, json: bool) -> anyhow::Result<()
     match resp {
         Response::ResolveRef { hash } if json => println!("{{\"hash\":\"{hash}\"}}"),
         Response::ResolveRef { hash } => println!("{hash}"),
-        Response::Error { message } => return Err(anyhow!(message)),
+        Response::Error {
+            class,
+            code,
+            message,
+            retryable,
+        } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
@@ -421,7 +479,11 @@ async fn cmd_status(repo: &Path, _json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_prompt_dir(dir: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+// Returns raw bytes per ADR-0010 Decision 3: the wire carries
+// `BTreeMap<String, Vec<u8>>` so non-UTF-8 prompts (compiled templates,
+// instruction blobs with embedded NULs) survive the round-trip
+// unchanged.
+fn read_prompt_dir(dir: &Path) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
     if !dir.exists() {
         return Ok(out);
@@ -430,7 +492,7 @@ fn read_prompt_dir(dir: &Path) -> anyhow::Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-fn walk(root: &Path, here: &Path, out: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
+fn walk(root: &Path, here: &Path, out: &mut BTreeMap<String, Vec<u8>>) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(here).with_context(|| format!("reading {}", here.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -443,7 +505,7 @@ fn walk(root: &Path, here: &Path, out: &mut BTreeMap<String, String>) -> anyhow:
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .into_owned();
-            let body = std::fs::read_to_string(&path)
+            let body = std::fs::read(&path)
                 .with_context(|| format!("reading prompt {}", path.display()))?;
             out.insert(rel, body);
         }

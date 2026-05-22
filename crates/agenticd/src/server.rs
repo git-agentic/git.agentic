@@ -16,9 +16,11 @@ use agentic_core::refs::Refs;
 use agentic_core::{Object, ObjectStore};
 use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
 use agentic_memory::MemoryAdapter;
-use agentic_proto::framing::{read_frame, write_frame};
-use agentic_proto::{DiffOutput, Envelope, LogEntry, Request, Response};
+use agentic_proto::framing::{read_frame_bytes, write_frame, FrameError};
+use agentic_proto::{DiffOutput, Envelope, LogEntry, Request, RequestV0, Response, PROTOCOL_VERSION};
 use anyhow::{anyhow, Context};
+
+use crate::wire_error::map_anyhow_to_response_error;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
@@ -155,9 +157,55 @@ pub async fn handle_connection(
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut writer = tokio::io::BufWriter::new(write_half);
 
-    while let Some(envelope) = read_frame::<_, Envelope<Request>>(&mut reader).await? {
-        let correlation_id = envelope.correlation_id.clone();
-        let response = match dispatch(Arc::clone(&state), envelope.payload, peer_uid).await {
+    loop {
+        let bytes = match read_frame_bytes(&mut reader).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(()),
+            Err(FrameError::TooLarge(n)) => {
+                // Unattributable: we don't have a correlation_id, so we
+                // can't send a structured Response::Error back. Per
+                // ADR-0010 Decision 4, log-and-close is the honest
+                // failure mode here.
+                tracing::warn!(
+                    target: "agenticd::framing",
+                    frame_size = n,
+                    peer_uid = ?peer_uid,
+                    "inbound frame exceeds MAX_FRAME_BYTES; closing connection"
+                );
+                return Err(anyhow!(
+                    "inbound frame exceeds MAX_FRAME_BYTES ({n} bytes)"
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Decode envelope + version-route the payload per ADR-0010
+        // Decision 6 coexistence shim. Either branch may fail with a
+        // structured Protocol-class error reply that we send before
+        // dropping the connection.
+        let (correlation_id, request) =
+            match parse_envelope_with_v0_shim(&bytes, peer_uid).await {
+                Ok(pair) => pair,
+                Err(EnvelopeParseError::Attributable {
+                    correlation_id,
+                    response,
+                }) => {
+                    let reply = Envelope::new(correlation_id, response);
+                    write_frame(&mut writer, &reply).await?;
+                    continue;
+                }
+                Err(EnvelopeParseError::Unattributable(msg)) => {
+                    tracing::warn!(
+                        target: "agenticd::framing",
+                        peer_uid = ?peer_uid,
+                        error = %msg,
+                        "envelope unparseable; closing connection"
+                    );
+                    return Err(anyhow!("malformed envelope: {msg}"));
+                }
+            };
+
+        let response = match dispatch(Arc::clone(&state), request, peer_uid).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -167,18 +215,114 @@ pub async fn handle_connection(
                     correlation_id = %correlation_id,
                     "dispatch returned error"
                 );
-                Response::Error {
-                    message: format!("{e:#}"),
-                }
+                map_anyhow_to_response_error(e)
             }
         };
-        let reply = Envelope {
-            correlation_id,
-            payload: response,
-        };
+        let reply = Envelope::new(correlation_id, response);
         write_frame(&mut writer, &reply).await?;
     }
-    Ok(())
+}
+
+/// Outcome of [`parse_envelope_with_v0_shim`] when the envelope can't
+/// be deserialised. `Attributable` carries a `correlation_id` extracted
+/// from the bytes — the daemon can send a structured `Protocol`-class
+/// reply. `Unattributable` is for failures so deep we never recovered a
+/// correlation_id (truncated JSON, missing top-level fields).
+#[derive(Debug)]
+enum EnvelopeParseError {
+    Attributable {
+        correlation_id: String,
+        response: Response,
+    },
+    Unattributable(String),
+}
+
+/// Decode an inbound envelope, applying the ADR-0010 Decision 6
+/// coexistence shim:
+///
+/// * If `protocol_version` is absent or 0, deserialise as
+///   `Envelope<RequestV0>` and translate the payload via
+///   `RequestV0 -> Request` (which calls `into_bytes()` on each v0
+///   prompt String).
+/// * If `protocol_version` equals [`PROTOCOL_VERSION`], deserialise as
+///   `Envelope<Request>` directly.
+/// * If `protocol_version` exceeds [`PROTOCOL_VERSION`], return an
+///   attributable `Protocol`-class `version_mismatch` reply.
+async fn parse_envelope_with_v0_shim(
+    bytes: &[u8],
+    peer_uid: Option<u32>,
+) -> Result<(String, Request), EnvelopeParseError> {
+    // First pass: pull correlation_id + protocol_version out of a
+    // version-agnostic Value. If that fails, this envelope is too
+    // malformed to attribute.
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+        EnvelopeParseError::Unattributable(format!("envelope JSON parse failed: {e}"))
+    })?;
+    let correlation_id = value
+        .get("correlation_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            EnvelopeParseError::Unattributable("envelope missing correlation_id".to_string())
+        })?
+        .to_string();
+    let protocol_version = value
+        .get("protocol_version")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u16;
+
+    if protocol_version > PROTOCOL_VERSION {
+        tracing::info!(
+            target: "agenticd::framing",
+            peer_uid = ?peer_uid,
+            correlation_id = %correlation_id,
+            requested_version = protocol_version,
+            supported_version = PROTOCOL_VERSION,
+            "rejecting envelope with unknown protocol_version"
+        );
+        return Err(EnvelopeParseError::Attributable {
+            correlation_id,
+            response: Response::protocol(
+                "version_mismatch",
+                format!(
+                    "client protocol_version {protocol_version} > daemon-supported \
+                     {PROTOCOL_VERSION}; upgrade the daemon or downgrade the client"
+                ),
+            ),
+        });
+    }
+
+    // Second pass: deserialise the envelope as the typed shape we now
+    // know matches the client's wire version.
+    if protocol_version == 0 {
+        // v0 client: prompts are String, no protocol_version field.
+        let env_v0: Envelope<RequestV0> = serde_json::from_slice(bytes).map_err(|e| {
+            EnvelopeParseError::Attributable {
+                correlation_id: correlation_id.clone(),
+                response: Response::protocol(
+                    "malformed_v0_envelope",
+                    format!("v0 envelope failed to deserialise: {e}"),
+                ),
+            }
+        })?;
+        tracing::debug!(
+            target: "agenticd::framing",
+            correlation_id = %correlation_id,
+            "translating v0 envelope to v1"
+        );
+        Ok((correlation_id, env_v0.payload.into()))
+    } else {
+        // v1 (or future-equivalent) client.
+        let env: Envelope<Request> = serde_json::from_slice(bytes).map_err(|e| {
+            EnvelopeParseError::Attributable {
+                correlation_id: correlation_id.clone(),
+                response: Response::protocol(
+                    "malformed_envelope",
+                    format!("v{protocol_version} envelope failed to deserialise: {e}"),
+                ),
+            }
+        })?;
+        Ok((correlation_id, env.payload))
+    }
 }
 
 async fn dispatch(
@@ -196,9 +340,10 @@ async fn dispatch(
                 .with_context(|| format!("resolving ref {name}"))?;
             match resolved {
                 Some(h) => Ok(Response::ResolveRef { hash: h.to_hex() }),
-                None => Ok(Response::Error {
-                    message: format!("ref not found: {name}"),
-                }),
+                None => Ok(Response::not_found(
+                    "ref_not_found",
+                    format!("ref not found: {name}"),
+                )),
             }
         }
 
@@ -261,14 +406,15 @@ async fn dispatch(
             // dropped connection.
             const MAX_OBJECT_BYTES: usize = 10 * 1024 * 1024;
             if data.len() > MAX_OBJECT_BYTES {
-                return Ok(Response::Error {
-                    message: format!(
+                return Ok(Response::validation(
+                    "object_too_large",
+                    format!(
                         "object {} is too large to fetch inline ({} bytes > {} byte limit)",
                         h.to_hex(),
                         data.len(),
                         MAX_OBJECT_BYTES,
                     ),
-                });
+                ));
             }
             Ok(Response::ObjectData {
                 hash: h.to_hex(),
@@ -364,3 +510,97 @@ fn handle_diff(state: &DaemonState, from: &str, to: &str) -> anyhow::Result<Diff
 // phased orchestration (snapshot_memory → fingerprint_tools →
 // assemble_inputs → stage_and_commit_with_now → publish_head).
 // Audit §A3 / §S2.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0010 Decision 6: an envelope missing `protocol_version` (the
+    /// v0 wire shape) deserialises through the coexistence shim and
+    /// surfaces as a v1 `Request`. Pre-ADR-0010 SDK clients keep working.
+    #[tokio::test]
+    async fn parse_envelope_translates_v0_commit_into_v1() {
+        let v0 = br#"{
+            "correlation_id": "c1",
+            "payload": {
+                "op": "commit",
+                "message": "hi",
+                "prompts": {"system.md": "you are helpful"}
+            }
+        }"#;
+        let (cid, req) = parse_envelope_with_v0_shim(v0, None).await.unwrap();
+        assert_eq!(cid, "c1");
+        let Request::Commit(input) = req else {
+            panic!("expected Commit");
+        };
+        assert_eq!(
+            input.prompts.get("system.md").map(Vec::as_slice),
+            Some(b"you are helpful".as_slice()),
+            "v0 String prompt must translate to v1 Vec<u8> via into_bytes()"
+        );
+    }
+
+    /// ADR-0010 Decision 5: a higher-than-supported `protocol_version`
+    /// is met with an attributable Protocol-class `version_mismatch`
+    /// reply, not a dropped connection.
+    #[tokio::test]
+    async fn parse_envelope_rejects_unknown_future_protocol_version() {
+        let future = br#"{
+            "correlation_id": "c2",
+            "protocol_version": 9999,
+            "payload": {"op": "ping"}
+        }"#;
+        match parse_envelope_with_v0_shim(future, None).await {
+            Err(EnvelopeParseError::Attributable {
+                correlation_id,
+                response: Response::Error { class, code, .. },
+            }) => {
+                assert_eq!(correlation_id, "c2");
+                assert_eq!(class, agentic_proto::ErrorClass::Protocol);
+                assert_eq!(code, "version_mismatch");
+            }
+            other => panic!("expected attributable Protocol error, got {other:?}"),
+        }
+    }
+
+    /// An envelope without `correlation_id` is unattributable — the
+    /// daemon has no envelope to reply to, so it closes the connection.
+    #[tokio::test]
+    async fn parse_envelope_unattributable_when_correlation_id_missing() {
+        let bad = br#"{
+            "protocol_version": 1,
+            "payload": {"op": "ping"}
+        }"#;
+        match parse_envelope_with_v0_shim(bad, None).await {
+            Err(EnvelopeParseError::Unattributable(_)) => {}
+            other => panic!("expected Unattributable, got {other:?}"),
+        }
+    }
+
+    /// A v1 envelope with a base64-encoded prompt deserialises into
+    /// raw bytes the same way the proto-crate test asserts at the
+    /// wire-type layer. Lower-level integration than the proto crate's
+    /// own test; this one exercises the daemon's shim entry point.
+    #[tokio::test]
+    async fn parse_envelope_v1_decodes_base64_prompts() {
+        // base64("hello world") == "aGVsbG8gd29ybGQ="
+        let v1 = br#"{
+            "correlation_id": "c3",
+            "protocol_version": 1,
+            "payload": {
+                "op": "commit",
+                "message": "hi",
+                "prompts": {"sys.md": "aGVsbG8gd29ybGQ="}
+            }
+        }"#;
+        let (cid, req) = parse_envelope_with_v0_shim(v1, None).await.unwrap();
+        assert_eq!(cid, "c3");
+        let Request::Commit(input) = req else {
+            panic!("expected Commit");
+        };
+        assert_eq!(
+            input.prompts.get("sys.md").map(Vec::as_slice),
+            Some(b"hello world".as_slice())
+        );
+    }
+}

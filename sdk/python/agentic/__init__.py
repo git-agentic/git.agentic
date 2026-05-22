@@ -20,15 +20,35 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 
-from .client import AgenticClient, AgenticError, DEFAULT_SOCKET_PATH
+from .client import (
+    DEFAULT_SOCKET_PATH,
+    PROTOCOL_VERSION,
+    AgenticClient,
+    AgenticConcurrencyError,
+    AgenticError,
+    AgenticInternalError,
+    AgenticMemoryError,
+    AgenticNotFoundError,
+    AgenticProtocolError,
+    AgenticStorageError,
+    AgenticValidationError,
+)
 from .types import Commit, Diff, LogEntry, RollbackPlan
 
 __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "PROTOCOL_VERSION",
     "AgenticClient",
     "AgenticError",
+    "AgenticProtocolError",
+    "AgenticValidationError",
+    "AgenticNotFoundError",
+    "AgenticStorageError",
+    "AgenticMemoryError",
+    "AgenticConcurrencyError",
+    "AgenticInternalError",
     "DEFAULT_SOCKET_PATH",
     "Commit",
     "Diff",
@@ -55,7 +75,7 @@ def resolve(name: str) -> str | None:
 def commit(
     *,
     message: str,
-    prompts: Mapping[str, str] | None = None,
+    prompts: Mapping[str, str | bytes] | None = None,
     tools: Iterable[str] | None = None,
     model: str | None = None,
     no_memory: bool = False,
