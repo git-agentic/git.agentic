@@ -80,11 +80,33 @@ impl TableHead {
         }
     }
 
-    fn apply(&mut self, ev: ChangeEvent, pk_col: &str) {
+    fn apply(&mut self, ev: ChangeEvent, pk_col: &str) -> Result<()> {
         if self.active.schema_version != ev.schema_version && self.active.rows.is_empty() {
             self.active.schema_version = ev.schema_version.clone();
         }
-        let pk = ev.row.get(pk_col).cloned().unwrap_or(Json::Null);
+        // PK must be present and non-NULL. Without it the segment's
+        // pk_lo/pk_hi anchor would degrade to Json::Null and corrupt
+        // the manifest's range metadata — same failure mode that
+        // `bootstrap_table` now rejects on the snapshot path. Surface
+        // here as `Err`; the streamer loop logs + drops the event so
+        // the channel keeps draining instead of crashing the task.
+        let pk = match ev.row.get(pk_col) {
+            Some(v) if !v.is_null() => v.clone(),
+            Some(_) => {
+                return Err(Error::Backend(format!(
+                    "streamer event for table {:?}: PK column {:?} is NULL; \
+                     refusing to anchor segment on a null PK",
+                    self.table, pk_col
+                )))
+            }
+            None => {
+                return Err(Error::Backend(format!(
+                    "streamer event for table {:?}: PK column {:?} is absent from event row; \
+                     check TrackedTable.pk vs the trigger payload",
+                    self.table, pk_col
+                )))
+            }
+        };
         if self.active.rows.is_empty() {
             self.active.pk_lo = pk.clone();
         }
@@ -103,6 +125,7 @@ impl TableHead {
         });
         self.active.rows.push(envelope);
         self.active.row_count = self.active.rows.len() as u64;
+        Ok(())
     }
 
     fn seal_if_nonempty<S: ObjectStore + ?Sized>(
@@ -225,8 +248,26 @@ where
                         );
                         continue;
                     };
-                    let pk = pk_for.get(&ev.table).cloned().unwrap_or_default();
-                    head.apply(ev, &pk);
+                    // PK lookup must succeed — `pk_for` is built from
+                    // the same `tables` set as `heads`, so missing
+                    // would be a bookkeeping bug not a data issue.
+                    // Drop the event with a loud log if it ever fires;
+                    // empty-string PK would silently anchor segments.
+                    let Some(pk) = pk_for.get(&ev.table).cloned() else {
+                        tracing::error!(
+                            table = %ev.table,
+                            "no PK column registered for tracked table; \
+                             dropping event to avoid null-anchored segment"
+                        );
+                        continue;
+                    };
+                    if let Err(e) = head.apply(ev, &pk) {
+                        // Surfaces null/absent PK in the event row, etc.
+                        // Log loudly but keep the streamer alive — one
+                        // bad event shouldn't crash the whole task.
+                        tracing::error!(error = %format!("{e:#}"), "dropping streamer event");
+                        continue;
+                    }
                     if let Err(e) = head.maybe_seal_on_threshold(store.as_ref()) {
                         tracing::error!(error = %e, "sealing active head");
                     }
