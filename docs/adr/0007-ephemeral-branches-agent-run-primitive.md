@@ -1,7 +1,8 @@
 # ADR-0007: Ephemeral Branches as an Agent-Run Primitive
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-21
+**Accepted:** 2026-05-22
 **Deciders:** Toni
 **Extends:** [ADR-0002](./0002-substrate-and-supercommit.md) Decision 2 (Commit object as platform API contract)
 **Relates to:** [ADR-0005](./0005-sessionstore-amendment-to-adr-0004.md) (`executor/<session_id>` per-session branches for the Claude Agent SDK integration)
