@@ -159,20 +159,37 @@ impl Refs {
     ///
     /// Atomicity caveat: `snapshot()` itself reads files sequentially.
     /// Callers must hold a serialising lock (in agenticd, that's
-    /// `DaemonState.commit_lock` — every commit acquires it before
-    /// writing refs, so taking the snapshot under the same lock is
-    /// sufficient) to guarantee the snapshot's contents reflect a
-    /// single point in time. Without external serialisation a concurrent
-    /// commit can still interleave between two `read_branch` calls
-    /// inside `snapshot()`; the snapshot then describes one ref's
-    /// pre-commit state and another's post-commit state. The lock is
-    /// the discipline that closes that window.
+    /// `DaemonState.commit_lock` — every ref-writing operation, commit
+    /// and rollback alike, acquires it before writing refs, so taking
+    /// the snapshot under the same lock is sufficient) to guarantee the
+    /// snapshot's contents reflect a single point in time. Without
+    /// external serialisation a concurrent commit can still interleave
+    /// between two `read_branch` calls inside `snapshot()`; the
+    /// snapshot then describes one ref's pre-commit state and
+    /// another's post-commit state. The lock is the discipline that
+    /// closes that window.
     pub fn snapshot(&self) -> Result<RefsSnapshot> {
         let head = self.read_head()?;
         let mut branches = BTreeMap::new();
         for name in self.list_branches()? {
-            if let Some(hash) = self.read_branch(&name)? {
-                branches.insert(name, hash);
+            match self.read_branch(&name)? {
+                Some(hash) => {
+                    branches.insert(name, hash);
+                }
+                None => {
+                    // TOCTOU: between `list_branches` and `read_branch`
+                    // an external writer (or a test fixture) deleted the
+                    // file. Under `commit_lock` no in-daemon writer can
+                    // do this; if we see it, surface the gap loudly so
+                    // operators can correlate a "ref not found" with the
+                    // race instead of staring at a silently incomplete
+                    // snapshot.
+                    tracing::warn!(
+                        target: "agentic_core::refs",
+                        branch = %name,
+                        "branch listed but missing at read time; dropping from snapshot"
+                    );
+                }
             }
         }
         Ok(RefsSnapshot { head, branches })
@@ -205,6 +222,11 @@ impl RefsSnapshot {
             });
         }
         if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+            // INVARIANT: 64 ASCII hex chars — `Hash::from_str` only
+            // rejects non-hex chars or wrong length, both ruled out by
+            // the guard above. `map_err` stays as a defensive backstop
+            // so a future Hash parser change can't silently corrupt
+            // resolutions.
             let h: Hash = name
                 .parse()
                 .map_err(|e: ParseHashError| Error::Other(anyhow::anyhow!(e)))?;
@@ -218,9 +240,17 @@ impl RefsSnapshot {
         self.head.as_ref()
     }
 
-    /// All branch refs at snapshot time, keyed by branch name.
-    pub fn branches(&self) -> &BTreeMap<String, Hash> {
-        &self.branches
+    /// Iterate over `(branch_name, commit_hash)` pairs at snapshot
+    /// time, sorted by branch name. Doesn't leak the concrete
+    /// collection type so callers (and `branches()`-like accessors
+    /// added later) don't pin a semver contract to `BTreeMap`.
+    pub fn branches(&self) -> impl Iterator<Item = (&str, &Hash)> {
+        self.branches.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Number of branch refs captured by the snapshot.
+    pub fn branch_count(&self) -> usize {
+        self.branches.len()
     }
 }
 
@@ -236,10 +266,27 @@ fn collect_branch_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> Resul
             continue;
         }
         if !ft.is_file() {
+            // Symlinks, FIFOs, sockets: not branches. Warn so an
+            // operator who put one in `refs/heads/` finds out about
+            // it instead of silently losing the ref.
+            tracing::warn!(
+                target: "agentic_core::refs",
+                path = %entry.path().display(),
+                "non-regular file under refs/heads/; skipping"
+            );
             continue;
         }
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
+            // Non-UTF-8 filename: we have no way to round-trip it
+            // through Refs::read_branch / write_branch (both take
+            // `&str`). Warn loudly — silently dropping it means a
+            // physically-present branch goes invisible.
+            tracing::warn!(
+                target: "agentic_core::refs",
+                path = %entry.path().display(),
+                "branch filename is not valid UTF-8; skipping"
+            );
             continue;
         };
         if name.ends_with(".tmp") {
@@ -381,7 +428,28 @@ mod tests {
         );
         assert_eq!(snap.resolve("nonexistent").unwrap(), None);
         // Branches accessor sees both refs.
-        assert_eq!(snap.branches().len(), 2);
+        assert_eq!(snap.branch_count(), 2);
+        let names: Vec<&str> = snap.branches().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["feature/x", "main"]);
+    }
+
+    #[test]
+    fn snapshot_handles_unborn_head_to_missing_branch() {
+        // After `agentic init` writes HEAD -> refs/heads/main but
+        // before the first commit lands, `main` does not exist. The
+        // snapshot must surface this as `Ok(None)` rather than
+        // erroring or panicking — agentic-cli's `status` command
+        // relies on this to print "(no commits yet)".
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        refs.write_head_symbolic("main").unwrap();
+        // No write_branch("main", ...) call.
+        let snap = refs.snapshot().unwrap();
+        assert_eq!(
+            snap.resolve("HEAD").unwrap(),
+            None,
+            "unborn HEAD must resolve to None, not error"
+        );
     }
 
     #[test]

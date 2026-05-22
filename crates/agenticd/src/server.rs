@@ -413,7 +413,7 @@ async fn parse_envelope_with_v0_shim(
     }
 }
 
-async fn dispatch(
+pub(crate) async fn dispatch(
     state: Arc<DaemonState>,
     request: Request,
     peer_uid: Option<u32>,
@@ -469,11 +469,12 @@ async fn dispatch(
 
         Request::Diff { from, to } => {
             // Take a frozen view of HEAD + every branch ref under
-            // `commit_lock` so a concurrent commit can't advance one
-            // side of the diff between the two ref resolves. Once we
-            // have the snapshot the lock can drop — the rest of diff
-            // operates on content-addressed object reads, which are
-            // immutable by construction.
+            // `commit_lock` so a concurrent ref-writing operation —
+            // commit or rollback — can't advance one side of the diff
+            // between the two ref resolves. Once we have the snapshot
+            // the lock can drop; the rest of diff operates on
+            // content-addressed object reads, which are immutable by
+            // construction.
             let snapshot = {
                 let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
                 state.refs.snapshot()?
@@ -557,7 +558,7 @@ async fn dispatch(
 
 fn handle_diff(
     state: &DaemonState,
-    snapshot: &agentic_core::refs::RefsSnapshot,
+    snapshot: &agentic_core::RefsSnapshot,
     from: &str,
     to: &str,
 ) -> anyhow::Result<DiffOutput> {
@@ -841,6 +842,94 @@ mod tests {
             second.to_hex(),
             "to must be the snapshotted tip, not the live one"
         );
+    }
+
+    /// Issue #45: prove the Diff dispatch arm acquires `commit_lock`
+    /// before reading refs. Deleting the lock acquisition would let
+    /// `dispatch(Diff)` proceed past a held lock; this test would
+    /// fail because the inner task completes immediately instead of
+    /// blocking on the lock release.
+    ///
+    /// Mechanic: hold `commit_lock` from the test, drive
+    /// `dispatch(Diff)` as a pinned future on the same runtime, and
+    /// race it against a short sleep using `tokio::select!`. With the
+    /// lock acquisition in the Diff arm in place, the future parks on
+    /// `lock_owned().await` and the sleep wins. Without it (if
+    /// someone deletes the dispatch's lock block) the future completes
+    /// here and the test panics. After releasing the lock we await
+    /// the same pinned future for the actual response.
+    #[tokio::test]
+    async fn dispatch_diff_blocks_on_commit_lock() {
+        use agentic_core::{FsObjectStore, ObjectStore};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        let state = Arc::new(
+            DaemonState::open(
+                dir.path().to_path_buf(),
+                agentic_dir,
+                store,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Two commits so there's actually something for diff to
+        // resolve. Without this, dispatch(Diff) would fail at the
+        // `ref not found` step BEFORE proving the lock interaction.
+        let first = make_commit(&state, "main", "first", b"v1".to_vec()).await;
+        let second = make_commit(&state, "main", "second", b"v2".to_vec()).await;
+        assert_ne!(first, second);
+
+        // Grab the lock from the test side, holding it.
+        let guard = Arc::clone(&state.commit_lock).lock_owned().await;
+
+        let dispatch_fut = dispatch(
+            Arc::clone(&state),
+            Request::Diff {
+                from: first.to_hex(),
+                to: "main".to_string(),
+            },
+            None,
+        );
+        tokio::pin!(dispatch_fut);
+
+        tokio::select! {
+            res = &mut dispatch_fut => {
+                panic!(
+                    "dispatch(Diff) completed while commit_lock was held; \
+                     the lock acquisition in the Diff arm is missing or \
+                     was bypassed. got: {res:?}"
+                );
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // expected: dispatch is parked on commit_lock.
+            }
+        }
+
+        // Release the lock — dispatch now proceeds.
+        drop(guard);
+        let response = tokio::time::timeout(Duration::from_secs(2), &mut dispatch_fut)
+            .await
+            .expect("dispatch must complete promptly once lock is dropped")
+            .expect("dispatch should succeed once unblocked");
+
+        match response {
+            Response::Diff(out) => {
+                assert_eq!(out.from, first.to_hex());
+                assert_eq!(out.to, second.to_hex());
+            }
+            other => panic!("expected Response::Diff, got {other:?}"),
+        }
     }
 
     /// Helper: drive a commit on `branch` with a single prompt blob.
