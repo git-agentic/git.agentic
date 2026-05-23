@@ -9,11 +9,11 @@ This is a **measured early sanity-check** of where performance sits relative to 
 
 | Operation | Target (`snapshot-model` §9) | Measured | Notes |
 |---|---|---|---|
-| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **8.87 ms @ 100K rows** (laptop, post-fix) — linearly ~89 ms at 1M | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
+| `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **5 ms @ 10K / 5.6 ms @ 100K / 18.81 ms @ 1M** (laptop) | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
 | `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** (Criterion) | ✓ no obvious blocker; not a §9 measurement |
-| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **12.29 s @ 100K rows** (laptop) — linearly ~120 s at 1M | ⚠ does **not** meet §9; per-row INSERT round-trips are the bottleneck. Multi-row INSERT or COPY batching is the fix (see "Coverage gaps" below). |
+| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **102 ms @ 10K / 1.07 s @ 100K / 10.34 s @ 1M** (laptop, post-batched-INSERT) | ⚠ 1M still ~2× over §9 on this hardware shape, but linear and predictable. Multi-row INSERT closed the 12× gap from the per-row path; the next 10× hop is `COPY FROM STDIN` (tracked, v1.1). |
 | `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in `run-demo.sh`; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
-| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **66 µs @ 10K rows** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target at the segment counts we measure. |
+| `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **3 µs @ 10K / 4 µs @ 100K / 5 µs @ 1M** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target. |
 | `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
 | Per-blob write, **median** | < 5 ms per row (p99) | **2.7 ms median (512 KB)** / **0.83 ms median (1 KB)** | ⚠ Criterion reports median, not p99 — p99 needs `--save-baseline` raw-sample analysis (tracked) |
 | Snapshot storage amortized | < 2× changed data | _not yet measured_ | ⚠ pending segment-size sampling job |
@@ -24,37 +24,42 @@ The harness lives at [`crates/agentic-memory/tests/integration.rs`](../../crates
 
 Numbers below are from a developer laptop (Apple Silicon, 8-core; Postgres 16 + pgvector in Docker Desktop on the same host).
 
-### `BENCH_ROWS=10000` (2026-05-22, post-snapshot-fix)
+### `BENCH_ROWS=10000` (2026-05-22, post-snapshot-fix + batched restore)
 
 | Operation | Measured | §9 target |
 |---|---|---|
-| bulk seed (Postgres INSERTs, 10000 rows) | 30 ms | n/a — setup cost |
-| `snapshot()` | ~5 ms (post-fix) — was 39 ms with the O(n²) bug | < 2 s @ 1M-row pgvector |
-| `restore()` (no-op replay) | 1.33 s | < 5 s @ 1M-row + 10 commits |
-| `diff` (manifest hash compare) | 66 µs | < 1 s @ 1M-row pgvector — manifest-size-bounded, not row-bounded |
+| bulk seed (Postgres INSERTs, 10000 rows) | 22 ms | n/a — setup cost |
+| `snapshot()` | 5 ms | < 2 s @ 1M-row pgvector |
+| `restore()` (no-op replay) | **102 ms** (was 1.33 s; 13× from batched INSERT) | < 5 s @ 1M-row + 10 commits |
+| `diff` (manifest hash compare) | 3 µs | < 1 s @ 1M-row pgvector — manifest-size-bounded, not row-bounded |
 
 Both manifest hashes match across the snapshot → restore → snapshot cycle (round-trip determinism).
 
-### `BENCH_ROWS=100000` (2026-05-22, post-snapshot-fix)
+### `BENCH_ROWS=100000` (2026-05-22, post-snapshot-fix + batched restore)
 
 | Operation | Measured | §9 target |
 |---|---|---|
-| bulk seed (Postgres INSERTs, 100000 rows) | 231 ms | n/a — setup cost |
-| `snapshot()` | **8.87 ms** | < 2 s @ 1M-row pgvector |
-| `restore()` (no-op replay) | **12.29 s** ⚠ does not meet §9 extrapolated to 1M | < 5 s @ 1M-row + 10 commits |
-| `diff` (manifest hash compare) | 4.7 µs | < 1 s @ 1M-row pgvector |
+| bulk seed (Postgres INSERTs, 100000 rows) | 210 ms | n/a — setup cost |
+| `snapshot()` | 5.60 ms | < 2 s @ 1M-row pgvector |
+| `restore()` (no-op replay) | **1.07 s** (was 12.29 s; 11.5× from batched INSERT) | < 5 s @ 1M-row + 10 commits |
+| `diff` (manifest hash compare) | 4 µs | < 1 s @ 1M-row pgvector |
 
 Manifest hashes match across the snapshot → restore → snapshot cycle.
 
-Pre-fix, this scale was unrunnable — the first attempt at 100K rows was killed after >10 min of 100%-CPU work, Postgres idle. A diagnostic pass found two distinct issues:
+**Diagnosis 1 — Snapshot O(n²) on segment size** *(fixed earlier)*: `bootstrap_table` called `current.canonical_size()` after every row to decide whether to seal a segment. `canonical_size()` re-serialised the **entire growing segment** on every iteration. With the default 64 MiB segment target, a 100K-row bootstrap re-encoded the segment ~100K times for cumulative O(n²) cost. Replaced with a running-byte counter that accumulates each row's encoded size as it lands.
 
-**Diagnosis 1 — Snapshot O(n²) on segment size** *(fix applied in this PR)*: `bootstrap_table` called `current.canonical_size()` after every row to decide whether to seal a segment. `canonical_size()` is `serde_json::to_vec(self).len()` — it re-serialised the **entire growing segment** on every iteration. With the default 64 MiB segment target, a 100K-row bootstrap re-encoded the segment ~100K times for a cumulative O(n²) cost. Replaced with a running-byte counter that accumulates each row's encoded size as it lands.
+**Diagnosis 2 — Restore O(n) round-trips** *(fixed in this revision)*: `restore_manifest`'s inner loop issued one parameterised INSERT per row, hitting a hard floor of N × Postgres-round-trip-cost. `apply_segment_rows` now groups consecutive same-shape envelopes (same column-set + same upsert-vs-delete mode) and emits one multi-row `INSERT … VALUES (...), (...), … ON CONFLICT` per group, capped at 1000 rows per statement to stay well under Postgres's 65535-parameter ceiling. Delete envelopes batch as `DELETE … WHERE pk IN (...)`. Order across groups is preserved — a shape change always flushes — so the streamer's per-row event ordering still drives the final state.
 
-**Diagnosis 2 — Restore O(n) round-trips** *(documented; fix is a follow-up)*: `restore_manifest` loops every row in the manifest and calls `apply_envelope` → `upsert_row`, which issues a single parameterised INSERT per row through the open transaction. For N rows that's N Postgres round-trips inside one transaction. At ≈ 100 µs per query on localhost the floor is ≈ N × 100 µs — exactly what 10K (1.33 s) and projected 1M (≈ 100 s) show. Fixing this needs either a multi-row `INSERT VALUES (...), (...)` batched at e.g. 1000 rows per statement (~100× speedup expected on localhost), or `COPY FROM STDIN` (~1000× expected). Multi-row INSERT is simpler and stays within sqlx's typed API; COPY needs `PgCopyIn` wire-format work. Tracking as a separate refactor — `apply_envelope` currently assumes one row per call and the inner loop would need to group by column-set first (delta segments may carry rows with different shapes).
+### `BENCH_ROWS=1000000` — the §9-shaped row, now measurable
 
-### `BENCH_ROWS=1000000` — the §9-shaped row
+| Operation | Measured | §9 target |
+|---|---|---|
+| bulk seed (Postgres INSERTs, 1000000 rows) | 1.78 s | n/a — setup cost |
+| `snapshot()` | **18.81 ms** | < 2 s @ 1M-row pgvector — ✓ |
+| `restore()` (no-op replay) | **10.34 s** | < 5 s @ 1M-row + 10 commits — ⚠ ~2× over |
+| `diff` (manifest hash compare) | 5 µs | < 1 s @ 1M-row pgvector — ✓ |
 
-Still not attempted on laptop hardware. With the snapshot fix the bootstrap is now linear, but restore's O(N) round-trips dominate. Re-run after the restore-side batching lands; that's the prerequisite for a representative §9 number.
+Pre-batched, 1M was unrunnable on this hardware (extrapolated to ≈ 130 s). Now linear and predictable: 1M = ~10 × 100K, which matches the measurement. The remaining ~2× to hit §9 is the next 10× speed-up that `COPY FROM STDIN` is expected to deliver (sqlx's `PgCopyIn` wire-format encoding, tracked as a v1.1 follow-up). At a representative cloud instance class — fewer noisy neighbours, faster fsync, larger shared_buffers — the present multi-row-INSERT shape may already meet §9 on its own.
 
 ## Raw Criterion micro-benchmarks (2026-05-20)
 
@@ -83,8 +88,9 @@ Source: [`crates/agentic-core/benches/store.rs`](../../crates/agentic-core/bench
 
 ## Coverage gaps (tracked)
 
-- **Restore round-trip count.** Restore loops every row in the manifest and issues one parameterised INSERT per row through the open transaction. At 100K rows this is 12.29 s — linearly ~120 s at 1M, which doesn't meet §9. The fix is multi-row `INSERT VALUES (...), (...)` batched at ≈ 1000 rows per statement (~100× expected speedup on localhost) or `COPY FROM STDIN` (~1000× expected). Multi-row INSERT is simpler — `apply_envelope` currently assumes one row per call and the inner loop would need to group by column-set first (delta segments may carry rows with different shapes). Track as a separate refactor on `agentic-memory::restore`.
-- **Snapshot O(n²) fix landed.** `bootstrap_table` previously called `canonical_size()` (== full re-serialisation of the segment) on every row to decide when to seal. The fix accumulates a running byte counter as rows land; 100K snapshot is now 8.87 ms (was unrunnable). This is in the diff that ships this benchmarks.md update.
+- **Restore batched-INSERT landed.** `apply_segment_rows` now groups consecutive same-shape envelopes and emits one multi-row `INSERT ... VALUES (...), (...)` (or `DELETE ... WHERE pk IN (...)` for deletes) per group, capped at 1000 rows / 60000 params per statement. 100K restore went from 12.29 s to 1.07 s (11.5×); 1M is now tractable at 10.34 s on the laptop.
+- **Restore COPY FROM STDIN.** The next ~10× hop. sqlx exposes `PgCopyIn` for binary wire-format encoding; an estimated 100 ms / 1M rows on the same hardware would put §9 squarely within reach without a cloud-class machine. Trade-off: only `INSERT` rows batch cleanly via COPY — `DELETE` and column-set-variant `UPDATE` runs fall back to multi-row INSERT/DELETE. Tracked as a v1.1 follow-up.
+- **Snapshot O(n²) fix landed earlier.** `bootstrap_table` previously called `canonical_size()` (full re-serialisation) on every row. Replaced with a running-byte counter; 100K snapshot went from unrunnable to 8.87 ms (now 5.60 ms with measurement noise).
 - **p99 per-blob write number** requires Criterion's `--save-baseline` + raw-sample analysis; currently we publish the median only.
 - **Snapshot storage amortisation** (< 2× changed data) needs a segment-size sampling job that walks the object store after a series of commits with varying delta sizes.
 - **Representative-cloud-instance run** of `pg_snapshot_perf_smoke` at `BENCH_ROWS=1000000` is the unambiguous §9 commitment. Laptop numbers here are a "ranged signal, not an SLA" — useful for spotting regressions, not for public commitments.
