@@ -1358,19 +1358,28 @@ async fn restore_handles_duplicate_pk_within_a_batch() {
         .await
         .expect("restore must handle duplicate PK in same shape run by flushing between");
 
-    // Verify last-writer-wins: id=42 must have text="last", and there
-    // should be no other row.
-    let row: (i64, String) =
+    // Verify last-writer-wins AND that only one row exists. Fetching
+    // all rows and asserting full set — `fetch_one` would silently
+    // accept extra rows beyond the first, which would mask a bug
+    // where TRUNCATE didn't run or extra inserts leaked.
+    let rows: Vec<(i64, String)> =
         sqlx::query_as(format!("SELECT id, text FROM \"{schema}\".episodes").as_str())
-            .fetch_one(&admin_pool)
+            .fetch_all(&admin_pool)
             .await
             .unwrap();
-    assert_eq!(row.0, 42);
     assert_eq!(
-        row.1, "last",
+        rows.len(),
+        1,
+        "exactly one row expected after duplicate-PK restore; got {} rows: {:?}",
+        rows.len(),
+        rows
+    );
+    assert_eq!(rows[0].0, 42);
+    assert_eq!(
+        rows[0].1, "last",
         "duplicate-PK restore must preserve last-writer-wins via separate statements; \
          got {:?}",
-        row.1
+        rows[0].1
     );
 
     drop_schema(&admin_pool, &schema).await;

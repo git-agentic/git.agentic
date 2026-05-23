@@ -249,7 +249,14 @@ async fn apply_segment_rows(
     while i < entries.len() {
         let (first_op, first_obj) = entries[i];
         let first_mode = batch_mode_of(first_op);
+        // `first_cols` preserves the column ORDER so `batch_upsert`
+        // can bind args in a stable, deterministic sequence. The
+        // accompanying `first_col_set` is the O(1)-lookup version of
+        // the same list, used by the same-shape membership check
+        // below so we don't pay O(k²) per candidate row at wider
+        // schemas. Built once per batch.
         let first_cols: Vec<&str> = first_obj.keys().map(String::as_str).collect();
+        let first_col_set: std::collections::HashSet<&str> = first_cols.iter().copied().collect();
         // Cap by both row count AND param count. For upserts param
         // count == col_count * rows; for deletes it's just rows.
         // The smaller cap controls. `.max(1)` so a pathological wide
@@ -292,14 +299,11 @@ async fn apply_segment_rows(
                     break;
                 }
                 // Set-equality without allocating a `Vec` per row.
-                // The streamer almost always emits a consistent column
-                // order, so the `iter().all(...).contains()` walk
-                // resolves in O(k) — k is column count, small in
-                // practice (typically 2–20). `serde_json::Map`
-                // preserves insertion order, not sorted order;
-                // `next_obj.keys()` doesn't need to be materialised
-                // into a Vec to check membership against `first_cols`.
-                if !next_obj.keys().all(|k| first_cols.contains(&k.as_str())) {
+                // `first_col_set` is the HashSet built once per batch
+                // so membership is O(1) per column instead of O(k).
+                // Equal-length check above + every key of next_obj
+                // present in first_col_set ⇒ identical sets.
+                if !next_obj.keys().all(|k| first_col_set.contains(k.as_str())) {
                     break;
                 }
                 // Duplicate-PK check. `HashSet::insert` returns false
