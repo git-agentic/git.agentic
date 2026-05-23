@@ -266,14 +266,17 @@ async fn apply_segment_rows(
         // For upsert runs, track which PKs are already in this batch
         // so we flush before a duplicate would trigger SQLSTATE 21000.
         // `pk_signature` stringifies the PK value canonically so two
-        // equivalent JSON scalars (e.g. `1` and `1`) match. Init with
-        // the first row's PK.
-        let mut seen_pks: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(cap);
+        // equivalent JSON scalars (e.g. `1` and `1`) match.
+        //
+        // Allocated lazily — Delete runs never touch this and shouldn't
+        // pay for it.
+        let mut seen_pks: Option<std::collections::HashSet<String>> = None;
         if first_mode == BatchMode::Upsert {
+            let mut set = std::collections::HashSet::with_capacity(cap);
             if let Some(pk) = first_obj.get(pk_col) {
-                seen_pks.insert(pk_signature(pk));
+                set.insert(pk_signature(pk));
             }
+            seen_pks = Some(set);
         }
 
         // Find the run end: same mode, same column-set (for upserts),
@@ -288,14 +291,15 @@ async fn apply_segment_rows(
                 if next_obj.len() != first_cols.len() {
                     break;
                 }
-                // `serde_json::Map` preserves insertion order, not
-                // sorted order. `same_column_set` is set-equality, not
-                // sequence-equality — two rows with the same columns
-                // in different orders still batch (uncommon in
-                // practice because the streamer emits a consistent
-                // shape per source row).
-                let next_cols: Vec<&str> = next_obj.keys().map(String::as_str).collect();
-                if !same_column_set(&first_cols, &next_cols) {
+                // Set-equality without allocating a `Vec` per row.
+                // The streamer almost always emits a consistent column
+                // order, so the `iter().all(...).contains()` walk
+                // resolves in O(k) — k is column count, small in
+                // practice (typically 2–20). `serde_json::Map`
+                // preserves insertion order, not sorted order;
+                // `next_obj.keys()` doesn't need to be materialised
+                // into a Vec to check membership against `first_cols`.
+                if !next_obj.keys().all(|k| first_cols.contains(&k.as_str())) {
                     break;
                 }
                 // Duplicate-PK check. `HashSet::insert` returns false
@@ -307,7 +311,10 @@ async fn apply_segment_rows(
                     None => break, // missing PK → flush and let the
                                    // upsert path error on this row
                 };
-                if !seen_pks.insert(next_pk) {
+                let set = seen_pks
+                    .as_mut()
+                    .expect("seen_pks initialised above for Upsert mode");
+                if !set.insert(next_pk) {
                     break;
                 }
             }
@@ -363,24 +370,6 @@ fn batch_mode_of(op: Op) -> BatchMode {
         Op::Insert | Op::Update => BatchMode::Upsert,
         Op::Delete => BatchMode::Delete,
     }
-}
-
-/// Compare two column-name slices irrespective of order. `serde_json::Map`
-/// preserves insertion order, so we can't rely on identical iteration
-/// order across two row objects from different sources. Cheap because
-/// column counts are small in practice (typically 2–20) — the O(k²)
-/// `contains` scan is bounded tightly enough that adding a HashSet
-/// indirection would cost more in allocation than it saves in
-/// comparison. A fast `a == b` equality check up-front handles the
-/// common case where the streamer emits identical iteration order.
-fn same_column_set(a: &[&str], b: &[&str]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    if a == b {
-        return true; // identical iteration order — most common case
-    }
-    a.iter().all(|c| b.contains(c))
 }
 
 async fn batch_upsert(
@@ -617,32 +606,6 @@ mod tests {
         );
     }
 
-    /// A partial envelope (only one of `op`/`row` present) falls through
-    /// the inner `if let` and is treated as a plain bootstrap row. The
-    /// result is "treat the partial-envelope object as a row to upsert
-    /// under Insert". Documents the corner case so a future change to
-    /// peel_envelope notices when it shifts.
-    ///
-    /// The next behaviour change worth considering: reject partial
-    /// envelopes loudly. Held off in this PR because no current
-    /// producer emits them — the streamer always writes both keys —
-    /// so making it an error would just add code without a real
-    /// failure mode to prevent.
-    #[test]
-    fn same_column_set_identity_fast_path() {
-        // Common case: streamer emits a consistent column order. The
-        // fast `a == b` check resolves without the O(k²) scan.
-        let a = ["id", "text", "embedding"];
-        assert!(same_column_set(&a, &a));
-    }
-
-    #[test]
-    fn same_column_set_handles_reordered_keys() {
-        assert!(same_column_set(&["id", "text"], &["text", "id"]));
-        assert!(!same_column_set(&["id", "text"], &["id", "score"]));
-        assert!(!same_column_set(&["id"], &["id", "text"]));
-    }
-
     #[test]
     fn pk_signature_distinguishes_distinct_scalars() {
         // Used by the duplicate-PK detector in apply_segment_rows.
@@ -656,6 +619,17 @@ mod tests {
         assert_ne!(pk_signature(&json!(1)), pk_signature(&json!("1")));
     }
 
+    /// A partial envelope (only one of `op`/`row` present) falls through
+    /// the inner `if let` and is treated as a plain bootstrap row. The
+    /// result is "treat the partial-envelope object as a row to upsert
+    /// under Insert". Documents the corner case so a future change to
+    /// peel_envelope notices when it shifts.
+    ///
+    /// The next behaviour change worth considering: reject partial
+    /// envelopes loudly. Held off in this PR because no current
+    /// producer emits them — the streamer always writes both keys —
+    /// so making it an error would just add code without a real
+    /// failure mode to prevent.
     #[test]
     fn peel_envelope_partial_envelope_falls_through_to_plain_row() {
         let partial = json!({"op": "delete"}); // no `row` key
