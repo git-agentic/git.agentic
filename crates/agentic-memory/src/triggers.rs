@@ -295,7 +295,7 @@ pub fn spawn_poller(
                             error = %e,
                             consecutive_failures,
                             escalate_after = POLLER_ESCALATE_AFTER,
-                            "change-log drain has failed for {} consecutive ticks; \
+                            "change-log drain has failed {} times since the last successful non-empty drain; \
                              snapshot fence (drain_to_completion) will hard-error \
                              until this clears",
                             consecutive_failures
