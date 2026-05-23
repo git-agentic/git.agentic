@@ -30,6 +30,15 @@ pub enum Error {
     #[error("required reverse migration missing for: {0}")]
     MissingReverseMigration(String),
 
+    /// The streamer task has exited and its mpsc receiver is dropped.
+    /// Permanent failure mode — a retry can't reopen the channel; the
+    /// adapter needs to be torn down and re-bootstrapped. The poller
+    /// matches this variant explicitly so it can terminate its own
+    /// task instead of looping forever and starving every
+    /// `Quiesceable::pause()` caller (restore deadlock).
+    #[error("streamer task has shut down (channel closed)")]
+    StreamerShutdown,
+
     #[error(transparent)]
     Core(#[from] agentic_core::Error),
 

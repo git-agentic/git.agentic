@@ -108,6 +108,11 @@ fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) 
         MemoryError::Core(core) => classify_core_error(core),
         MemoryError::Sqlx(sqlx) => classify_sqlx_like(sqlx),
         MemoryError::Other(_) => (ErrorClass::Internal, "memory_other", false),
+        // Permanent: streamer is gone and a retry can't bring it
+        // back. Surface as non-retryable Memory so the SDK doesn't
+        // burn a retry budget on something that needs a daemon
+        // restart.
+        MemoryError::StreamerShutdown => (ErrorClass::Memory, "streamer_shutdown", false),
     }
 }
 
