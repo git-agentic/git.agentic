@@ -185,14 +185,14 @@ impl StreamerHandle {
         self.tx
             .send(Cmd::Event(ev))
             .await
-            .map_err(|_| Error::Backend("streamer task has shut down".into()))
+            .map_err(|_| Error::StreamerShutdown)
     }
 
     pub async fn seed_sealed(&self, refs: Vec<SegmentRef>) -> Result<()> {
         self.tx
             .send(Cmd::SeedSealed(refs))
             .await
-            .map_err(|_| Error::Backend("streamer task has shut down".into()))
+            .map_err(|_| Error::StreamerShutdown)
     }
 
     pub async fn take_snapshot(&self, schema_version: &str) -> Result<SegmentManifest> {
@@ -203,9 +203,8 @@ impl StreamerHandle {
                 reply: tx,
             })
             .await
-            .map_err(|_| Error::Backend("streamer task has shut down".into()))?;
-        rx.await
-            .map_err(|_| Error::Backend("streamer dropped reply channel".into()))?
+            .map_err(|_| Error::StreamerShutdown)?;
+        rx.await.map_err(|_| Error::StreamerShutdown)?
     }
 }
 

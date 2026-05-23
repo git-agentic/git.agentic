@@ -75,6 +75,35 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How many rows the poller fetches per cycle.
 pub const POLL_BATCH_SIZE: i64 = 1000;
 
+/// Accumulated failed drain ticks before the poller's log level
+/// escalates from `warn` to `error`. Counts every `Err(...)` return
+/// from `drain_once`; not strictly consecutive at the wall-clock
+/// level because empty ticks (`Ok(processed: 0)`) deliberately do
+/// not reset the counter (see the poller loop's empty-tick comment
+/// for why). In practice the counter only grows during a sustained
+/// failure window — a single successful non-empty drain resets it
+/// to 0.
+///
+/// At the default 100 ms tick interval (see [`DEFAULT_POLL_INTERVAL`]),
+/// 50 ticks ≈ 5 s of sustained drain failure — long enough to ride
+/// out a Postgres reconnect or a brief connectivity blip without
+/// paging anyone, short of anything that would still look like
+/// "transient" to an operator.
+///
+/// **Operator note**: if `spawn_poller` is called with a custom
+/// interval far from the default, the 5 s framing breaks. The
+/// constant stays in ticks rather than wall-clock seconds because
+/// the loop is tick-driven; the wall-clock equivalent is just a
+/// helpful default-case framing for operator alerts.
+const POLLER_ESCALATE_AFTER: u32 = 50;
+
+/// Once escalated, emit one error log every N ticks instead of one
+/// per tick. Prevents log flood / alert storm during a sustained
+/// outage while keeping the signal alive for operators. At the
+/// default 100 ms interval, 50 ticks ≈ 5 s between heartbeats — same
+/// cadence as the escalation threshold, which is intentional.
+const POLLER_ERROR_HEARTBEAT: u32 = 50;
+
 /// Idempotently install the change-log table, capture function, and
 /// per-table triggers. Safe to call on every adapter start.
 ///
@@ -178,6 +207,25 @@ pub fn spawn_poller(
         );
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Track consecutive systemic failures so the log level
+        // escalates from `warn` to `error` if drain keeps failing.
+        // A single transient blip at warn is fine; a sustained
+        // outage needs an alertable signal. The counter resets on
+        // any successful non-empty drain; it is NOT reset on an
+        // empty tick (`Ok(processed: 0)`) — that path proves
+        // Postgres connectivity (the SELECT succeeded) but doesn't
+        // exercise the streamer-send + bulk-DELETE pipeline, so a
+        // mid-pipeline failure could still be present. After an
+        // outage clears, the next non-empty drain decides.
+        //
+        // At 100 ms ticks, a threshold of 50 means ~5 s of sustained
+        // failure before escalation — enough to ride out a Postgres
+        // reconnect, short of anything an operator would call "the
+        // streamer is broken". After escalation, error logs are
+        // throttled: one at the warn→error boundary, then a heartbeat
+        // every POLLER_ERROR_HEARTBEAT ticks (~5 s by default) to keep
+        // logs alertable without flooding alert systems.
+        let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
             // Acquire the pause-lock around each drain. While a restore
@@ -186,17 +234,74 @@ pub fn spawn_poller(
             // restore window reaches the streamer.
             let _permit = pause_lock_for_task.lock().await;
             match drain_once(&pool, &streamer, &key_of, &bare_lookup, DrainMode::Lenient).await {
-                Ok(DrainOutcome { processed: 0, .. }) => {}
+                Ok(DrainOutcome { processed: 0, .. }) => {
+                    // See the comment above: empty drains don't reset
+                    // the failure counter because the SELECT was the
+                    // only operation exercised. The next non-empty
+                    // drain decides whether the streak is over.
+                }
                 Ok(DrainOutcome {
                     processed,
                     forwarded,
-                }) => tracing::info!(
-                    processed,
-                    forwarded,
-                    skipped = processed - forwarded,
-                    "agentic_change_log drained"
-                ),
-                Err(e) => tracing::warn!(error = %e, "change-log drain failed"),
+                }) => {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            consecutive_failures,
+                            "agentic_change_log drain recovered after sustained failure"
+                        );
+                    }
+                    consecutive_failures = 0;
+                    tracing::info!(
+                        processed,
+                        forwarded,
+                        skipped = processed - forwarded,
+                        "agentic_change_log drained"
+                    );
+                }
+                // Streamer task has exited — its mpsc receiver is
+                // dropped and a retry can never reopen it. Looping
+                // here would hold `pause_lock` 10×/s and deadlock
+                // every `Quiesceable::pause()` caller (restore would
+                // hang). Terminate the poller; the daemon must be
+                // re-bootstrapped to recover.
+                Err(Error::StreamerShutdown) => {
+                    tracing::error!(
+                        "trigger poller terminating: streamer task has shut down; \
+                         the daemon must be restarted to re-bootstrap the streamer. \
+                         Any in-flight snapshot fence will fail until then."
+                    );
+                    return;
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures < POLLER_ESCALATE_AFTER {
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures,
+                            "change-log drain failed"
+                        );
+                    } else if consecutive_failures == POLLER_ESCALATE_AFTER
+                        || (consecutive_failures - POLLER_ESCALATE_AFTER)
+                            .is_multiple_of(POLLER_ERROR_HEARTBEAT)
+                    {
+                        // Log at error on the warn→error transition,
+                        // then a heartbeat every POLLER_ERROR_HEARTBEAT
+                        // ticks. Without throttling, a sustained
+                        // outage would emit 10 error logs/s at the
+                        // default 100 ms interval — defeating the
+                        // alertability the escalation was meant to
+                        // provide.
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            escalate_after = POLLER_ESCALATE_AFTER,
+                            "change-log drain has failed {} times since the last successful non-empty drain; \
+                             snapshot fence (drain_to_completion) will hard-error \
+                             until this clears",
+                            consecutive_failures
+                        );
+                    }
+                }
             }
         }
     });

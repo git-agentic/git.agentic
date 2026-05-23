@@ -108,6 +108,14 @@ fn classify_memory_error(err: &MemoryError) -> (ErrorClass, &'static str, bool) 
         MemoryError::Core(core) => classify_core_error(core),
         MemoryError::Sqlx(sqlx) => classify_sqlx_like(sqlx),
         MemoryError::Other(_) => (ErrorClass::Internal, "memory_other", false),
+        // Permanent: streamer is gone and a retry can't bring it
+        // back. Surface as non-retryable Memory so the SDK doesn't
+        // burn a retry budget on something that needs a daemon
+        // restart. Reuses the existing `streamer_dead` code token
+        // from the legacy string-sniff path below — both describe
+        // the same underlying condition, and fragmenting the wire
+        // code would split operator alerts on the same failure mode.
+        MemoryError::StreamerShutdown => (ErrorClass::Memory, "streamer_dead", false),
     }
 }
 
@@ -316,6 +324,39 @@ mod tests {
                 assert_eq!(class, ErrorClass::Validation);
                 assert_eq!(code, "secret_detected");
                 assert!(!retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn memory_streamer_shutdown_is_non_retryable_using_legacy_code() {
+        // Permanent failure mode — the streamer task is gone and a
+        // retry can't reopen the mpsc channel. The SDK must see
+        // retryable=false so it doesn't burn its retry budget on
+        // something that needs a daemon restart. Uses the same
+        // `streamer_dead` code as the legacy string-sniff path so
+        // operator alerts don't fragment on two codes for the same
+        // condition.
+        let err: anyhow::Error = anyhow::Error::new(MemoryError::StreamerShutdown);
+        match map_anyhow_to_response_error(err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Memory);
+                assert_eq!(
+                    code, "streamer_dead",
+                    "typed StreamerShutdown must reuse the legacy code; \
+                     fragmenting would split alert rules across two codes \
+                     for the same condition"
+                );
+                assert!(
+                    !retryable,
+                    "StreamerShutdown must be non-retryable; the channel can't reopen"
+                );
             }
             _ => panic!("expected Response::Error"),
         }
