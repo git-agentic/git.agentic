@@ -327,6 +327,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_streamer_shutdown_is_non_retryable_with_specific_code() {
+        // Permanent failure mode — the streamer task is gone and a
+        // retry can't reopen the mpsc channel. The SDK must see
+        // retryable=false so it doesn't burn its retry budget on
+        // something that needs a daemon restart. The `code` must be
+        // distinct from the generic `backend_failure` catchall so
+        // operator alerts can wire on the right signal.
+        let err: anyhow::Error = anyhow::Error::new(MemoryError::StreamerShutdown);
+        match map_anyhow_to_response_error(err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Memory);
+                assert_eq!(code, "streamer_shutdown");
+                assert!(
+                    !retryable,
+                    "StreamerShutdown must be non-retryable; the channel can't reopen"
+                );
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
     fn memory_backend_transient_message_is_retryable() {
         let err: anyhow::Error = anyhow::Error::new(MemoryError::Backend(
             "connection dropped mid-snapshot".to_string(),
