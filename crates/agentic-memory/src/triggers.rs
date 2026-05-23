@@ -75,6 +75,15 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How many rows the poller fetches per cycle.
 pub const POLL_BATCH_SIZE: i64 = 1000;
 
+/// Consecutive failed drain ticks before the poller's log level
+/// escalates from `warn` to `error`. At the default 100 ms tick
+/// interval, 50 ticks ≈ 5 s of sustained drain failure — long
+/// enough to ride out a Postgres reconnect or a brief connectivity
+/// blip without paging anyone, short of anything that would still
+/// look like "transient" to an operator. The counter resets on any
+/// successful non-empty drain.
+const POLLER_ESCALATE_AFTER: u32 = 50;
+
 /// Idempotently install the change-log table, capture function, and
 /// per-table triggers. Safe to call on every adapter start.
 ///
@@ -178,6 +187,15 @@ pub fn spawn_poller(
         );
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Track consecutive systemic failures so the log level
+        // escalates from `warn` to `error` if drain keeps failing.
+        // A single transient blip at warn is fine; a sustained
+        // outage needs an alertable signal. Resets to 0 on any
+        // successful drain. At 100 ms ticks, a threshold of 50
+        // means ~5 s of sustained failure before escalation —
+        // enough to ride out a brief Postgres reconnect, short of
+        // anything an operator would call "the streamer is broken".
+        let mut consecutive_failures: u32 = 0;
         loop {
             ticker.tick().await;
             // Acquire the pause-lock around each drain. While a restore
@@ -186,17 +204,52 @@ pub fn spawn_poller(
             // restore window reaches the streamer.
             let _permit = pause_lock_for_task.lock().await;
             match drain_once(&pool, &streamer, &key_of, &bare_lookup, DrainMode::Lenient).await {
-                Ok(DrainOutcome { processed: 0, .. }) => {}
+                Ok(DrainOutcome { processed: 0, .. }) => {
+                    // Empty tick — common case; don't reset the
+                    // failure counter on it because no work was
+                    // attempted, just keep the streak count steady.
+                    // (If the prior tick failed, `consecutive_failures`
+                    // stays nonzero and the next non-empty drain
+                    // either confirms the failure or clears it.)
+                }
                 Ok(DrainOutcome {
                     processed,
                     forwarded,
-                }) => tracing::info!(
-                    processed,
-                    forwarded,
-                    skipped = processed - forwarded,
-                    "agentic_change_log drained"
-                ),
-                Err(e) => tracing::warn!(error = %e, "change-log drain failed"),
+                }) => {
+                    if consecutive_failures > 0 {
+                        tracing::info!(
+                            consecutive_failures,
+                            "agentic_change_log drain recovered after sustained failure"
+                        );
+                    }
+                    consecutive_failures = 0;
+                    tracing::info!(
+                        processed,
+                        forwarded,
+                        skipped = processed - forwarded,
+                        "agentic_change_log drained"
+                    );
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures < POLLER_ESCALATE_AFTER {
+                        tracing::warn!(
+                            error = %e,
+                            consecutive_failures,
+                            "change-log drain failed"
+                        );
+                    } else {
+                        tracing::error!(
+                            error = %e,
+                            consecutive_failures,
+                            escalate_after = POLLER_ESCALATE_AFTER,
+                            "change-log drain has failed for {} consecutive ticks; \
+                             snapshot fence (drain_to_completion) will hard-error \
+                             until this clears",
+                            consecutive_failures
+                        );
+                    }
+                }
             }
         }
     });
