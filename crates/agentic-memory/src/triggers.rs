@@ -75,16 +75,23 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How many rows the poller fetches per cycle.
 pub const POLL_BATCH_SIZE: i64 = 1000;
 
-/// Consecutive failed drain ticks before the poller's log level
-/// escalates from `warn` to `error`. At the default 100 ms tick
-/// interval (see [`DEFAULT_POLL_INTERVAL`]), 50 ticks ≈ 5 s of
-/// sustained drain failure — long enough to ride out a Postgres
-/// reconnect or a brief connectivity blip without paging anyone,
-/// short of anything that would still look like "transient" to an
-/// operator. The counter resets on any successful non-empty drain.
+/// Accumulated failed drain ticks before the poller's log level
+/// escalates from `warn` to `error`. Counts every `Err(...)` return
+/// from `drain_once`; not strictly consecutive at the wall-clock
+/// level because empty ticks (`Ok(processed: 0)`) deliberately do
+/// not reset the counter (see the poller loop's empty-tick comment
+/// for why). In practice the counter only grows during a sustained
+/// failure window — a single successful non-empty drain resets it
+/// to 0.
+///
+/// At the default 100 ms tick interval (see [`DEFAULT_POLL_INTERVAL`]),
+/// 50 ticks ≈ 5 s of sustained drain failure — long enough to ride
+/// out a Postgres reconnect or a brief connectivity blip without
+/// paging anyone, short of anything that would still look like
+/// "transient" to an operator.
 ///
 /// **Operator note**: if `spawn_poller` is called with a custom
-/// interval far from the default, this 5 s framing breaks. The
+/// interval far from the default, the 5 s framing breaks. The
 /// constant stays in ticks rather than wall-clock seconds because
 /// the loop is tick-driven; the wall-clock equivalent is just a
 /// helpful default-case framing for operator alerts.
