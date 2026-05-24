@@ -11,7 +11,7 @@ This is a **measured early sanity-check** of where performance sits relative to 
 |---|---|---|---|
 | `commit` (memory snapshot of N-row pgvector) | < 2 s @ 1M rows + 100 deltas | **5 ms @ 10K / 5.6 ms @ 100K / 18.81 ms @ 1M** (laptop) | text-only `episodes` schema; no embeddings, no deltas. ✓ comfortably within target. |
 | `commit` (prompts-only, 16-byte system prompt, no memory) | n/a — degenerate input | **2.3 ms median** (Criterion) | ✓ no obvious blocker; not a §9 measurement |
-| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **102 ms @ 10K / 1.07 s @ 100K / 10.34 s @ 1M** (laptop, post-batched-INSERT) | ⚠ 1M still ~2× over §9 on this hardware shape, but linear and predictable. Multi-row INSERT closed the 12× gap from the per-row path; the next 10× hop is `COPY FROM STDIN` (tracked, v1.1). |
+| `rollback` (memory restore of N-row pgvector) | < 5 s @ 1M rows + 10 commits | **102 ms @ 10K / 1.07 s @ 100K / 10.34 s @ 1M** (laptop, batched-INSERT) | ⚠ 1M still ~2× over §9 on this hardware shape, but linear and predictable. Multi-row INSERT closed the 12× gap from the per-row path. `COPY FROM STDIN` was prototyped 2026-05-24 and **did not help on this hardware** (see "Coverage gaps" below for measured numbers and reasoning). A representative cloud-class machine remains the unambiguous §9-meeting path. |
 | `rollback` (broken-prompt demo, end-to-end) | n/a — demo scale | **~1 s observed** in `run-demo.sh`; ~6.7 s total for 12 demo steps incl. Postgres bring-up | ✓ demo discipline met |
 | `diff` (manifest hash compare across snapshots) | < 1 s @ 1M-row pgvector | **3 µs @ 10K / 4 µs @ 100K / 5 µs @ 1M** (laptop) | manifest comparison doesn't touch Postgres — cost scales with manifest size (segment-entry count), not row count or DB I/O. Trivially within target. |
 | `diff` (demo scenario) | n/a — demo scale | sub-second (observed) | ✓ demo discipline met |
@@ -59,7 +59,9 @@ Manifest hashes match across the snapshot → restore → snapshot cycle.
 | `restore()` (no-op replay) | **10.34 s** | < 5 s @ 1M-row + 10 commits — ⚠ ~2× over |
 | `diff` (manifest hash compare) | 5 µs | < 1 s @ 1M-row pgvector — ✓ |
 
-Pre-batched, 1M was unrunnable on this hardware (extrapolated to ≈ 130 s). Now linear and predictable: 1M = ~10 × 100K, which matches the measurement. The remaining ~2× to hit §9 is the next 10× speed-up that `COPY FROM STDIN` is expected to deliver (sqlx's `PgCopyIn` wire-format encoding, tracked as a v1.1 follow-up). At a representative cloud instance class — fewer noisy neighbours, faster fsync, larger shared_buffers — the present multi-row-INSERT shape may already meet §9 on its own.
+Pre-batched, 1M was unrunnable on this hardware (extrapolated to ≈ 130 s). Now linear and predictable: 1M = ~10 × 100K, which matches the measurement.
+
+The remaining ~2× to hit §9 on this laptop was hypothesised to come from `COPY FROM STDIN`. That prototype landed and was reverted 2026-05-24 — see "Coverage gaps" for the measured-not-faster result and the cloud-class-machine framing. At a representative cloud instance class — fewer noisy neighbours, faster fsync, larger shared_buffers — the present multi-row-INSERT shape may already meet §9 on its own.
 
 ## Raw Criterion micro-benchmarks (2026-05-20)
 
@@ -89,7 +91,16 @@ Source: [`crates/agentic-core/benches/store.rs`](../../crates/agentic-core/bench
 ## Coverage gaps (tracked)
 
 - **Restore batched-INSERT landed.** `apply_segment_rows` now groups consecutive same-shape envelopes and emits one multi-row `INSERT ... VALUES (...), (...)` (or `DELETE ... WHERE pk IN (...)` for deletes) per group, capped at 1000 rows / 60000 params per statement. 100K restore went from 12.29 s to 1.07 s (11.5×); 1M is now tractable at 10.34 s on the laptop.
-- **Restore COPY FROM STDIN.** The next ~10× hop. sqlx exposes `PgCopyIn` for binary wire-format encoding; an estimated 100 ms / 1M rows on the same hardware would put §9 squarely within reach without a cloud-class machine. Trade-off: only `INSERT` rows batch cleanly via COPY — `DELETE` and column-set-variant `UPDATE` runs fall back to multi-row INSERT/DELETE. Tracked as a v1.1 follow-up.
+- **Restore `COPY FROM STDIN` was prototyped 2026-05-24 and reverted.** The hypothesis was a ~10× speed-up on top of batched INSERT; the measurement instead showed flat-to-15%-slower on this hardware:
+  - 10K: 102 ms → 104 ms (+2%)
+  - 100K: 1.07 s → 1.06 s (flat)
+  - 1M: 10.34 s → 11.88 s (**+15% slower**)
+
+  Diagnosis: on Docker-Desktop Postgres at localhost, the bottleneck for restore is per-row write cost (WAL emission + btree insert), not the frontend/backend protocol overhead COPY skips. Multi-row INSERT at 1000 rows/statement already amortises the protocol round-trip; COPY's text-encoding pass added CPU work in the hot loop without saving anything Postgres-side. Manifest hashes stayed byte-identical, so the change was correct — just not faster.
+
+  What the measurement does NOT rule out: COPY winning on a representative cloud-class instance where (a) network RTT is higher than localhost IPC, (b) WAL fsync overhead is amortised by group commit, or (c) the binary COPY format (not yet tried) skips the text-encoding CPU cost. If a future revisit happens, start with binary COPY and run against managed Postgres, not Docker-Desktop.
+
+  Worktree + branch were deleted; no PR opened. Recorded here so the next person doesn't repeat the experiment expecting a different result on the same hardware.
 - **Snapshot O(n²) fix landed earlier.** `bootstrap_table` previously called `canonical_size()` (full re-serialisation) on every row. Replaced with a running-byte counter; 100K snapshot went from unrunnable to 8.87 ms (now 5.60 ms with measurement noise).
 - **p99 per-blob write number** requires Criterion's `--save-baseline` + raw-sample analysis; currently we publish the median only.
 - **Snapshot storage amortisation** (< 2× changed data) needs a segment-size sampling job that walks the object store after a series of commits with varying delta sizes.
