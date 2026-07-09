@@ -4,9 +4,10 @@
 //!
 //!   1. Resolve target ref → target Commit object.
 //!   2. If the target's `schema_version` differs from the live database's,
-//!      run reverse SQL migrations via `crate::migrate` to align the schema.
+//!      run reverse SQL migrations via `MemoryAdapter::apply_reverse_migrations`
+//!      (steps loaded by `crate::migrate::load_steps`).
 //!   3. Restore memory: load the target's SegmentManifest, hand it to
-//!      `PostgresAdapter::restore_with_guard` which TRUNCATEs each tracked
+//!      the adapter's `restore_with_guard` which TRUNCATEs each tracked
 //!      table and re-INSERTs from the captured segments inside one
 //!      transaction. The poller is paused for the whole window
 //!      (audit §A1).
@@ -100,51 +101,46 @@ pub async fn execute(
     }
 
     // -- Schema migrations + memory restore ----------------------------------
-    // The MutexGuard is released before any filesystem I/O so the daemon
-    // stays responsive and the future remains Send (no &adapter across
-    // awaits in separate async fns).
+    // No adapter lock: `Arc<dyn MemoryAdapter>` methods take `&self`, and
+    // exclusivity against concurrent commits comes from the daemon's
+    // commit_lock (audit §C9 / §A9).
     if let Some(ref target_schema) = target.schema_version {
-        let memory: std::sync::Arc<tokio::sync::Mutex<agentic_memory::postgres::PostgresAdapter>> =
+        let adapter: std::sync::Arc<dyn MemoryAdapter> =
             std::sync::Arc::clone(state.memory.as_ref().ok_or_else(|| {
                 anyhow!("target commit has a schema_version but no memory backend is attached")
             })?);
 
-        // Phase 1: query DB for live schema version and pending migration
-        // names. Guard is dropped at the end of this block.
+        // Phase 1: query the backend for the live schema version and the
+        // pending migration names.
         //
         // NOTE: the live-vs-target comparison here is a planning step
         // (decides whether migrations are needed and how many), not a
-        // duplicate of the gate that `PostgresAdapter::restore_with_guard`
-        // performs against the post-migration live state (audit §S5).
-        // After A8 wrapped the reverse-migration sequence in an outer
-        // transaction, partial failures don't leave intermediate live
-        // versions, so the two checks no longer raise inconsistent error
-        // types — `migrate::run_reverse` returns its own context-wrapped
-        // error and `restore_with_guard` only runs on success.
-        let (live_schema, migration_names) = {
-            let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
-            let live = adapter
-                .current_schema_version()
+        // duplicate of the gate that `restore_with_guard` performs
+        // against the post-migration live state (audit §S5). The
+        // reverse-migration sequence is atomic inside the backend
+        // (apply_reverse_migrations), so partial failures don't leave
+        // intermediate live versions.
+        let live_schema = adapter
+            .current_schema_version()
+            .await
+            .context("reading live schema version")?;
+        let migration_names = if live_schema != *target_schema {
+            adapter
+                .migrations_after(target_schema)
                 .await
-                .context("reading live schema version")?;
-            let names = if live != *target_schema {
-                adapter
-                    .migrations_after(target_schema)
-                    .await
-                    .context("querying pending reverse migrations")?
-            } else {
-                Vec::new()
-            };
-            (live, names)
+                .context("querying pending reverse migrations")?
+        } else {
+            Vec::new()
         };
 
         if live_schema != *target_schema {
             plan.push(format!(
                 "reverse schema migrations: {live_schema} → {target_schema}"
             ));
-            // Phase 2: synchronous filesystem I/O — no lock held.
-            // `accept_data_loss` is forwarded so `check_irreversible` can
-            // honor the operator's opt-in for IRREVERSIBLE-marked migrations.
+            // Phase 2: synchronous filesystem I/O — no adapter call in
+            // flight. `accept_data_loss` is forwarded so
+            // `check_irreversible` can honor the operator's opt-in for
+            // IRREVERSIBLE-marked migrations.
             let steps = migrate::load_steps(
                 state.refs.agentic_dir(),
                 &migration_names,
@@ -152,10 +148,10 @@ pub async fn execute(
             )
             .context("loading reverse migration files")?;
 
-            // Phase 3: execute migrations — re-acquire lock.
+            // Phase 3: execute — atomic inside the backend.
             if !args.dry_run {
-                let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
-                migrate::run_reverse(&adapter, steps)
+                adapter
+                    .apply_reverse_migrations(&steps)
                     .await
                     .context("running reverse migrations")?;
             }
@@ -177,17 +173,16 @@ pub async fn execute(
                     manifest,
                     schema_version: target_schema.clone(),
                 };
-                let adapter = std::sync::Arc::clone(&memory).lock_owned().await;
-                // Pause the trigger poller for the restore window, then
-                // call the guard-taking restore method so the quiesce
-                // discipline is visible at the call site. The poller
-                // resumes when `guard` is dropped at end of scope.
+                // Pause the backend's data capture for the restore
+                // window, then call the guard-taking restore method so
+                // the quiesce discipline is visible at the call site.
+                // The capture resumes when `guard` is dropped.
                 // Audit anchor: §A1 / [R1] — without this the demo's
                 // atomicity claim is silently false.
                 let guard = adapter
                     .begin_restore()
                     .await
-                    .context("pausing trigger poller for restore window")?;
+                    .context("pausing data capture for restore window")?;
                 adapter
                     .restore_with_guard(&guard, &handle)
                     .await

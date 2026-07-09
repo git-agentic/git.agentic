@@ -114,7 +114,7 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
         refs,
         commit_lock: Arc::new(Mutex::new(())),
         shutdown: tokio_util::sync::CancellationToken::new(),
-        memory: Some(Arc::new(Mutex::new(adapter))),
+        memory: Some(Arc::new(adapter)),
         mcp_servers: Vec::new(),
         http: reqwest::Client::builder()
             .user_agent("agenticd-test")

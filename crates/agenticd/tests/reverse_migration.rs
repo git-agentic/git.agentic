@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentic_core::FsObjectStore;
 use agentic_memory::postgres::{PgConfig, PostgresAdapter};
+use agentic_memory::MemoryAdapter;
 use agenticd::migrate;
 use sqlx::{Executor, PgPool};
 use tempfile::TempDir;
@@ -56,7 +57,8 @@ fn schema_scoped_url(base: &str, schema: &str) -> String {
 
 /// Install enough of `PostgresAdapter::install_helpers` for the migration
 /// runner to operate against a fresh schema: just `agentic_migrations`
-/// (the `agentic_schema_version()` function is not needed by `run_reverse`).
+/// (the `agentic_schema_version()` function is not needed by
+/// `apply_reverse_migrations`).
 async fn setup_schema_with_three_migrations(pool: &PgPool, schema: &str) -> sqlx::Result<()> {
     pool.execute(format!("CREATE SCHEMA \"{schema}\"").as_str())
         .await?;
@@ -152,7 +154,8 @@ async fn ac1_mid_sequence_failure_rolls_back_entire_sequence() {
     );
 
     // Build an adapter pointed at the test schema. The object store isn't
-    // exercised by `run_reverse`, but constructing the adapter requires one.
+    // exercised by `apply_reverse_migrations`, but constructing the adapter
+    // requires one.
     let store_dir = TempDir::new().unwrap();
     let store = Arc::new(FsObjectStore::open(store_dir.path().join("objects")).unwrap());
     let cfg = PgConfig::new(schema_scoped_url(&url, &schema), Vec::new());
@@ -171,7 +174,7 @@ async fn ac1_mid_sequence_failure_rolls_back_entire_sequence() {
     .expect("load steps");
     assert_eq!(steps.len(), 2);
 
-    let result = migrate::run_reverse(&adapter, steps).await;
+    let result = adapter.apply_reverse_migrations(&steps).await;
     assert!(
         result.is_err(),
         "expected step-2 failure to propagate; got {result:?}"
@@ -238,7 +241,8 @@ async fn run_reverse_commits_successful_sequence() {
         false,
     )
     .unwrap();
-    migrate::run_reverse(&adapter, steps)
+    adapter
+        .apply_reverse_migrations(&steps)
         .await
         .expect("happy-path reverse");
 
@@ -262,7 +266,8 @@ async fn run_reverse_commits_successful_sequence() {
 
 // ---------------------------------------------------------------------------
 // AC3c — accept_data_loss=true makes an IRREVERSIBLE-marked migration run
-// end-to-end through load_steps → run_reverse against real Postgres.
+// end-to-end through load_steps → apply_reverse_migrations against real
+// Postgres.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -340,9 +345,10 @@ async fn ac3c_accept_data_loss_reverses_irreversible_migration() {
         .await
         .expect("connect adapter");
 
-    migrate::run_reverse(&adapter, steps)
+    adapter
+        .apply_reverse_migrations(&steps)
         .await
-        .expect("run_reverse should execute the bypassed IRREVERSIBLE migration");
+        .expect("apply_reverse_migrations should execute the bypassed IRREVERSIBLE migration");
 
     // The destructive SQL actually ran.
     assert!(

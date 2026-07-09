@@ -676,13 +676,10 @@ impl PostgresAdapter {
     /// [`Self::apply_down_migration_tx`] calls and finishes with `tx.commit()`.
     /// Dropping the transaction without committing rolls back every step.
     ///
-    /// Not a trait method in v1.0: sqlx 0.8's `Executor<'c>` HRTBs don't
-    /// unify across async_trait's boxed-future elision when a
-    /// `Transaction<'_, Postgres>` is borrowed across awaits inside the
-    /// elaborated `Pin<Box<dyn Future + Send + '_>>`. `agenticd::migrate::run_reverse`
-    /// uses these inherent methods directly. When a second real backend
-    /// lands we revisit the trait shape with the right abstraction.
-    pub async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    /// Internal helper for the trait's `apply_reverse_migrations` — the
+    /// transaction stays inside this impl because sqlx 0.8's
+    /// `Executor<'c>` HRTBs can't cross the async_trait boundary.
+    async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
         Ok(self.pool.begin().await?)
     }
 
@@ -697,7 +694,7 @@ impl PostgresAdapter {
     /// DDL (`CREATE INDEX CONCURRENTLY`, etc.) will error inside the
     /// transaction, which is the correct failure mode — the migration file
     /// must be rewritten.
-    pub async fn apply_down_migration_tx<'c>(
+    async fn apply_down_migration_tx<'c>(
         &self,
         tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
         name: &str,
