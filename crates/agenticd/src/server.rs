@@ -14,7 +14,7 @@ use agentic_core::commit::walk_log;
 use agentic_core::diff as diff_mod;
 use agentic_core::refs::Refs;
 use agentic_core::{Object, ObjectStore};
-use agentic_memory::postgres::{PgConfig, PostgresAdapter, TrackedTable};
+use agentic_memory::postgres::TrackedTable;
 use agentic_memory::MemoryAdapter;
 use agentic_proto::framing::{read_frame_bytes, write_frame, FrameError};
 use agentic_proto::{
@@ -27,6 +27,7 @@ use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 use crate::mcp::McpServerSpec;
+use crate::membackend::MemoryBackendSpec;
 use crate::peer_auth::PeerAuthPolicy;
 
 /// Long-lived state shared by every connection handler.
@@ -51,8 +52,11 @@ pub struct DaemonState {
     pub shutdown: tokio_util::sync::CancellationToken,
     /// Optional memory backend. When present, every commit takes a memory
     /// snapshot under the commit lock and threads its manifest hash into
-    /// the Commit's `memory_snapshot` dimension.
-    pub memory: Option<Arc<Mutex<PostgresAdapter>>>,
+    /// the Commit's `memory_snapshot` dimension. No adapter-level mutex:
+    /// write-path exclusivity comes from `commit_lock` (one commit at a
+    /// time, ADR-0001), and adapters are internally `&self`-safe
+    /// (audit §C9 / §A9).
+    pub memory: Option<Arc<dyn MemoryAdapter>>,
     /// MCP servers to fingerprint on each commit.
     pub mcp_servers: Vec<McpServerSpec>,
     /// Shared HTTP client for MCP calls. Reusing one client lets the
@@ -77,24 +81,9 @@ impl DaemonState {
         std::fs::create_dir_all(&agentic_dir).context("creating .agentic directory")?;
         let refs = Refs::open(&agentic_dir).context("opening refs")?;
 
-        let memory = match postgres_url {
-            None => None,
-            Some(url) => {
-                if tables.is_empty() {
-                    return Err(anyhow::anyhow!(
-                        "--postgres requires at least one --tables entry"
-                    ));
-                }
-                let cfg = PgConfig::new(url, tables);
-                let mut adapter = PostgresAdapter::connect(cfg, store.clone()).await?;
-                adapter.init().await?;
-                tracing::info!(
-                    logical_decoding = adapter.logical_decoding_available(),
-                    "memory backend attached"
-                );
-                Some(Arc::new(Mutex::new(adapter)))
-            }
-        };
+        let memory = MemoryBackendSpec::from_flags(postgres_url, tables)?
+            .open(store.clone())
+            .await?;
 
         let http = reqwest::Client::builder()
             .user_agent(concat!("agenticd/", env!("CARGO_PKG_VERSION")))

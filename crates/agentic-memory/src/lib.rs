@@ -16,7 +16,7 @@ pub mod segment;
 pub mod streamer;
 pub mod triggers;
 
-pub use adapter::{MemoryAdapter, RestoreGuard, SnapshotHandle};
+pub use adapter::{MemoryAdapter, MigrationStep, RestoreGuard, SnapshotHandle};
 pub use segment::{Embedding, Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 
 #[derive(Debug, thiserror::Error)]

@@ -33,7 +33,6 @@ use std::sync::Arc;
 use agentic_core::commit::{stage_and_commit_with_now, CommitInputs};
 use agentic_core::refs::HeadRef;
 use agentic_core::ObjectKind;
-use agentic_memory::MemoryAdapter;
 use agentic_proto::{CommitInput, CommitOutput};
 use anyhow::Context;
 
@@ -143,10 +142,9 @@ async fn snapshot_memory(
     if no_memory {
         return Ok((None, None));
     }
-    let Some(memory) = state.memory.as_ref().map(Arc::clone) else {
+    let Some(adapter) = state.memory.as_ref().map(Arc::clone) else {
         return Ok((None, None));
     };
-    let adapter = memory.lock_owned().await;
     let handle = adapter.snapshot().await.context("taking memory snapshot")?;
     let manifest_bytes = handle.manifest.to_canonical_bytes();
     // Wrap the put_raw in spawn_blocking — under GcsObjectStore this is

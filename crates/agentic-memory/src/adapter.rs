@@ -19,6 +19,22 @@ pub struct SnapshotHandle {
     pub schema_version: String,
 }
 
+/// One step in a reverse-migration plan.
+///
+/// Produced by the daemon's `.down.sql` loader
+/// (`agenticd::migrate::load_steps`) in the order returned by
+/// [`MemoryAdapter::migrations_after`] — most-recent first. `sql` is the
+/// pre-read file content so backends never do filesystem I/O.
+#[derive(Debug, Clone)]
+pub struct MigrationStep {
+    /// Migration stem name as recorded by the backend's bookkeeping
+    /// (e.g. `"003_add_embeddings"` in Postgres's `agentic_migrations`).
+    pub name: String,
+    /// Reverse-migration content. SQL for SQL backends; other backends
+    /// may ignore it and reverse by name alone.
+    pub sql: String,
+}
+
 /// Resume-on-drop token returned by [`MemoryAdapter::begin_restore`].
 ///
 /// Adapters that need to pause background work for the restore window
@@ -74,16 +90,12 @@ impl RestoreGuard {
 /// the contract that prevents racing snapshots and restores; the trait
 /// does not impose it itself.
 ///
-/// Reverse-migration application is intentionally not a trait method
-/// in v1.0 — `PostgresAdapter` exposes
-/// `begin_reverse_tx` / `apply_down_migration_tx` as inherent methods
-/// that thread a `sqlx::Transaction<'_, Postgres>` through the
-/// caller, and `agenticd::migrate::run_reverse` uses those directly.
-/// Lifting that to a trait method runs into the sqlx 0.8 + async_trait
-/// + `Executor<'c>` HRTB incompatibility (the `&mut PgConnection`'s
-/// per-borrow lifetime can't unify across the boxed future's elision).
-/// When the second real backend lands and we have evidence for the
-/// right abstraction, this gets reopened.
+/// Reverse-migration application is a single coarse method
+/// ([`Self::apply_reverse_migrations`]) rather than a begin/apply/commit
+/// triple: sqlx 0.8's `Executor<'c>` HRTBs don't unify across
+/// async_trait's boxed-future elision, so a transaction handle cannot
+/// cross the trait boundary. Each backend owns its own atomicity
+/// mechanism instead (audit §A9, issue #43).
 #[async_trait::async_trait]
 pub trait MemoryAdapter: Send + Sync {
     /// Bring up the adapter against an existing user database. Runs any
@@ -142,4 +154,15 @@ pub trait MemoryAdapter: Send + Sync {
     /// this pattern.
     async fn restore_with_guard(&self, guard: &RestoreGuard, target: &SnapshotHandle)
         -> Result<()>;
+
+    /// Apply reverse (down) migrations, in the given order, atomically.
+    ///
+    /// All-or-nothing: if any step fails, the backend's observable state
+    /// (schema, data, and migration bookkeeping) must be unchanged.
+    /// Postgres implements this as one transaction committed only after
+    /// every step succeeds. An empty `steps` slice is a no-op.
+    ///
+    /// `steps` must be in the order returned by
+    /// [`Self::migrations_after`] — most-recent first.
+    async fn apply_reverse_migrations(&self, steps: &[MigrationStep]) -> Result<()>;
 }

@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use agentic_core::{Hash, ObjectKind, ObjectStore};
 use serde_json::Value as Json;
-use sqlx::PgPool;
+use sqlx::{Executor as _, PgPool};
 use tokio::task::JoinHandle;
 
-use crate::adapter::{MemoryAdapter, RestoreGuard, SnapshotHandle};
+use crate::adapter::{MemoryAdapter, MigrationStep, RestoreGuard, SnapshotHandle};
 use crate::segment::{Segment, SegmentManifest, SegmentRef, DEFAULT_SEGMENT_TARGET_BYTES};
 use crate::streamer::{self, StreamerHandle};
 use crate::triggers::{self, Quiesceable};
@@ -648,6 +648,38 @@ impl MemoryAdapter for PostgresAdapter {
         )
         .await
     }
+
+    /// One outer transaction; every step's `sql` plus its
+    /// `agentic_migrations` bookkeeping delete runs on the same
+    /// connection, so any failure drops the transaction and rolls back
+    /// the whole sequence (audit §A8 semantics, unchanged — the code
+    /// moved here from `agenticd::migrate::run_reverse`).
+    async fn apply_reverse_migrations(&self, steps: &[MigrationStep]) -> Result<()> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.begin_reverse_tx().await.map_err(|e| {
+            Error::Other(
+                anyhow::anyhow!(e)
+                    .context("opening outer transaction for reverse-migration sequence"),
+            )
+        })?;
+        for step in steps {
+            self.apply_down_migration_tx(&mut tx, &step.name, &step.sql)
+                .await
+                .map_err(|e| {
+                    Error::Other(
+                        anyhow::anyhow!(e)
+                            .context(format!("applying reverse migration {:?}", step.name)),
+                    )
+                })?;
+            tracing::info!(migration = %step.name, "reverse migration applied (in outer tx)");
+        }
+        tx.commit().await.map_err(|e| {
+            Error::Other(anyhow::anyhow!(e).context("committing reverse-migration sequence"))
+        })?;
+        Ok(())
+    }
 }
 
 impl PostgresAdapter {
@@ -657,13 +689,10 @@ impl PostgresAdapter {
     /// [`Self::apply_down_migration_tx`] calls and finishes with `tx.commit()`.
     /// Dropping the transaction without committing rolls back every step.
     ///
-    /// Not a trait method in v1.0: sqlx 0.8's `Executor<'c>` HRTBs don't
-    /// unify across async_trait's boxed-future elision when a
-    /// `Transaction<'_, Postgres>` is borrowed across awaits inside the
-    /// elaborated `Pin<Box<dyn Future + Send + '_>>`. `agenticd::migrate::run_reverse`
-    /// uses these inherent methods directly. When a second real backend
-    /// lands we revisit the trait shape with the right abstraction.
-    pub async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    /// Internal helper for the trait's `apply_reverse_migrations` — the
+    /// transaction stays inside this impl because sqlx 0.8's
+    /// `Executor<'c>` HRTBs can't cross the async_trait boundary.
+    async fn begin_reverse_tx(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
         Ok(self.pool.begin().await?)
     }
 
@@ -678,14 +707,21 @@ impl PostgresAdapter {
     /// DDL (`CREATE INDEX CONCURRENTLY`, etc.) will error inside the
     /// transaction, which is the correct failure mode — the migration file
     /// must be rewritten.
-    pub async fn apply_down_migration_tx<'c>(
+    async fn apply_down_migration_tx<'c>(
         &self,
         tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
         name: &str,
         sql: &str,
     ) -> Result<()> {
-        sqlx::raw_sql(sql)
-            .execute(&mut **tx)
+        // `Executor::execute(&str)`, not `sqlx::raw_sql(sql)`: both run
+        // the unprepared simple query protocol (multi-statement `.down.sql`
+        // files work in either), but sqlx 0.8's `RawSql` `Execute` impl
+        // trips a rustc HRTB limitation (`implementation of Executor is
+        // not general enough`) that poisons `Send` for every future
+        // transitively awaiting this one — including async_trait's boxed
+        // future for `apply_reverse_migrations`.
+        (&mut **tx)
+            .execute(sql)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("executing down migration {name:?}: {e}")))?;
         let delete_result = sqlx::query("DELETE FROM agentic_migrations WHERE name = $1")

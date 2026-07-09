@@ -1,8 +1,10 @@
-//! Reverse SQL migration runner (ADR-0002 §5).
+//! Reverse SQL migration planner (ADR-0002 §5).
 //!
-//! Runs `.down.sql` files from `<agentic_dir>/schema/` to bring the live
-//! database schema from its current version down to a target commit's
-//! `schema_version`, as part of `agentic rollback`.
+//! Loads and validates `.down.sql` files from `<agentic_dir>/schema/` so
+//! the live database schema can be brought from its current version down
+//! to a target commit's `schema_version`, as part of `agentic rollback`.
+//! Execution happens in `MemoryAdapter::apply_reverse_migrations`; this
+//! module only *plans* (loads and validates files).
 //!
 //! ## Migration file convention
 //!
@@ -25,32 +27,19 @@
 //! taken before the migration was applied) is a separate v1.1 work item;
 //! `--accept-data-loss` does NOT trigger that path in v1.0.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use agentic_memory::postgres::PostgresAdapter;
+use agentic_memory::MigrationStep;
 use anyhow::{anyhow, Context};
-
-/// One step in a reverse-migration plan.
-#[derive(Debug)]
-pub struct MigrationStep {
-    /// Migration stem name as recorded in `agentic_migrations`
-    /// (e.g. `"003_add_embeddings"`).
-    pub name: String,
-    /// Absolute path to the `.down.sql` file (retained for diagnostics).
-    #[allow(dead_code)]
-    pub path: PathBuf,
-    /// SQL content, pre-read so `run_reverse` doesn't need filesystem access.
-    pub sql: String,
-}
 
 /// Load and validate the `.down.sql` files for the given migration names.
 ///
 /// `names` must already be in execution order (most-recent first), as returned
 /// by `PostgresAdapter::migrations_after`. This function is **synchronous** so
-/// callers can release the `MutexGuard<PostgresAdapter>` before doing file I/O.
+/// callers run this between adapter calls — it does blocking filesystem I/O.
 ///
 /// When `accept_data_loss` is `true`, files marked `-- IRREVERSIBLE` are loaded
-/// anyway and their SQL will run as written when `run_reverse` executes — the
+/// anyway and their SQL will run as written when `apply_reverse_migrations` executes — the
 /// operator has explicitly accepted that the reverse may not restore lost data.
 /// When `false` (the default), an IRREVERSIBLE marker fails the load with a
 /// clear message instructing the operator on their options.
@@ -93,49 +82,11 @@ pub fn load_steps(
         check_irreversible(name, &sql, accept_data_loss)?;
         steps.push(MigrationStep {
             name: name.clone(),
-            path,
             sql,
         });
     }
 
     Ok(steps)
-}
-
-/// Execute `steps` against the live database, in order, as one atomic
-/// Postgres transaction.
-///
-/// All steps run on the same connection — `PostgresAdapter::begin_reverse_tx`
-/// opens the outer transaction and each step is executed via
-/// `apply_down_migration_tx`. On any error the outer transaction is dropped
-/// without committing and every step rolls back: the schema and the
-/// `agentic_migrations` bookkeeping return to the pre-call state. Only after
-/// the loop completes successfully is the outer transaction committed.
-///
-/// The caller must hold a lock on the `PostgresAdapter` for the duration of
-/// this call. Do not hold the lock while calling `load_steps` — that function
-/// does blocking filesystem I/O and should run without the lock held.
-pub async fn run_reverse(
-    adapter: &PostgresAdapter,
-    steps: Vec<MigrationStep>,
-) -> anyhow::Result<()> {
-    if steps.is_empty() {
-        return Ok(());
-    }
-    let mut tx = adapter
-        .begin_reverse_tx()
-        .await
-        .context("opening outer transaction for reverse-migration sequence")?;
-    for step in &steps {
-        adapter
-            .apply_down_migration_tx(&mut tx, &step.name, &step.sql)
-            .await
-            .with_context(|| format!("applying reverse migration {:?}", step.name))?;
-        tracing::info!(migration = %step.name, "reverse migration applied (in outer tx)");
-    }
-    tx.commit()
-        .await
-        .context("committing reverse-migration sequence")?;
-    Ok(())
 }
 
 /// Reject migration names containing path separators or `..` components that
@@ -183,6 +134,7 @@ fn check_irreversible(name: &str, sql: &str, accept_data_loss: bool) -> anyhow::
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn make_schema_dir(tmp: &TempDir) -> PathBuf {
