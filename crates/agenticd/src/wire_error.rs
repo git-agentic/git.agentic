@@ -31,10 +31,23 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
     let message = format!("{err:#}");
 
     // Walk the error chain looking for typed errors we know how to
-    // classify. `agentic_memory::Error` is checked first because it
+    // classify. Daemon-local types first (nothing wraps them), then
+    // `agentic_memory::Error` before `agentic_core::Error` because it
     // wraps `agentic_core::Error` and `sqlx::Error` — so we look at
     // the most-specific layer before falling through. Raw sqlx errors
     // are classified inside `classify_memory_error`'s `Sqlx` arm.
+    if let Some(gate) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::rollback::ApprovalError>())
+    {
+        // Validation, not retryable: the caller must obtain an operator
+        // approval (or drop accept_data_loss); retrying the same request
+        // can never succeed.
+        let code = match gate {
+            crate::rollback::ApprovalError::KeyNotConfigured => "approval_key_not_configured",
+        };
+        return Response::validation(code, message);
+    }
     if let Some(mem) = err.chain().find_map(|e| e.downcast_ref::<MemoryError>()) {
         let (class, code, retryable) = classify_memory_error(mem);
         return Response::error(class, code, message, retryable);
@@ -225,6 +238,31 @@ mod tests {
                 assert_eq!(class, ErrorClass::Internal);
                 assert_eq!(code, "unclassified");
                 assert!(!retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn approval_key_not_configured_classifies_as_non_retryable_validation() {
+        // ADR-0014 interim gate: accept_data_loss=true with no approval
+        // mechanism is a structural rejection — the caller must obtain an
+        // operator approval, so retrying the identical request can never
+        // succeed. Wire code is shared with the full gate so operator
+        // alert rules survive the upgrade.
+        let err: anyhow::Error =
+            anyhow::Error::new(crate::rollback::ApprovalError::KeyNotConfigured)
+                .context("rolling back");
+        match map_anyhow_to_response_error(err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Validation);
+                assert_eq!(code, "approval_key_not_configured");
+                assert!(!retryable, "approval rejection must not be retried");
             }
             _ => panic!("expected Response::Error"),
         }
