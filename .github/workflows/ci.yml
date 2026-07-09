@@ -100,3 +100,51 @@ jobs:
           GCS_ENDPOINT: http://localhost:54323
           GCS_BUCKET: agentic-test-bucket
         run: cargo test -p agentic-core --test gcs_integration -- --ignored --nocapture
+
+  # Postgres+pgvector integration tests. Repo policy (CLAUDE.md "What not
+  # to do") forbids mocking Postgres for snapshot/restore paths — the
+  # snapshot algorithm leans on Postgres-specific behaviour (advisory
+  # locks, pgvector storage, transactional DDL), so the ignored suites
+  # must run against the real thing in CI. Mirrors the demo's
+  # pgvector/pgvector:pg16 image and credentials
+  # (examples/langgraph-rollback/docker-compose.yml). 2026-07-09 audit
+  # finding #6 / wayfinder map #103.
+  postgres:
+    name: postgres integration (pgvector)
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://agentic:agentic@localhost:54322/agentic
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agentic
+          POSTGRES_PASSWORD: agentic
+          POSTGRES_DB: agentic
+        ports:
+          - 54322:5432
+        options: >-
+          --health-cmd "pg_isready -U agentic -d agentic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: create pgvector extension
+        # The adapter checks for the extension but cannot create it
+        # (CREATE EXTENSION needs superuser); the demo does this in
+        # seed.sql, CI does it here.
+        run: psql "$DATABASE_URL" -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+      - name: memory adapter suite (snapshot/restore)
+        # --test-threads=1 is required by the suite's own contract (see
+        # its module doc): public.agentic_change_log is shared across
+        # test schemas by design, so parallel tests interfere with each
+        # other's trigger events. Verified: parallel runs fail two
+        # tests; single-threaded is green.
+        run: cargo test -p agentic-memory --test integration -- --ignored --nocapture --test-threads=1
+      - name: reverse migration suite
+        run: cargo test -p agenticd --test reverse_migration -- --ignored --nocapture
+      - name: commit-with-memory suite
+        run: cargo test -p agenticd --test commit_with_memory -- --ignored --nocapture
