@@ -59,46 +59,11 @@ pub struct RollbackArgs {
     pub repo: PathBuf,
 }
 
-/// Typed rejection for the ADR-0014 destructive-rollback approval gate.
-///
-/// Interim shape: the daemon has no approval-key mechanism yet, so the
-/// fail-closed branch (ADR-0014 Decision 4) is the entire gate — every
-/// `accept_data_loss = true` request is rejected. The full gate
-/// (`approval_token` verification) extends this enum with the remaining
-/// rejection variants when it lands.
-#[derive(Debug, thiserror::Error)]
-pub enum ApprovalError {
-    #[error(
-        "accept_data_loss=true requires an operator approval token (ADR-0014), and this \
-         daemon has no approval key configured — failing closed. Destructive rollback is \
-         unavailable until the approval gate ships; re-run without --accept-data-loss, or \
-         write a real reverse migration for the IRREVERSIBLE step"
-    )]
-    KeyNotConfigured,
-}
-
 pub async fn execute(
     state: std::sync::Arc<DaemonState>,
     args: RollbackArgs,
     peer_uid: Option<u32>,
 ) -> anyhow::Result<RollbackOutput> {
-    // ADR-0014 approval gate, evaluated before any other work — dry-run
-    // included — so a rejected request has zero side effects. Until the
-    // token-verification gate ships, no approval mechanism exists, so the
-    // fail-closed branch (Decision 4) rejects every request. The audit
-    // line fires on the rejection path too (Decision 5): probing for the
-    // gate must be visible to the operator.
-    if args.accept_data_loss {
-        tracing::warn!(
-            ?peer_uid,
-            target = %args.target,
-            decision = "rejected_no_key_configured",
-            "RollbackForcedDataLoss: rejecting accept_data_loss=true rollback \
-             (no approval mechanism configured; ADR-0014 interim gate)"
-        );
-        return Err(anyhow::Error::new(ApprovalError::KeyNotConfigured));
-    }
-
     let target_hash = state
         .refs
         .resolve(&args.target)?
