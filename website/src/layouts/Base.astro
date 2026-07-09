@@ -7,7 +7,10 @@ const {
   title = 'git.agentic — Git for agent behavior',
   description = 'Atomic, reversible snapshots of the full system state — code, prompts, tools, model, memory, schema — that determines how an AI agent acts.',
 } = Astro.props;
-const canonical = new URL(Astro.url.pathname, Astro.site).toString();
+const canonical = new URL(
+  Astro.url.pathname.replace(/\.html$/, '').replace(/\/index$/, '/'),
+  Astro.site,
+).toString();
 ---
 <!doctype html>
 <html lang="en">
