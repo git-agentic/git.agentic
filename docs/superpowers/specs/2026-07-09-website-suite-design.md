@@ -15,8 +15,8 @@ the suite story.
 ## Decisions made during brainstorming
 
 1. **Site shape:** suite landing page at `/`, plus dedicated full product
-   pages `/git-agentic/`, `/src-control/`, `/sentinel/`. The current homepage
-   content moves to `/git-agentic/`.
+   pages `/git-agentic`, `/src-control`, `/sentinel` (no trailing slash). The current homepage
+   content moves to `/git-agentic`.
 2. **Umbrella brand:** "git.agentic" names the whole effort as well as the
    flagship project (Docker-style company/product name sharing). Header brand
    is unchanged; no new suite name is coined.
