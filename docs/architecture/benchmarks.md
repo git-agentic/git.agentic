@@ -88,6 +88,29 @@ commit/prompts_only     2.35 ms
 
 Source: [`crates/agentic-core/benches/store.rs`](../../crates/agentic-core/benches/store.rs).
 
+## `get_raw` integrity-verification overhead (2026-07-10)
+
+Audit finding #3 added a `Hash::of(bytes)` check to every `get_raw` read
+(segments + manifests on the restore path). The added cost is exactly one
+BLAKE3 pass over the decompressed bytes. Single-shot wall timings (release,
+laptop; 200-iter mean per size):
+
+```
+size        get_raw (with verify)   added Hash::of      added share
+4 KB                33.7 µs              3.42 µs            10.2 %
+64 KB               77.7 µs             39.9 µs             51.4 %
+1 MB               577 µs              488 µs               84.6 %
+```
+
+BLAKE3 runs at ~2 GB/s here, so the verification adds ~0.5 ms per MiB read.
+The added-share climbs with object size only because `get_raw` itself is
+cheap (file read + zstd decode); in absolute terms a full restore's added
+cost is `total_restored_bytes / 2 GB/s` — sub-millisecond at demo scale and
+a few milliseconds even for large manifests, against a rollback budget of
+< 5 s that is dominated by Postgres INSERT replay (102 ms @ 10K rows →
+10.34 s @ 1M rows above). The §9 rollback/commit/write-overhead targets are
+unaffected.
+
 ## Coverage gaps (tracked)
 
 - **Restore batched-INSERT landed.** `apply_segment_rows` now groups consecutive same-shape envelopes and emits one multi-row `INSERT ... VALUES (...), (...)` (or `DELETE ... WHERE pk IN (...)` for deletes) per group, capped at 1000 rows / 60000 params per statement. 100K restore went from 12.29 s to 1.07 s (11.5×); 1M is now tractable at 10.34 s on the laptop.

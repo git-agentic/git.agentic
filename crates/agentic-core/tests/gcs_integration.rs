@@ -141,6 +141,80 @@ fn has_returns_true_after_put_false_for_unknown() {
     assert!(!cold.has(&nope));
 }
 
+// Audit finding #3: an object corrupted in the bucket (bytes altered
+// while the object key is retained) must be rejected on get_raw with an
+// IntegrityError, and the corrupt bytes must NOT be written to the local
+// cache ("never cache a failed verification"). Uses a fresh cache so the
+// read exercises the real GCS download + verify path.
+#[test]
+#[ignore]
+fn corrupt_download_is_rejected_and_not_cached() {
+    let prefix = fresh_prefix();
+    let Some((store, _cache)) = make_store(&prefix) else {
+        eprintln!("GCS_BUCKET not set — skipping");
+        return;
+    };
+    let Some(ep) = endpoint() else {
+        eprintln!("GCS_ENDPOINT not set (needs fake-gcs to overwrite a bucket object) — skipping");
+        return;
+    };
+
+    let payload = b"honest segment bytes";
+    let hash = store.put_raw(ObjectKind::Segment, payload).unwrap();
+
+    // Overwrite the bucket object at its exact key with zstd of DIFFERENT
+    // bytes — the shape of a bucket writer tampering in place. The object
+    // name mirrors GcsObjectStore::object_name: `<prefix>/<ab>/<rest>.zst`.
+    let hex = hash.to_hex();
+    let object_name = format!("{prefix}/{}/{}.zst", &hex[..2], &hex[2..]);
+    let corrupt = zstd::stream::encode_all(&b"CORRUPTED"[..], 3).unwrap();
+    let upload_url = format!(
+        "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+        ep.trim_end_matches('/'),
+        bucket().unwrap(),
+        object_name.replace('/', "%2F"),
+    );
+    let resp = reqwest::blocking::Client::new()
+        .post(&upload_url)
+        .header("Content-Type", "application/octet-stream")
+        .body(corrupt)
+        .send()
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "overwriting the bucket object should succeed; got {}",
+        resp.status()
+    );
+
+    // Read with a cold cache so we hit GCS, not the warm put cache.
+    let cache2 = tempfile::tempdir().unwrap();
+    let cold = GcsObjectStore::new(
+        bucket().unwrap(),
+        prefix,
+        cache2.path(),
+        endpoint(),
+        bearer(),
+    )
+    .unwrap();
+    match cold.get_raw(&hash) {
+        Err(agentic_core::Error::IntegrityError { declared, .. }) => {
+            assert_eq!(declared, hash);
+        }
+        other => panic!("expected IntegrityError from corrupt download, got {other:?}"),
+    }
+    // Never cache a failed verification: the corrupt bytes must not have
+    // been persisted to the cold cache. Cache layout mirrors
+    // GcsObjectStore::cache_path: `<cache_dir>/<ab>/<rest>.zst`.
+    let cache_file = cache2
+        .path()
+        .join(&hex[..2])
+        .join(format!("{}.zst", &hex[2..]));
+    assert!(
+        !cache_file.exists(),
+        "corrupt download must not be written to the cache at {cache_file:?}"
+    );
+}
+
 #[test]
 #[ignore]
 fn missing_object_returns_not_found() {

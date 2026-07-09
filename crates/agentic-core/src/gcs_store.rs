@@ -44,7 +44,7 @@ use std::time::Duration;
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
 use crate::scanner::{Allowlist, Scanner};
-use crate::store::ObjectStore;
+use crate::store::{check_integrity, ObjectStore};
 use crate::{Error, Result};
 
 /// Default upstream — GCS's public JSON API host.
@@ -252,6 +252,49 @@ impl GcsObjectStore {
         Ok(Some((bytes, compressed)))
     }
 
+    /// Fetch the bytes for `hash`, verifying integrity with `verify`
+    /// before trusting a cache hit or caching a fresh download.
+    ///
+    /// The verification scheme differs by caller (raw-bytes hash for
+    /// `get_raw`, typed-object hash for `get`), so it's injected as a
+    /// closure. Two integrity properties hold regardless of scheme
+    /// (2026-07-09 audit finding #3):
+    ///
+    /// * A **poisoned cache hit** is evicted and we fall through to GCS,
+    ///   which may still hold the intact object — a merely-corrupted
+    ///   local cache self-heals rather than failing the read.
+    /// * A **corrupt download** is rejected *before* `cache_write`, so a
+    ///   bad object is never written to the local cache ("never cache a
+    ///   failed verification").
+    fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Result<Vec<u8>> {
+        if let Some(cached) = self.cache_read(hash) {
+            match verify(&cached) {
+                Ok(()) => return Ok(cached),
+                Err(_) => {
+                    tracing::warn!(
+                        target: "agentic-core::gcs_store",
+                        hash = %hash.to_hex(),
+                        "cached object failed integrity check; evicting and refetching from GCS",
+                    );
+                    // Evict the poisoned entry so `has`/subsequent reads
+                    // don't keep trusting it; ignore unlink errors (a
+                    // concurrent evictor or a since-deleted file is fine).
+                    let _ = fs::remove_file(self.cache_path(hash));
+                }
+            }
+        }
+        match self.download_compressed(hash)? {
+            None => Err(Error::NotFound(*hash)),
+            Some((bytes, compressed)) => {
+                // Verify BEFORE caching: a corrupt GCS object must not be
+                // persisted to the local cache.
+                verify(&bytes)?;
+                let _ = self.cache_write_compressed(hash, &compressed);
+                Ok(bytes)
+            }
+        }
+    }
+
     fn remote_exists(&self, hash: &Hash) -> bool {
         let name = self.object_name(hash);
         let url = self.metadata_url(&name);
@@ -343,31 +386,23 @@ impl ObjectStore for GcsObjectStore {
     }
 
     fn get(&self, hash: &Hash) -> Result<Object> {
-        let bytes = self.get_raw(hash)?;
-        let object: Object = serde_json::from_slice(&bytes)?;
-        let computed = object.hash();
-        if &computed != hash {
-            return Err(Error::IntegrityError {
-                declared: *hash,
-                computed,
-            });
-        }
-        Ok(object)
+        // Typed objects are addressed by `object.hash()`, so the verify
+        // closure parses and checks that — not `Hash::of(bytes)`.
+        let bytes = self.fetch_checked(hash, |b| {
+            let object: Object = serde_json::from_slice(b)?;
+            check_integrity(hash, object.hash())
+        })?;
+        // INVARIANT: the closure above already parsed these bytes as an
+        // Object successfully, so this second parse cannot fail. The cost
+        // is one extra deserialize of a small typed object (Blob/Tree/
+        // Commit), off the hot restore path (which uses `get_raw`).
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
-        if let Some(cached) = self.cache_read(hash) {
-            return Ok(cached);
-        }
-        match self.download_compressed(hash)? {
-            None => Err(Error::NotFound(*hash)),
-            Some((bytes, compressed)) => {
-                // Best-effort cache fill; a write failure here doesn't
-                // affect correctness.
-                let _ = self.cache_write_compressed(hash, &compressed);
-                Ok(bytes)
-            }
-        }
+        // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
+        // contract) — verify against that. Audit finding #3.
+        self.fetch_checked(hash, |b| check_integrity(hash, Hash::of(b)))
     }
 
     fn has(&self, hash: &Hash) -> bool {
@@ -484,5 +519,50 @@ mod tests {
         store.cache_write_compressed(&h, &compressed).unwrap();
         let got = store.cache_read(&h).unwrap();
         assert_eq!(got, payload);
+    }
+
+    // Audit finding #3: a poisoned local cache entry (bytes that don't
+    // match their content address) must never be returned. It is evicted
+    // and the read falls through to GCS. Here the fake endpoint refuses
+    // the connection, so the fall-through fails — the point of the test
+    // is that get_raw does NOT return the poisoned bytes, and that the
+    // bad entry is gone afterwards. Deterministic, no server needed.
+    #[test]
+    fn cache_hit_poisoned_is_evicted_and_not_returned() {
+        let dir = tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            // An address that refuses connects: port 1 on loopback.
+            Some("http://127.0.0.1:1".into()),
+            None,
+        )
+        .unwrap();
+
+        // Address is Hash::of(good), but we plant Hash-mismatched bytes at
+        // that cache slot — the shape of a corrupted local cache/disk.
+        let good = b"the canonical bytes";
+        let hash = Hash::of(good);
+        let poison = zstd::stream::encode_all(&b"tampered!!"[..], 3).unwrap();
+        store.cache_write_compressed(&hash, &poison).unwrap();
+        assert!(store.cache_path(&hash).exists());
+
+        let result = store.get_raw(&hash);
+        // Never returns the poison. (The fall-through GCS fetch errors
+        // because nothing is listening — that's fine; not-returning-poison
+        // is the property under test.)
+        if let Ok(bytes) = &result {
+            assert_ne!(
+                bytes.as_slice(),
+                b"tampered!!",
+                "poisoned cache bytes must never be returned"
+            );
+        }
+        assert!(result.is_err(), "no server to heal from, so read errors");
+        assert!(
+            !store.cache_path(&hash).exists(),
+            "poisoned cache entry must be evicted"
+        );
     }
 }
