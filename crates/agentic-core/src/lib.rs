@@ -51,6 +51,9 @@ pub enum Error {
     #[error("blob rejected by secret scanner: {hits:?}")]
     SecretDetected { hits: Vec<scanner::Hit> },
 
+    #[error("invalid branch name {name:?}: {reason}")]
+    InvalidBranchName { name: String, reason: String },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -78,6 +78,12 @@ fn classify_core_error(err: &CoreError) -> (ErrorClass, &'static str, bool) {
             (ErrorClass::Storage, "object_integrity_failure", false)
         }
         CoreError::SecretDetected { .. } => (ErrorClass::Validation, "secret_detected", false),
+        // Structural rejection of an untrusted branch name (path
+        // traversal defence). The caller must change the name; retrying
+        // the identical request can never succeed.
+        CoreError::InvalidBranchName { .. } => {
+            (ErrorClass::Validation, "invalid_branch_name", false)
+        }
         CoreError::Io(_) => (ErrorClass::Storage, "io_failure", true),
         CoreError::Serialize(_) => (ErrorClass::Storage, "serialization_failure", false),
         CoreError::KindMismatch { .. } => (ErrorClass::Storage, "object_kind_mismatch", false),
@@ -224,6 +230,31 @@ mod tests {
             } => {
                 assert_eq!(class, ErrorClass::Internal);
                 assert_eq!(code, "unclassified");
+                assert!(!retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn invalid_branch_name_classifies_as_non_retryable_validation() {
+        // Path-traversal defence (2026-07-09 audit finding #1): a
+        // hostile branch name is a structural rejection — the caller
+        // must change the name, so the SDK must not burn retries on it.
+        let core_err: anyhow::Error = anyhow::Error::new(agentic_core::Error::InvalidBranchName {
+            name: "../escape".to_string(),
+            reason: "'.' and '..' path components are not allowed".to_string(),
+        })
+        .context("reading branch ref before commit");
+        match map_anyhow_to_response_error(core_err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Validation);
+                assert_eq!(code, "invalid_branch_name");
                 assert!(!retryable);
             }
             _ => panic!("expected Response::Error"),

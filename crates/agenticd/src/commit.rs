@@ -295,6 +295,41 @@ mod tests {
         )
     }
 
+    // 2026-07-09 audit, critical finding #1 — `CommitInput.branch` is
+    // untrusted socket input. A traversal name must be rejected before
+    // any staging, and no file may appear at the escape target.
+    #[tokio::test]
+    async fn execute_rejects_traversal_branch_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let state = make_state(&repo).await;
+
+        let mut input = commit_input("hostile");
+        // From <repo>/.agentic/refs/heads/, four `..` reach <tmp>: the
+        // file would land at <tmp>/escape.
+        input.branch = Some("../../../../escape".to_string());
+
+        let err = execute(state.clone(), input, None)
+            .await
+            .expect_err("traversal branch name must be rejected");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<agentic_core::Error>(),
+                Some(agentic_core::Error::InvalidBranchName { .. })
+            )),
+            "rejection must carry the typed InvalidBranchName; got: {err:#}"
+        );
+        assert!(
+            !dir.path().join("escape").exists() && !dir.path().join("escape.tmp").exists(),
+            "no file may be created outside refs/heads/"
+        );
+        assert!(
+            state.refs.read_head().unwrap().is_none(),
+            "a rejected first commit must not publish HEAD"
+        );
+    }
+
     fn commit_input(message: &str) -> CommitInput {
         let mut prompts = std::collections::BTreeMap::new();
         prompts.insert("system.md".to_string(), b"you are helpful".to_vec());
