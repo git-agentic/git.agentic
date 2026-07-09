@@ -11,7 +11,7 @@ const repo = 'https://github.com/git-agentic/pkg-registry';
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Auditing proxy live · policy &amp; permissions next</span>
+    <span class="badge"><span class="pulse"></span>Full security layer built · open-source launch prep</span>
     <span class="badge">Apache 2.0</span>
     <span class="badge">TypeScript</span>
   </div>
@@ -71,29 +71,50 @@ $ sentinel audit is-odd 3.0.1
     <li>Deterministic scoring — start at 100, weighted penalties per
       finding, any critical forces block — fully reproducible in CI; an
       LLM adapter only adds context, never the score</li>
-    <li>Policy and approval gate: signed per-enterprise policy, capability
-      manifests, and a hard privilege boundary — the agent can request an
-      approval, only a human can grant it</li>
-    <li>Sandbox enforcement (macOS Seatbelt, Linux bubblewrap): lifecycle
-      scripts run with denied-by-default access to secrets and network;
-      detected violations quarantine that exact tarball fleet-wide</li>
+    <li>Policy and approval gate: signed per-enterprise policy — with a
+      lint and a dry-run impact preview against real audit history before
+      signing — capability manifests, and a hard privilege boundary: the
+      agent can request an approval, only a human can grant it, enforced
+      by signed Ed25519 role tokens on the control plane</li>
+    <li>Deny-by-default sandbox (macOS Seatbelt, Linux bubblewrap):
+      lifecycle scripts get no network, no credential env vars, no writes
+      outside a fixed floor, and no <code>$HOME</code> reads unless a
+      capability is approved; detected violations quarantine that exact
+      tarball fleet-wide</li>
     <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
-      CLI whose exit codes make <code>sentinel audit</code> a CI gate</li>
+      CLI whose exit codes make <code>sentinel audit</code> a CI gate;
+      <code>sentinel explain</code> turns a verdict into per-finding
+      remediation and a suggested last-known-good version — advisory
+      only, it never rewrites a lockfile</li>
     <li>Whole-tree gates: audit every package in an npm/yarn/pnpm lockfile,
       write a CycloneDX SBOM, post the verdict to the PR via a GitHub
       Action</li>
     <li>Signed audit attestations (DSSE/in-toto, Ed25519) verified offline
       as a deploy-time gate, plus known-malicious advisory and CVE-range
       (SCA) detection</li>
+    <li>Identity and history signals: typosquat and dependency-confusion
+      detection, and release-anomaly findings — maintainer takeover,
+      dormancy resurrection, new capabilities in a patch release</li>
+    <li>Durable history and observability (opt-in, zero-dependency
+      SQLite): verdict trends, top-flagged packages, and a violation
+      timeline on the dashboard, the CLI, and <code>/-/metrics</code></li>
+    <li>Hardened trust boundary: tarball fetches pinned to allowlisted
+      origins (no SSRF), Host-header spoofing refused, byte caps and
+      opt-in rate limits on expensive routes</li>
   </ul>
 
   <h2>Status</h2>
   <p class="mute">
-    The auditing proxy is the live wedge: deterministic engine, whole-tree
-    lockfile gate, sandbox enforcement with runtime quarantine, MCP server,
-    GitHub Action, signed policies and attestations, advisory + CVE
-    detection. The long arc is policy and install-time permissions for the
-    whole ecosystem.
+    What started as the audit-proxy wedge has grown into the full layer
+    (July 2026): signed per-enterprise policy and install-time permission
+    manifests, a deny-by-default capability sandbox, offline signature and
+    Sigstore-provenance verification, known-malicious (GHSA) and CVE-range
+    detection, supply-chain identity and release-anomaly heuristics,
+    whole-tree lockfile auditing with SBOMs and signed attestations, a
+    CI-native GitHub Action, an agent-native MCP server, durable
+    observability, and a hardened network trust boundary. Current work is
+    open-source launch prep; the long arc is policy and install-time
+    permissions for the whole ecosystem.
   </p>
 
   <p class="mute">
