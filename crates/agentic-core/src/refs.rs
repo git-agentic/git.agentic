@@ -56,12 +56,20 @@ impl Refs {
         self.agentic_dir.join("HEAD")
     }
 
-    fn branch_path(&self, name: &str) -> PathBuf {
-        self.agentic_dir.join("refs").join("heads").join(name)
+    /// Build the on-disk path for a branch ref. Validates the name first:
+    /// branch names arrive from the socket (`CommitInput.branch`, rollback
+    /// targets), so joining them unvalidated under `refs/heads/` lets a
+    /// `../…` or absolute name escape the ref directory — and
+    /// `write_atomic` would then create directories and rename a file at
+    /// an attacker-chosen location (2026-07-09 audit, critical finding #1).
+    fn branch_path(&self, name: &str) -> Result<PathBuf> {
+        validate_branch_name(name)?;
+        Ok(self.agentic_dir.join("refs").join("heads").join(name))
     }
 
     /// Write `HEAD` as a symbolic ref pointing at `refs/heads/<branch>`.
     pub fn write_head_symbolic(&self, branch: &str) -> Result<()> {
+        validate_branch_name(branch)?;
         let contents = format!("ref: refs/heads/{branch}\n");
         write_atomic(&self.head_path(), contents.as_bytes())
     }
@@ -85,9 +93,10 @@ impl Refs {
         }
     }
 
-    /// Write a branch ref atomically.
+    /// Write a branch ref atomically. Rejects invalid branch names with
+    /// [`Error::InvalidBranchName`].
     pub fn write_branch(&self, branch: &str, hash: &Hash) -> Result<()> {
-        let path = self.branch_path(branch);
+        let path = self.branch_path(branch)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -96,8 +105,11 @@ impl Refs {
     }
 
     /// Read a branch ref. Returns `None` if the branch does not exist.
+    /// Rejects invalid branch names with [`Error::InvalidBranchName`] —
+    /// loudly, rather than `None`, so a traversal probe is distinguishable
+    /// from a missing branch.
     pub fn read_branch(&self, branch: &str) -> Result<Option<Hash>> {
-        let path = self.branch_path(branch);
+        let path = self.branch_path(branch)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -254,6 +266,68 @@ impl RefsSnapshot {
     }
 }
 
+/// Validate a branch name before it is used to build a filesystem path
+/// under `refs/heads/`.
+///
+/// Branch names are untrusted input: they arrive over the daemon socket
+/// (`CommitInput.branch`, rollback targets) and from `HEAD` file contents.
+/// Every `Refs` path construction goes through this check so a hostile
+/// name can never address a file outside the ref directory.
+///
+/// Permitted: `/`-separated sequences of normal relative components
+/// (`main`, `feature/foo`, `releases/v1.0/rc`). Rejected:
+///
+/// * empty names and empty components (leading/trailing/doubled `/`)
+/// * `.` and `..` components (traversal)
+/// * absolute paths (their leading `/` yields an empty first component)
+/// * backslashes — `list_branches` normalises `\` to `/`, so a name
+///   containing one can never round-trip
+/// * control characters
+/// * components ending in `.tmp` — they collide with `write_atomic`'s
+///   temp files, which `list_branches` skips
+/// * the reserved name `HEAD`, which `resolve` would shadow
+pub fn validate_branch_name(name: &str) -> Result<()> {
+    let reject = |reason: &str| {
+        Err(Error::InvalidBranchName {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        })
+    };
+    if name.is_empty() {
+        return reject("name is empty");
+    }
+    if name == "HEAD" {
+        return reject("'HEAD' is reserved");
+    }
+    if name.contains('\\') {
+        return reject("backslashes are not allowed");
+    }
+    if name.chars().any(char::is_control) {
+        return reject("control characters are not allowed");
+    }
+    for component in name.split('/') {
+        if component.is_empty() {
+            return reject("empty path component (leading, trailing, or doubled '/')");
+        }
+        if component == "." || component == ".." {
+            return reject("'.' and '..' path components are not allowed");
+        }
+        if component.ends_with(".tmp") {
+            return reject("components ending in '.tmp' collide with atomic-write temp files");
+        }
+    }
+    // Belt and braces: the OS-level path parser must agree that every
+    // component is a plain relative one. Catches platform-specific
+    // absolute/prefix forms the string checks above don't model.
+    if Path::new(name)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return reject("not a plain relative path");
+    }
+    Ok(())
+}
+
 /// Walk `dir` (recursively) collecting branch names relative to `root`.
 /// Skips `.tmp` files left by `write_atomic` mid-write. Path separators
 /// in the returned names are always `/`, regardless of platform.
@@ -387,6 +461,112 @@ mod tests {
         assert_eq!(
             refs.read_branch("releases/v1.0/rc").unwrap(),
             Some(Hash::of(b"rc"))
+        );
+    }
+
+    // 2026-07-09 audit, critical finding #1 — branch names are untrusted
+    // socket input; a `../…` or absolute name must never address a file
+    // outside `refs/heads/`.
+    #[test]
+    fn validate_rejects_hostile_and_malformed_names() {
+        let bad: &[&str] = &[
+            "",
+            "HEAD",
+            "..",
+            ".",
+            "../escape",
+            "../../etc/passwd",
+            "feature/../../../escape",
+            "feature/..",
+            "./sneaky",
+            "a/./b",
+            "/absolute",
+            "/etc/passwd",
+            "a//b",
+            "trailing/",
+            "/leading",
+            "back\\slash",
+            "C:\\windows",
+            "nul\0byte",
+            "new\nline",
+            "foo.tmp",
+            "dir/foo.tmp",
+        ];
+        for name in bad {
+            let err = validate_branch_name(name).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidBranchName { .. }),
+                "{name:?} must be rejected with InvalidBranchName; got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_normal_and_nested_names() {
+        for name in ["main", "ab-test", "feature/foo", "releases/v1.0/rc", "a.b"] {
+            validate_branch_name(name).unwrap_or_else(|e| panic!("{name:?} must be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn write_branch_traversal_is_rejected_and_writes_nothing() {
+        // Layout: <tmp>/repo/.agentic — a traversal like `../escape`
+        // would land the ref file at <tmp>/repo/escape, outside the
+        // ref directory.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let agentic_dir = repo.join(".agentic");
+        let refs = Refs::open(&agentic_dir).unwrap();
+        let h = Hash::of(b"payload");
+
+        for (name, escape_target) in [
+            ("../escape", repo.join("escape")),
+            ("../../escape2", dir.path().join("escape2")),
+        ] {
+            let err = refs.write_branch(name, &h).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidBranchName { .. }),
+                "{name:?}: expected InvalidBranchName, got {err:?}"
+            );
+            assert!(
+                !escape_target.exists(),
+                "{name:?}: no file may be created outside refs/heads/"
+            );
+            // Nor may the tmp file from a partial atomic write survive.
+            assert!(!escape_target.with_extension("tmp").exists());
+        }
+
+        // Absolute path: nothing may be written at the named location.
+        let abs = dir.path().join("abs-escape");
+        let err = refs.write_branch(abs.to_str().unwrap(), &h).unwrap_err();
+        assert!(matches!(err, Error::InvalidBranchName { .. }));
+        assert!(!abs.exists());
+    }
+
+    #[test]
+    fn read_and_resolve_reject_traversal_names_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        // Plant a file outside refs/heads/ that a traversal read would
+        // otherwise reach and parse.
+        let h = Hash::of(b"outside");
+        std::fs::write(dir.path().join("outside-ref"), format!("{}\n", h.to_hex())).unwrap();
+
+        let err = refs.read_branch("../outside-ref").unwrap_err();
+        assert!(matches!(err, Error::InvalidBranchName { .. }));
+        let err = refs.resolve("../outside-ref").unwrap_err();
+        assert!(matches!(err, Error::InvalidBranchName { .. }));
+    }
+
+    #[test]
+    fn write_head_symbolic_rejects_invalid_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = Refs::open(dir.path()).unwrap();
+        let err = refs.write_head_symbolic("../escape").unwrap_err();
+        assert!(matches!(err, Error::InvalidBranchName { .. }));
+        assert!(
+            refs.read_head().unwrap().is_none(),
+            "HEAD must be untouched"
         );
     }
 

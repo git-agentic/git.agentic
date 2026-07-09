@@ -31,23 +31,10 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
     let message = format!("{err:#}");
 
     // Walk the error chain looking for typed errors we know how to
-    // classify. Daemon-local types first (nothing wraps them), then
-    // `agentic_memory::Error` before `agentic_core::Error` because it
+    // classify. `agentic_memory::Error` is checked first because it
     // wraps `agentic_core::Error` and `sqlx::Error` — so we look at
     // the most-specific layer before falling through. Raw sqlx errors
     // are classified inside `classify_memory_error`'s `Sqlx` arm.
-    if let Some(gate) = err
-        .chain()
-        .find_map(|e| e.downcast_ref::<crate::rollback::ApprovalError>())
-    {
-        // Validation, not retryable: the caller must obtain an operator
-        // approval (or drop accept_data_loss); retrying the same request
-        // can never succeed.
-        let code = match gate {
-            crate::rollback::ApprovalError::KeyNotConfigured => "approval_key_not_configured",
-        };
-        return Response::validation(code, message);
-    }
     if let Some(mem) = err.chain().find_map(|e| e.downcast_ref::<MemoryError>()) {
         let (class, code, retryable) = classify_memory_error(mem);
         return Response::error(class, code, message, retryable);
@@ -91,6 +78,12 @@ fn classify_core_error(err: &CoreError) -> (ErrorClass, &'static str, bool) {
             (ErrorClass::Storage, "object_integrity_failure", false)
         }
         CoreError::SecretDetected { .. } => (ErrorClass::Validation, "secret_detected", false),
+        // Structural rejection of an untrusted branch name (path
+        // traversal defence). The caller must change the name; retrying
+        // the identical request can never succeed.
+        CoreError::InvalidBranchName { .. } => {
+            (ErrorClass::Validation, "invalid_branch_name", false)
+        }
         CoreError::Io(_) => (ErrorClass::Storage, "io_failure", true),
         CoreError::Serialize(_) => (ErrorClass::Storage, "serialization_failure", false),
         CoreError::KindMismatch { .. } => (ErrorClass::Storage, "object_kind_mismatch", false),
@@ -244,16 +237,16 @@ mod tests {
     }
 
     #[test]
-    fn approval_key_not_configured_classifies_as_non_retryable_validation() {
-        // ADR-0014 interim gate: accept_data_loss=true with no approval
-        // mechanism is a structural rejection — the caller must obtain an
-        // operator approval, so retrying the identical request can never
-        // succeed. Wire code is shared with the full gate so operator
-        // alert rules survive the upgrade.
-        let err: anyhow::Error =
-            anyhow::Error::new(crate::rollback::ApprovalError::KeyNotConfigured)
-                .context("rolling back");
-        match map_anyhow_to_response_error(err) {
+    fn invalid_branch_name_classifies_as_non_retryable_validation() {
+        // Path-traversal defence (2026-07-09 audit finding #1): a
+        // hostile branch name is a structural rejection — the caller
+        // must change the name, so the SDK must not burn retries on it.
+        let core_err: anyhow::Error = anyhow::Error::new(agentic_core::Error::InvalidBranchName {
+            name: "../escape".to_string(),
+            reason: "'.' and '..' path components are not allowed".to_string(),
+        })
+        .context("reading branch ref before commit");
+        match map_anyhow_to_response_error(core_err) {
             Response::Error {
                 class,
                 code,
@@ -261,8 +254,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(class, ErrorClass::Validation);
-                assert_eq!(code, "approval_key_not_configured");
-                assert!(!retryable, "approval rejection must not be retried");
+                assert_eq!(code, "invalid_branch_name");
+                assert!(!retryable);
             }
             _ => panic!("expected Response::Error"),
         }
