@@ -120,6 +120,20 @@ What the demo requires:
 
 Performance targets (from [`snapshot-model.md`](docs/architecture/snapshot-model.md) §9): commit < 2s, rollback < 5s, diff < 1s, write overhead < 5ms p99, snapshot storage < 2× changed data amortized. These are commitments, not aspirations.
 
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked in GitHub Issues (`git-agentic/git.agentic`) via the `gh` CLI; external PRs are **not** a triage surface. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` (the last already exists in the repo). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` (not yet written) + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 ## Canonical references
 
 When in doubt, these are authoritative:
