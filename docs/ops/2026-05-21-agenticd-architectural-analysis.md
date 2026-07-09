@@ -34,17 +34,17 @@ This document is the durable evidence behind the v1.0 hardening + v1.1 architect
 ## Structural Analysis
 
 <a name="s1"></a>**S1 — `DaemonState.memory` typed to concrete `PostgresAdapter`, not the `MemoryAdapter` trait** (`server.rs:44`, `rollback.rs:87–148`).
-The trait exists with `snapshot`/`restore`/`current_schema_version`, but rollback calls `migrations_after` and `apply_down_migration` (`rollback.rs:102, 122`) which only exist on the concrete type. `DaemonState` therefore stores `Option<Arc<Mutex<PostgresAdapter>>>`. Asymmetric to `ObjectStore` (which IS abstracted, via `Arc<dyn ObjectStore + Send + Sync>` at `server.rs:35`). Blocks the v1.1 Mem0/Zep/Letta path at the type level.
+The trait exists with `snapshot`/`restore`/`current_schema_version`, but rollback calls `migrations_after` and `apply_down_migration` (`rollback.rs:102, 122`) which only exist on the concrete type. `DaemonState` therefore stores `Option<Arc<Mutex<PostgresAdapter>>>`. Asymmetric to `ObjectStore` (which IS abstracted, via `Arc<dyn ObjectStore + Send + Sync>` at `server.rs:35`). Blocks the v1.1 Mem0/Zep/Letta path at the type level. — resolved 2026-07-09 by §A9's completion (issue #43).
 
 <a name="s2"></a>**S2 — `handle_commit` inlined in `server.rs:286–364`; `rollback::execute` extracted as its own module.** Same structural shape (acquire lock, run phased orchestration, return typed output); only rollback was extracted. Adding a third write-path operation has two models to follow.
 
 <a name="s3"></a>**S3 — `rollback.rs` has three unrelated responsibilities.** Phase orchestration (`execute`, lines 43–231), typed object loaders (`load_commit`/`load_tree`/`load_blob`, lines 233–256, pure `ObjectStore` consumers with no rollback logic), and filesystem write-back (`restore_prompts`/`sweep_orphans`, lines 267–304, synchronous `std::fs` I/O).
 
-<a name="s4"></a>**S4 — `load_manifest` (`rollback.rs:258–263`) calls `serde_json::from_slice` directly; no `SegmentManifest::from_canonical_bytes` to mirror the existing `to_canonical_bytes` writer.** Wire-format knowledge leaks out of `agentic-memory` into the daemon.
+<a name="s4"></a>**S4 — `load_manifest` (`rollback.rs:258–263`) calls `serde_json::from_slice` directly; no `SegmentManifest::from_canonical_bytes` to mirror the existing `to_canonical_bytes` writer.** Wire-format knowledge leaks out of `agentic-memory` into the daemon. — resolved 2026-05-22 by §A10 (issue #44); this entry was left stale when A10 landed.
 
 <a name="s5"></a>**S5 — Schema-version gate duplicated.** `PostgresAdapter::restore` at `postgres.rs:413–417` checks live vs target, AND `rollback.rs:94–108` does it first. Under success the inner guard is a no-op; under partial-migration failure both fire with different error types (`anyhow::Error` vs `Error::SchemaMismatch`).
 
-<a name="s6"></a>**S6 — No `MemoryBackendSpec` factory equivalent to `ObjectStoreSpec`.** `ObjectStoreSpec::parse` + `open` (`objstore.rs:51, 88`) is cleanly testable. Memory backend is constructed inline in `DaemonState::open` (`server.rs:64–80`) with validation, config, connect, and init all in one block.
+<a name="s6"></a>**S6 — No `MemoryBackendSpec` factory equivalent to `ObjectStoreSpec`.** `ObjectStoreSpec::parse` + `open` (`objstore.rs:51, 88`) is cleanly testable. Memory backend is constructed inline in `DaemonState::open` (`server.rs:64–80`) with validation, config, connect, and init all in one block. — resolved 2026-07-09 by `MemoryBackendSpec` (§A9 / issue #43).
 
 <a name="s7"></a>**S7 — `read_prompts_for_commit` and `read_tools_for_commit` are identical except for the field name** (`rollback.rs:306–336`). Two-line structural duplication; will recur per new tree-typed dimension.
 
@@ -131,7 +131,7 @@ The trait exists with `snapshot`/`restore`/`current_schema_version`, but rollbac
 | <a name="r7"></a>**R7** Wire-protocol errors untyped | [B6](#b6), [B13](#b13), [B14](#b14) | Near certain | Medium | Multi-module | Moderate (ADR) | Low |
 | <a name="r8"></a>**R8** Non-deterministic commit hashes | [B4](#b4) | Possible | Medium | Localized | Moderate | Low |
 | <a name="r9"></a>**R9** MCP fingerprinting serial | [B1](#b1), [C3](#c3) | Possible | High when triggered | System-wide for lock window | Moderate | No (no MCP in demo) |
-| <a name="r10"></a>**R10** MemoryAdapter trait incomplete | [S1](#s1), [S4](#s4), [S6](#s6) | Certain at v1.1 | Medium | Multi-module | Difficult | No |
+| <a name="r10"></a>**R10** MemoryAdapter trait incomplete | [S1](#s1), [S4](#s4), [S6](#s6) | Certain at v1.1 | Medium | Multi-module | Difficult | No (resolved 2026-07-09 — §A9 complete) |
 | <a name="r11"></a>**R11** Code organization | [S2](#s2), [S3](#s3), [S7](#s7), [B5](#b5), [C7](#c7), [C11](#c11), [C12](#c12), [C13](#c13) | n/a | Low | n/a | n/a | No |
 
 **Priorities:**
@@ -398,9 +398,7 @@ fn needs_memory_restore(t:&Target) -> bool { t.memory_snapshot.is_some() }
 
 **Tests landed:** AC3a/AC3b unit tests in `crates/agenticd/src/migrate.rs`; AC1 + AC3c integration tests + happy-path regression in `crates/agenticd/tests/reverse_migration.rs` (real Postgres, gated by `#[ignore]`); AC2 unit tests in `crates/agenticd/src/rollback.rs`. Full workspace `cargo test` + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check` green.
 
-<a name="a9"></a>**A9 — `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — **PARTIAL 2026-05-22** ([#43](https://github.com/git-agentic/git.agentic/issues/43)). Trait surface expanded with the read-side of rollback: `migrations_after`, `begin_restore`, `restore_with_guard`. `RestoreGuard` generalised to an opaque boxed-payload type so backends without trigger pollers return `RestoreGuard::noop()`. `InMemoryAdapter` test fixture (under `crates/agentic-memory/src/in_memory.rs`) implements the trait and rounds-trips `snapshot → restore` through the canonical `SegmentManifest` path — the Rule-of-Three signal for the read-side trait shape.
-
-Still pending under the same issue: lifting `apply_reverse_migrations` onto the trait, and retyping `DaemonState.memory` from `Arc<Mutex<PostgresAdapter>>` to `Arc<dyn MemoryAdapter>`. The reverse-migration method blocked on a sqlx 0.8 + `async_trait` + `Executor<'c>` HRTB incompatibility — `&mut PgConnection`'s per-borrow lifetime can't unify across the boxed-future elision. `PostgresAdapter::begin_reverse_tx` + `apply_down_migration_tx` stay as inherent methods until either sqlx exposes a friendlier shape, the trait moves to AFIT with `trait_variant`-style Send bounds, or a second real backend (Mem0 / Zep / Letta) lands to inform the right abstraction. The daemon-state retype waits behind that.
+<a name="a9"></a>**A9 — `MemoryAdapter` trait completeness** ([S1](#s1), [S4](#s4), [S6](#s6), [R10](#r10)) — **DONE 2026-07-09** ([#43](https://github.com/git-agentic/git.agentic/issues/43)). Completed 2026-07-09 (issue #43): `apply_reverse_migrations` is on the trait (coarse, backend-owned atomicity — the sqlx HRTB blocker never crosses the boundary), `DaemonState.memory` is `Option<Arc<dyn MemoryAdapter>>` with no adapter mutex (write-path exclusivity via `commit_lock`, resolving §C9's over-serialization), and `MemoryBackendSpec` mirrors `ObjectStoreSpec` (§S6). The `InMemoryAdapter` fixture models migrations and passes the daemon's rollback path end-to-end (`crates/agenticd/tests/rollback_in_memory.rs`).
 
 <a name="a10"></a>**A10 — `SegmentManifest::from_canonical_bytes`** — **DONE 2026-05-22** (issue [#44](https://github.com/git-agentic/git.agentic/issues/44)). Inverse-of-`to_canonical_bytes` constructor lives on the type; `rollback::loaders::load_manifest` routes through it instead of calling `serde_json::from_slice` directly. Pulled forward from v1.1 as a small low-risk cleanup.
 
