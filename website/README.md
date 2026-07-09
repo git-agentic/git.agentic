@@ -1,6 +1,11 @@
 # git.agentic website
 
-Static landing page for git-agentic.com (canonical), with .dev and .org redirecting to .com.
+Static site for git-agentic.com (canonical), with .dev and .org redirecting to .com. Four routes:
+
+- `/` — suite landing page
+- `/git-agentic` — git.agentic product page
+- `/src-control` — src-control product page
+- `/sentinel` — Sentinel product page
 
 ## Develop
 
