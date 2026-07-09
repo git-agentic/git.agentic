@@ -75,8 +75,9 @@ $ bash demo/run_demo.sh</code></pre>
       Agents run <code>npm install</code> and execute code nobody read.
       Sentinel is a transparent auditing proxy in front of
       registry.npmjs.org: every tarball is scored by a deterministic engine
-      and carries a verdict <em>before</em> install-time code runs. The
-      agent can request; only a human grants.
+      and carries a verdict <em>before</em> install-time code runs, and a
+      deny-by-default sandbox contains what does run. The agent can
+      request; only a human grants.
     </p>
     <pre><code>  color-stream@1.4.1
   ────────────────────────────────────────
@@ -87,7 +88,7 @@ $ bash demo/run_demo.sh</code></pre>
   <span class="bad">critical</span> [secret-exfil]     reads ~/.npmrc, AWS credentials…
 
   HTTP 403  x-sentinel-verdict: block</code></pre>
-    <p class="meta">TypeScript · auditing proxy live · policy &amp; permissions next</p>
+    <p class="meta">TypeScript · full security layer built · open-source launch prep</p>
     <p><a href="/sentinel">Full page →</a> &nbsp; <a href={pkgRegistry}>GitHub →</a></p>
   </section>
 
