@@ -1,0 +1,93 @@
+---
+import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+const repo = 'https://github.com/git-agentic/src-control';
+---
+<Base
+  title="src-control — version control built for fleets of agents"
+  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, per-path encryption, Git import/export."
+>
+  <Header />
+
+  <div class="badges">
+    <span class="badge"><span class="pulse"></span>Phases 1–9 implemented</span>
+    <span class="badge">Rust</span>
+    <span class="badge">Builds on Git, not against it</span>
+  </div>
+
+  <h1>Fork N agent worktrees entirely in RAM.</h1>
+
+  <p class="lead">
+    A next-generation version control system built around a
+    snapshot-and-tag model (Jujutsu-inspired), with in-memory virtual
+    worktrees, native committed secrets, and per-file permissions as the
+    long-term thesis.
+  </p>
+
+  <p class="mute">
+    A checkout assumes one developer, one directory, one disk. Agent fleets
+    break all three: they want dozens of concurrent worktrees, forked in
+    milliseconds, and gone without a trace when the run ends. Disk-bound
+    worktrees leak state and don't scale to that.
+  </p>
+
+  <h2>The demo</h2>
+
+  <p class="mute">
+    Fork parallel worktrees off one snapshot, run against each, tear down —
+    then prove nothing touched disk with an independent before/after
+    filesystem diff.
+  </p>
+
+  <pre><code><span class="comment"># fork 4 parallel in-RAM worktrees, run and check out against each</span>
+$ cargo run --bin sc -- demo --agents 4
+
+<span class="comment"># force the bounded budget: LRU eviction + spill, auto-cleaned</span>
+$ cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill
+
+<span class="comment"># independent zero-residue proof (snapshots the filesystem before/after)</span>
+$ bash demo/run_demo.sh
+
+<span class="comment"># interoperate with Git: import a repo's HEAD, export history back</span>
+$ sc import --repo /path/to/git/repo
+$ sc export --to /path/to/git/repo</code></pre>
+
+  <h2>How it works</h2>
+  <ul class="plain">
+    <li>A worktree is a copy-on-write overlay over an immutable base
+      snapshot — forking N agents is O(overlay), not O(repo); base blobs
+      are shared, never copied</li>
+    <li>Content lives only in RAM and touches disk <em>only</em> on an
+      explicit checkout — no FUSE mount, no kernel extension, which is what
+      makes "zero residual artifacts" provable rather than aspirational</li>
+    <li>Bounded blob budget with LRU eviction; optional spill to an
+      auto-cleaned content-addressed temp dir keeps the zero-residue
+      guarantee</li>
+    <li>Native committed secrets: env vars and keys committed into repo
+      state, encrypted at rest and in transit, decrypted only in an
+      authorized execution context</li>
+    <li>Durable <code>.sc/</code> repos: branches, merge, accidental-secret
+      scanning, local remotes, per-path encryption, packfiles/GC</li>
+    <li>Git interop via <code>gix</code>, isolated in one crate — imports an
+      existing repo's HEAD in-process, exports src-control history back to
+      Git commits</li>
+  </ul>
+
+  <h2>Status</h2>
+  <p class="mute">
+    Phases 1–9 are implemented and tested: in-RAM virtual worktrees,
+    committed secrets, persistent repos, merge, secret scanning, remotes,
+    encrypted paths, packfiles/GC, and Git export. Beyond the P9 roadmap:
+    network transports, richer merge ergonomics, secret/permission
+    lifecycle, sparse/subtree sharing, signed provenance.
+  </p>
+
+  <p class="mute">
+    Docs: <a href={`${repo}#readme`}>README</a> ·
+    <a href={`${repo}/blob/main/ARCHITECTURE.md`}>Architecture</a> ·
+    <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
+  </p>
+
+  <Footer />
+</Base>
