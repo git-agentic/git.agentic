@@ -1,0 +1,114 @@
+---
+import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+const repo = 'https://github.com/git-agentic/pkg-registry';
+---
+<Base
+  title="Sentinel — an agent-auditable security layer for npm"
+  description="A transparent auditing proxy in front of registry.npmjs.org: every tarball is scored by a deterministic engine and carries a verdict before install-time code runs."
+>
+  <Header />
+
+  <div class="badges">
+    <span class="badge"><span class="pulse"></span>Auditing proxy live · policy &amp; permissions next</span>
+    <span class="badge">Apache 2.0</span>
+    <span class="badge">TypeScript</span>
+  </div>
+
+  <h1>Agents run <code class="h1code">npm install</code> and execute code nobody read.</h1>
+
+  <p class="lead">
+    Sentinel is a transparent auditing proxy in front of
+    registry.npmjs.org: it serves real packages unchanged, but intercepts
+    every tarball, scores it with a deterministic audit engine, and attaches
+    a verdict — so an agent or a human sees the risk <em>before</em>
+    install-time code runs.
+  </p>
+
+  <p class="mute">
+    npm can't retract bad releases, has no install-time permissions, and
+    lets attackers squat names. The event-stream pattern — a clean package
+    ships a trojaned patch release — still works today, and agents install
+    with zero risk signaling.
+  </p>
+
+  <h2>The demo</h2>
+
+  <p class="mute">
+    A previously-clean package ships a patch release with a
+    <code>postinstall</code> that harvests secrets. Sentinel's verdict, and
+    what <code>npm install</code> sees when it fetches the bad tarball:
+  </p>
+
+  <pre><code>$ sentinel audit color-stream 1.4.1
+
+  color-stream@1.4.1
+  ────────────────────────────────────────────────────────
+  install    ⚠ runs lifecycle scripts
+  score      ░░░░░░░░░░ 0/100
+  verdict    <span class="bad">BLOCK</span>
+  findings (7)
+  <span class="bad">critical</span> [install-scripts] postinstall reads environment variables,
+                              decodes an encoded blob
+  <span class="bad">critical</span> [secret-exfil]    reads sensitive material (~/.npmrc, AWS
+                              credentials) with a network egress sink
+  <span class="bad">high</span>     [network-egress]  connects to a hardcoded IP address
+  <span class="bad">high</span>     [obfuscation]     uses eval()
+
+$ npm install --registry http://localhost:4873 color-stream
+  HTTP 403  x-sentinel-verdict: block  x-sentinel-score: 0
+
+<span class="comment"># and a clean package passes untouched</span>
+$ sentinel audit is-odd 3.0.1
+<span class="ok">  is-odd@3.0.1  → score 100/100  ALLOW  (signed, no install scripts)</span></code></pre>
+
+  <h2>How it works</h2>
+  <ul class="plain">
+    <li>Transparent proxy: resolves and serves real npm packages unchanged;
+      the verdict rides response headers, and <code>block</code> policy
+      turns a bad tarball into a 403 at install time</li>
+    <li>Deterministic scoring — start at 100, weighted penalties per
+      finding, any critical forces block — fully reproducible in CI; an
+      LLM adapter only adds context, never the score</li>
+    <li>Policy and approval gate: signed per-enterprise policy, capability
+      manifests, and a hard privilege boundary — the agent can request an
+      approval, only a human can grant it</li>
+    <li>Sandbox enforcement (macOS Seatbelt, Linux bubblewrap): lifecycle
+      scripts run with denied-by-default access to secrets and network;
+      detected violations quarantine that exact tarball fleet-wide</li>
+    <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
+      CLI whose exit codes make <code>sentinel audit</code> a CI gate</li>
+    <li>Whole-tree gates: audit every package in an npm/yarn/pnpm lockfile,
+      write a CycloneDX SBOM, post the verdict to the PR via a GitHub
+      Action</li>
+    <li>Signed audit attestations (DSSE/in-toto, Ed25519) verified offline
+      as a deploy-time gate, plus known-malicious advisory and CVE-range
+      (SCA) detection</li>
+  </ul>
+
+  <h2>Status</h2>
+  <p class="mute">
+    The auditing proxy is the live wedge: deterministic engine, whole-tree
+    lockfile gate, sandbox enforcement with runtime quarantine, MCP server,
+    GitHub Action, signed policies and attestations, advisory + CVE
+    detection. The long arc is policy and install-time permissions for the
+    whole ecosystem.
+  </p>
+
+  <p class="mute">
+    Docs: <a href={`${repo}#readme`}>README</a> ·
+    <a href={`${repo}/blob/main/ARCHITECTURE.md`}>Architecture</a> ·
+    <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
+  </p>
+
+  <Footer />
+</Base>
+
+<style>
+  .h1code {
+    font-size: 0.85em;
+    background: var(--bg-soft);
+    color: var(--accent-soft);
+  }
+</style>
