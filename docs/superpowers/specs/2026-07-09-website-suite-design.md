@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-09
 **Status:** Approved by Toni (brainstorming session 2026-07-09)
-**Scope:** `website/` only. No changes to product code, docs, or ADRs.
+**Scope:** `website/` + `docs/superpowers/` only. No changes to product code or ADRs.
 
 ## Goal
 
