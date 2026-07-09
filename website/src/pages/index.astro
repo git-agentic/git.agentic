@@ -1,6 +1,8 @@
 ---
 import Base from '../layouts/Base.astro';
 const repo = 'https://github.com/git-agentic/git.agentic';
+const srcControl = 'https://github.com/git-agentic/src-control';
+const pkgRegistry = 'https://github.com/git-agentic/pkg-registry';
 ---
 <Base>
   <header class="site">
@@ -33,6 +35,50 @@ const repo = 'https://github.com/git-agentic/git.agentic';
     git.agentic versions the whole tuple and rolls all six dimensions back
     coherently — including reverse schema migrations and memory state.
   </p>
+
+  <h2>Projects</h2>
+
+  <p class="mute">
+    git.agentic is the flagship of three projects building version control
+    and supply-chain infrastructure for the agent era.
+  </p>
+
+  <div class="projects">
+    <article class="project">
+      <h3><a href={repo}>git<span class="dot">.</span>agentic</a></h3>
+      <p class="tagline">Git for agent behavior.</p>
+      <p class="mute">
+        Atomic, reversible snapshots of the (code + prompts + tools + model +
+        memory + schema) tuple. When an agent regresses in production, roll
+        all six dimensions back coherently — this page ↓
+      </p>
+      <p class="meta">Rust core · Python SDK · Apache 2.0 · MVP code complete</p>
+    </article>
+
+    <article class="project">
+      <h3><a href={srcControl}>src-control</a></h3>
+      <p class="tagline">A next-generation version control system.</p>
+      <p class="mute">
+        Snapshot-and-tag model with in-memory virtual worktrees: fork N
+        parallel agent worktrees of a repo entirely in RAM and tear them down
+        with zero residual files on disk. Native committed secrets, per-path
+        encryption, and Git import/export.
+      </p>
+      <p class="meta">Rust · MVP phases 1–9 implemented</p>
+    </article>
+
+    <article class="project">
+      <h3><a href={pkgRegistry}>Sentinel</a></h3>
+      <p class="tagline">An agent-auditable security layer for npm.</p>
+      <p class="mute">
+        A transparent auditing proxy in front of registry.npmjs.org: every
+        tarball is scored by a deterministic audit engine and gets a verdict
+        <em>before</em> install-time code runs. Agents see the risk; humans
+        grant the capabilities.
+      </p>
+      <p class="meta">TypeScript · Phase 1 auditing proxy · policy &amp; permissions next</p>
+    </article>
+  </div>
 
   <h2>The version</h2>
   <pre><code><span class="comment"># a commit captures this atomically</span>
@@ -144,7 +190,38 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
     <span>
       <a href={repo}>GitHub</a> ·
       <a href={`${repo}/blob/main/docs/product/mvp-spec.md`}>MVP spec</a> ·
-      <a href={`${repo}/blob/main/docs/architecture/snapshot-model.md`}>Snapshot model</a>
+      <a href={`${repo}/blob/main/docs/architecture/snapshot-model.md`}>Snapshot model</a> ·
+      <a href={srcControl}>src-control</a> ·
+      <a href={pkgRegistry}>Sentinel</a>
     </span>
   </footer>
 </Base>
+
+<style>
+  .projects {
+    display: grid;
+    gap: 0.75rem;
+    margin: 1.25rem 0 0.5rem;
+  }
+  .project {
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem 1.1rem 0.85rem;
+    background: var(--bg-hard);
+  }
+  .project h3 { margin: 0 0 0.15rem; }
+  .project h3 a { color: var(--fg); }
+  .project h3 a:hover { color: var(--accent); text-decoration: none; }
+  .project .dot { color: var(--accent); }
+  .tagline {
+    font-family: var(--sans);
+    color: var(--fg);
+    margin-bottom: 0.5rem;
+  }
+  .project :global(.mute) { font-size: 13px; margin-bottom: 0.6rem; }
+  .meta {
+    font-size: 12px;
+    color: var(--fg-faint);
+    margin: 0;
+  }
+</style>

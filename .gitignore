@@ -51,3 +51,6 @@ PROMPT-*.md
 # Agent worktrees — see CLAUDE.md "Worktree discipline".
 # Each branch lives in .worktrees/<slug>/; never tracked in the parent tree.
 .worktrees/
+
+# Personal deploy helper — contains SSH endpoint details; keep local.
+website/deploy-git-agentic.command
