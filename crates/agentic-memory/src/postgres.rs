@@ -658,13 +658,26 @@ impl MemoryAdapter for PostgresAdapter {
         if steps.is_empty() {
             return Ok(());
         }
-        let mut tx = self.begin_reverse_tx().await?;
+        let mut tx = self.begin_reverse_tx().await.map_err(|e| {
+            Error::Other(
+                anyhow::anyhow!(e)
+                    .context("opening outer transaction for reverse-migration sequence"),
+            )
+        })?;
         for step in steps {
             self.apply_down_migration_tx(&mut tx, &step.name, &step.sql)
-                .await?;
+                .await
+                .map_err(|e| {
+                    Error::Other(
+                        anyhow::anyhow!(e)
+                            .context(format!("applying reverse migration {:?}", step.name)),
+                    )
+                })?;
             tracing::info!(migration = %step.name, "reverse migration applied (in outer tx)");
         }
-        tx.commit().await?;
+        tx.commit().await.map_err(|e| {
+            Error::Other(anyhow::anyhow!(e).context("committing reverse-migration sequence"))
+        })?;
         Ok(())
     }
 }

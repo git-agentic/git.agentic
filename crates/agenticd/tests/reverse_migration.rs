@@ -211,7 +211,7 @@ async fn ac1_mid_sequence_failure_rolls_back_entire_sequence() {
 
 #[tokio::test]
 #[ignore]
-async fn run_reverse_commits_successful_sequence() {
+async fn apply_reverse_migrations_commits_successful_sequence() {
     let Some(url) = database_url() else {
         eprintln!("DATABASE_URL not set — skipping integration test");
         return;
