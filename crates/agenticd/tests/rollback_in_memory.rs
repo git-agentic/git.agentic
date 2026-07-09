@@ -134,3 +134,127 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
         "rollback forward-records a commit"
     );
 }
+
+// ADR-0014 interim gate — `accept_data_loss = true` is rejected fail-closed
+// before ANY side effects: no schema reversal, no memory restore, no
+// forward-record. Regression for the 2026-07-09 audit finding that any
+// allowlisted worker could authorize destructive rollback itself.
+#[tokio::test]
+async fn rollback_rejects_accept_data_loss_before_side_effects() {
+    // -- Arrange: same shape as the happy-path test — baseline commit,
+    // then contaminate schema + data so a would-be rollback has real
+    // destructive work to (not) do.
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().to_path_buf();
+    let agentic_dir = repo_root.join(".agentic");
+    std::fs::create_dir_all(agentic_dir.join("objects")).unwrap();
+
+    let store: Arc<dyn ObjectStore + Send + Sync> =
+        Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+    let refs = Refs::open(&agentic_dir).unwrap();
+
+    let adapter = Arc::new(InMemoryAdapter::new(Arc::clone(&store)));
+    adapter.apply_migration("001_init").await;
+    adapter
+        .insert_rows(
+            "messages",
+            vec![serde_json::json!({"id": 1, "body": "clean"})],
+        )
+        .await;
+
+    let state = Arc::new(DaemonState {
+        repo_root: repo_root.clone(),
+        store: Arc::clone(&store),
+        refs,
+        commit_lock: Arc::new(Mutex::new(())),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        memory: Some(adapter.clone() as Arc<dyn MemoryAdapter>),
+        mcp_servers: Vec::new(),
+        http: reqwest::Client::builder()
+            .user_agent("agenticd-test")
+            .build()
+            .unwrap(),
+        peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+    });
+
+    let baseline = commit::execute(
+        Arc::clone(&state),
+        commit_input_with_memory("baseline"),
+        None,
+    )
+    .await
+    .expect("baseline commit with memory should succeed");
+    let baseline_ref = baseline.commit_hash.clone();
+    let tip_before = state.refs.read_branch("main").unwrap();
+
+    adapter.apply_migration("002_bump").await;
+    adapter
+        .insert_rows(
+            "messages",
+            vec![serde_json::json!({"id": 99, "body": "bad"})],
+        )
+        .await;
+
+    // Write the down.sql fixture so that, were the gate ever removed, the
+    // rollback would actually execute and the side-effect assertions below
+    // would fail loudly rather than masking the regression behind a
+    // missing-file error.
+    let schema_dir = agentic_dir.join("schema");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(
+        schema_dir.join("002_bump.down.sql"),
+        "-- no-op for fixture\n",
+    )
+    .unwrap();
+
+    // -- Act: attempt the rollback with accept_data_loss = true. ---------
+    let err = rollback::execute(
+        Arc::clone(&state),
+        RollbackArgs {
+            target: baseline_ref.clone(),
+            dry_run: false,
+            accept_data_loss: true,
+            repo: repo_root.clone(),
+        },
+        None,
+    )
+    .await
+    .expect_err("accept_data_loss=true must be rejected while no approval gate exists");
+
+    // -- Assert: typed rejection, and nothing happened. -------------------
+    assert!(
+        err.chain()
+            .any(|e| e.downcast_ref::<rollback::ApprovalError>().is_some()),
+        "rejection must carry the typed ApprovalError; got: {err:#}"
+    );
+    assert_eq!(
+        adapter.current_schema_version().await.unwrap(),
+        "002_bump",
+        "schema must NOT be reversed by a rejected request"
+    );
+    assert_eq!(
+        adapter.rows_of("messages").await.len(),
+        2,
+        "memory must NOT be restored by a rejected request"
+    );
+    assert_eq!(
+        state.refs.read_branch("main").unwrap(),
+        tip_before,
+        "no forward-record commit may be created by a rejected request"
+    );
+
+    // Dry-run does not soften the gate: the reject happens before the
+    // dry-run branch, per ADR-0014 Decision 1 (gate first).
+    rollback::execute(
+        Arc::clone(&state),
+        RollbackArgs {
+            target: baseline_ref,
+            dry_run: true,
+            accept_data_loss: true,
+            repo: repo_root,
+        },
+        None,
+    )
+    .await
+    .expect_err("dry_run must not bypass the accept_data_loss gate");
+}
