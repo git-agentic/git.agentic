@@ -94,10 +94,57 @@ pub async fn fingerprint_all(
         .await
 }
 
-/// Hit one MCP server's `tools/list` and return canonicalized bytes.
+/// Resource limits applied to every MCP response before it is parsed,
+/// canonicalised, or persisted. The fingerprinter runs while the daemon
+/// holds `commit_lock`, so an unbounded response is both a memory-
+/// exhaustion and a commit-availability problem (2026-07-09 audit,
+/// finding #4).
+#[derive(Clone, Copy, Debug)]
+pub struct McpLimits {
+    /// Cap on the raw HTTP response body, enforced *while streaming* —
+    /// the download aborts as soon as the cap is crossed, before any
+    /// parsing.
+    pub max_response_bytes: usize,
+    /// Cap on JSON nesting depth of the `result` value. serde_json's
+    /// own recursion limit (128) already bounds the parse; this is the
+    /// tighter policy cap for what we're willing to canonicalise.
+    pub max_json_depth: usize,
+    /// Cap on the canonical manifest bytes we hash and persist.
+    pub max_manifest_bytes: usize,
+}
+
+impl Default for McpLimits {
+    fn default() -> Self {
+        Self {
+            // A real tools/list manifest is a few KB; 1 MiB is generous
+            // headroom without letting one server pin the commit path.
+            max_response_bytes: 1024 * 1024,
+            max_json_depth: 32,
+            max_manifest_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// How much of an error body we quote back in error messages. Without
+/// this an oversized-but-failing reply would end up verbatim inside an
+/// anyhow chain (and from there in logs and wire error messages).
+const ERROR_BODY_EXCERPT_BYTES: usize = 512;
+
+/// Hit one MCP server's `tools/list` and return canonicalized bytes,
+/// under [`McpLimits::default`].
 pub async fn fingerprint_one(
     client: &reqwest::Client,
     spec: &McpServerSpec,
+) -> anyhow::Result<McpFingerprint> {
+    fingerprint_one_with_limits(client, spec, McpLimits::default()).await
+}
+
+/// [`fingerprint_one`] with explicit limits — split out so tests can
+/// exercise the caps without multi-megabyte fixtures.
+pub async fn fingerprint_one_with_limits(
+    client: &reqwest::Client,
+    spec: &McpServerSpec,
+    limits: McpLimits,
 ) -> anyhow::Result<McpFingerprint> {
     let body = JsonRpcRequest {
         jsonrpc: "2.0",
@@ -113,13 +160,14 @@ pub async fn fingerprint_one(
         .await
         .with_context(|| format!("POST {}", spec.url))?;
     let status = resp.status();
-    let bytes = resp.bytes().await?;
+    let bytes = read_body_capped(resp, limits.max_response_bytes, &spec.name).await?;
     if !status.is_success() {
+        let excerpt_len = bytes.len().min(ERROR_BODY_EXCERPT_BYTES);
         return Err(anyhow!(
             "MCP server {} returned HTTP {}: {}",
             spec.name,
             status,
-            String::from_utf8_lossy(&bytes)
+            String::from_utf8_lossy(&bytes[..excerpt_len])
         ));
     }
     let rpc: JsonRpcResponse = serde_json::from_slice(&bytes)
@@ -138,12 +186,75 @@ pub async fn fingerprint_one(
             spec.name
         )
     })?;
+    let depth = json_depth(&result);
+    if depth > limits.max_json_depth {
+        return Err(anyhow!(
+            "MCP server {} tools/list result nests {} levels deep (limit {}); \
+             refusing to canonicalise it",
+            spec.name,
+            depth,
+            limits.max_json_depth
+        ));
+    }
     let canonical_manifest = canonicalize(&result);
+    if canonical_manifest.len() > limits.max_manifest_bytes {
+        return Err(anyhow!(
+            "MCP server {} tools/list manifest is {} bytes canonicalised (limit {}); \
+             refusing to persist it",
+            spec.name,
+            canonical_manifest.len(),
+            limits.max_manifest_bytes
+        ));
+    }
     Ok(McpFingerprint {
         name: spec.name.clone(),
         url: spec.url.clone(),
         canonical_manifest,
     })
+}
+
+/// Download a response body, aborting as soon as `cap` is exceeded.
+/// The `Content-Length` header short-circuits when the server declares
+/// an oversize body up front; the streaming check is the enforcement
+/// that holds either way (a hostile or chunked server can declare
+/// nothing, or lie).
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    server: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(anyhow!(
+                "MCP server {server} declared a {len}-byte response (limit {cap}); \
+                 refusing to download it"
+            ));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > cap {
+            return Err(anyhow!(
+                "MCP server {server} response exceeded the {cap}-byte limit mid-stream; \
+                 aborting download"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Nesting depth of a JSON value (scalars = 1, `[]`/`{}` = 1, `[[]]` = 2).
+///
+/// INVARIANT: recursion is bounded — `serde_json::from_slice` enforces
+/// its own recursion limit of 128 at parse time, so any `Value` we hold
+/// is at most 128 levels deep and this cannot overflow the stack.
+fn json_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(json_depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        _ => 1,
+    }
 }
 
 /// Canonicalize a JSON value: sort object keys recursively, preserve
@@ -297,6 +408,163 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         addr
+    }
+
+    /// Spawn a fake MCP server that replies to one POST with `body`,
+    /// optionally omitting the Content-Length header (the connection
+    /// close then delimits the body — the shape a chunked or hostile
+    /// server that under-declares would present).
+    async fn spawn_mcp_server_with_body(
+        body: Vec<u8>,
+        declare_length: bool,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+                let headers = if declare_length {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(headers.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, handle)
+    }
+
+    fn tiny_limits() -> McpLimits {
+        McpLimits {
+            max_response_bytes: 64,
+            max_json_depth: 8,
+            max_manifest_bytes: 1024,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 2026-07-09 audit finding #4 — resource caps on MCP responses.
+    // The fingerprinter runs under commit_lock, so every unbounded
+    // dimension (bytes, depth, manifest size) is a commit-availability
+    // and memory-exhaustion vector.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oversized_declared_response_is_rejected_before_download() {
+        // 200 bytes of valid JSON against a 64-byte cap, with an honest
+        // Content-Length: the header check refuses before reading.
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{}]}}}}"#,
+            std::iter::repeat_n(r#""x""#, 40)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (addr, h) = spawn_mcp_server_with_body(payload.into_bytes(), true).await;
+        let spec = McpServerSpec {
+            name: "big".into(),
+            url: format!("http://{addr}/"),
+        };
+        let err = fingerprint_one_with_limits(&reqwest::Client::new(), &spec, tiny_limits())
+            .await
+            .expect_err("oversized declared response must be rejected");
+        assert!(
+            format!("{err:#}").contains("declared"),
+            "should reject via the Content-Length check; got: {err:#}"
+        );
+        h.await.ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_undeclared_response_is_rejected_mid_stream() {
+        // Same oversize body but with no Content-Length header: the
+        // streaming check must abort the download when the cap is
+        // crossed. This is the enforcement that holds against a server
+        // that lies about (or omits) its length.
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{}]}}}}"#,
+            std::iter::repeat_n(r#""x""#, 40)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (addr, h) = spawn_mcp_server_with_body(payload.into_bytes(), false).await;
+        let spec = McpServerSpec {
+            name: "sneaky".into(),
+            url: format!("http://{addr}/"),
+        };
+        let err = fingerprint_one_with_limits(&reqwest::Client::new(), &spec, tiny_limits())
+            .await
+            .expect_err("oversized undeclared response must be rejected mid-stream");
+        assert!(
+            format!("{err:#}").contains("mid-stream"),
+            "should reject via the streaming check; got: {err:#}"
+        );
+        h.await.ok();
+    }
+
+    #[tokio::test]
+    async fn overdeep_json_result_is_rejected() {
+        // 12 nested arrays against a depth cap of 8. Well under
+        // serde_json's own 128-level parse limit, so the parse succeeds
+        // and OUR policy check must be the one that rejects.
+        let nested = format!("{}1{}", "[".repeat(12), "]".repeat(12));
+        let payload = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"deep":{nested}}}}}"#);
+        let limits = McpLimits {
+            max_response_bytes: 4096,
+            ..tiny_limits()
+        };
+        let (addr, h) = spawn_mcp_server_with_body(payload.into_bytes(), true).await;
+        let spec = McpServerSpec {
+            name: "deep".into(),
+            url: format!("http://{addr}/"),
+        };
+        let err = fingerprint_one_with_limits(&reqwest::Client::new(), &spec, limits)
+            .await
+            .expect_err("over-deep result must be rejected");
+        assert!(
+            format!("{err:#}").contains("levels deep"),
+            "should reject via the depth check; got: {err:#}"
+        );
+        h.await.ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_canonical_manifest_is_rejected() {
+        // Response and depth fit their caps; the canonicalised manifest
+        // alone exceeds its own cap.
+        let payload = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":["abcdefghij"]}}"#;
+        let limits = McpLimits {
+            max_response_bytes: 4096,
+            max_json_depth: 8,
+            max_manifest_bytes: 16,
+        };
+        let (addr, h) = spawn_mcp_server_with_body(payload.as_bytes().to_vec(), true).await;
+        let spec = McpServerSpec {
+            name: "fat-manifest".into(),
+            url: format!("http://{addr}/"),
+        };
+        let err = fingerprint_one_with_limits(&reqwest::Client::new(), &spec, limits)
+            .await
+            .expect_err("oversized canonical manifest must be rejected");
+        assert!(
+            format!("{err:#}").contains("refusing to persist"),
+            "should reject via the manifest-size check; got: {err:#}"
+        );
+        h.await.ok();
+    }
+
+    #[test]
+    fn json_depth_counts_nesting() {
+        assert_eq!(json_depth(&json!(1)), 1);
+        assert_eq!(json_depth(&json!([])), 1);
+        assert_eq!(json_depth(&json!([1])), 2);
+        assert_eq!(json_depth(&json!({"a": {"b": [1]}})), 4);
     }
 
     /// AC for issue #42 / audit §A7: three servers each delaying
