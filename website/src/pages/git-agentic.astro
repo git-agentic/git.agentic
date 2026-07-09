@@ -1,0 +1,144 @@
+---
+import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+const repo = 'https://github.com/git-agentic/git.agentic';
+---
+<Base
+  title="git.agentic — Git for agent behavior"
+  description="Atomic, reversible snapshots of the full system state — code, prompts, tools, model, memory, schema — that determines how an AI agent acts."
+>
+  <Header />
+
+  <div class="badges">
+    <span class="badge"><span class="pulse"></span>v1.0 shipped · v1.1 in progress</span>
+    <span class="badge">Apache 2.0</span>
+    <span class="badge">Rust core · Python SDK</span>
+  </div>
+
+  <h1>Git for agent behavior.</h1>
+
+  <p class="lead">
+    Atomic, reversible snapshots of the full system state — code, prompts,
+    tools, model, memory, schema — that determines how an AI agent acts.
+  </p>
+
+  <p class="mute">
+    <code>git revert</code> knows about code. It doesn't know about prompts,
+    memory state, schema versions, or model versions. When an agent regresses
+    in production, <code>git revert</code> can't put the system back together.
+    git.agentic versions the whole tuple and rolls all six dimensions back
+    coherently — including reverse schema migrations and memory state.
+  </p>
+
+  <h2>The version</h2>
+  <pre><code><span class="comment"># a commit captures this atomically</span>
+AgentVersion = (
+    code_sha,
+    prompts,
+    tools,
+    model,
+    memory_snapshot,
+    schema_version,
+)</code></pre>
+
+  <table class="tuple">
+    <thead>
+      <tr><th>Dimension</th><th>What it is</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>code_sha</td><td>The git commit. The bit you already version.</td></tr>
+      <tr><td>prompts</td><td>System prompts, role prompts, few-shot templates — content-hashed.</td></tr>
+      <tr><td>tools</td><td>MCP server fingerprints. The tool surface the agent saw.</td></tr>
+      <tr><td>model</td><td>Provider, model id, decoding params. Pinned, not floated.</td></tr>
+      <tr><td>memory_snapshot</td><td>Postgres&nbsp;+&nbsp;pgvector state at commit time. Restored on rollback.</td></tr>
+      <tr><td>schema_version</td><td>Memory schema. Forward and <em>reverse</em> migrations.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The demo</h2>
+
+  <p class="mute">
+    A "small" prompt tweak plus a memory schema bump breaks the agent in
+    production. <code>git revert</code> alone can't fix it — the schema is
+    still bumped, the memory has accumulated contaminated rows.
+    <code>agentic rollback</code> restores all six dimensions in one move.
+  </p>
+
+  <pre><code><span class="comment"># baseline: agent works</span>
+$ ./scripts/ask "I'm thinking about cancelling."
+<span class="ok">&gt; "I understand. Could you tell me a bit more..."</span>
+
+<span class="comment"># developer ships a "small" prompt + schema change</span>
+$ ./scripts/deploy-bad-change.sh
+$ ./scripts/ask "I'm thinking about cancelling."
+<span class="bad">&gt; "Absolutely! I'll cancel and refund the full amount. Done!"   # hallucinated</span>
+
+<span class="comment"># git can't fix this — schema is bumped, memory is contaminated</span>
+$ git revert HEAD &amp;&amp; ./scripts/redeploy.sh
+$ ./scripts/ask "I'm thinking about cancelling."
+<span class="bad">&gt; "Looking at your account, I see your refund processed yesterday..."   # still wrong</span>
+
+<span class="comment"># the agentic way</span>
+$ agentic rollback v0.7
+<span class="accent">  ✓ Schema reverted          in 0.4s
+  ✓ Memory restored          in 2.1s
+  ✓ Prompts restored         in 0.0s
+  ✓ HEAD now at i7j8k9l (rollback of v0.8 → v0.7)</span>
+
+$ ./scripts/ask "I'm thinking about cancelling."
+<span class="ok">&gt; "I understand. Could you tell me a bit more..."   # baseline restored</span></code></pre>
+
+  <h2>Try it</h2>
+
+  <p class="mute">
+    One clone, one <code>docker-compose up</code>, one script.
+  </p>
+
+  <pre><code>$ git clone https://github.com/git-agentic/git.agentic
+$ cd git.agentic/examples/langgraph-rollback
+$ docker-compose up -d              <span class="comment"># Postgres + pgvector</span>
+$ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks, rolls back</span></code></pre>
+
+  <h2>What shipped in v1.0</h2>
+  <ul class="plain">
+    <li><code>agentic</code> CLI — <code>init</code>, <code>commit</code>, <code>log</code>, <code>diff</code>, <code>rollback</code>, <code>branch</code>, <code>status</code></li>
+    <li><code>agenticd</code> daemon — Rust, owns the object store and snapshot engine</li>
+    <li>Python SDK — typed client, drop-in LangGraph checkpointer</li>
+    <li>One memory backend: Postgres + pgvector, deeply integrated</li>
+    <li>One framework: LangGraph (the first platform-partner integration / Claude Agent SDK lands alongside)</li>
+    <li>One demo: <a href={`${repo}/blob/main/docs/product/demo-scenario.md`}>"the broken prompt"</a></li>
+  </ul>
+
+  <p class="faint">
+    Not in v1.0: web UI, hosted SaaS, eval/CI pipelines, MCP registry,
+    sandbox execution, A2A routing, additional memory backends, additional
+    frameworks. See <a href={`${repo}/blob/main/docs/adr/0001-architecture-foundations.md`}>ADR-0001</a> §9–§10 for why.
+  </p>
+
+  <h2>Status</h2>
+  <p class="mute">
+    v1.0 shipped 2026-05-26 with the public repo release: object store,
+    atomic memory snapshot, rollback with reverse migrations, MCP
+    fingerprinting, six-dimension diff, Python SDK + LangGraph checkpointer,
+    and the broken-prompt demo. v1.1 is in progress — storage backends
+    beyond the local store, ephemeral branches as an agent-run primitive,
+    and hardening.
+  </p>
+
+  <h2>Design partners</h2>
+  <p class="mute">
+    If you run a stateful LangGraph agent in production and have been
+    burned by a prompt or schema change that you couldn't cleanly revert,
+    let's talk. Email <a href="mailto:toni@git-agentic.com">toni@git-agentic.com</a>.
+  </p>
+
+  <p class="mute">
+    Docs: <a href={`${repo}#readme`}>README</a> ·
+    <a href={`${repo}/blob/main/docs/product/mvp-spec.md`}>MVP spec</a> ·
+    <a href={`${repo}/blob/main/docs/architecture/snapshot-model.md`}>Snapshot model</a> ·
+    <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
+  </p>
+
+  <Footer />
+</Base>
