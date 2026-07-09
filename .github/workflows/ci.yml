@@ -114,29 +114,42 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DATABASE_URL: postgres://agentic:agentic@localhost:54322/agentic
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: agentic
-          POSTGRES_PASSWORD: agentic
-          POSTGRES_DB: agentic
-        ports:
-          - 54322:5432
-        options: >-
-          --health-cmd "pg_isready -U agentic -d agentic"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
+      - name: start postgres (pgvector) with logical decoding enabled
+        run: |
+          docker run -d --name agentic-ci-pg -p 54322:5432 \
+            -e POSTGRES_USER=agentic \
+            -e POSTGRES_PASSWORD=agentic \
+            -e POSTGRES_DB=agentic \
+            --health-cmd "pg_isready -U agentic -d agentic" \
+            --health-interval 5s \
+            --health-timeout 5s \
+            --health-retries 12 \
+            pgvector/pgvector:pg16 \
+            postgres -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+
+          ready=""
+          for i in $(seq 1 30); do
+            if docker exec agentic-ci-pg pg_isready -U agentic -d agentic >/dev/null 2>&1; then
+              echo "postgres ready after ${i}s"
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "postgres did not become ready within 30s" >&2
+            docker logs agentic-ci-pg || true
+            exit 1
+          fi
       - name: create pgvector extension
         # The adapter checks for the extension but cannot create it
         # (CREATE EXTENSION needs superuser); the demo does this in
         # seed.sql, CI does it here.
-        run: psql "$DATABASE_URL" -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+        run: docker exec -e PGPASSWORD=agentic agentic-ci-pg psql -U agentic -d agentic -c 'CREATE EXTENSION IF NOT EXISTS vector;'
       - name: memory adapter suite (snapshot/restore)
         # --test-threads=1 is required by the suite's own contract (see
         # its module doc): public.agentic_change_log is shared across
