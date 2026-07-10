@@ -174,7 +174,12 @@ fn corrupt_download_is_rejected_and_not_cached() {
         bucket().unwrap(),
         object_name.replace('/', "%2F"),
     );
-    let resp = reqwest::blocking::Client::new()
+    // Bound the request so a misconfigured/unresponsive fake-GCS can't hang
+    // this (CI-run, --ignored) test indefinitely.
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap()
         .post(&upload_url)
         .header("Content-Type", "application/octet-stream")
         .body(corrupt)

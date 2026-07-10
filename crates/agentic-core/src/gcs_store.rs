@@ -252,26 +252,31 @@ impl GcsObjectStore {
         Ok(Some((bytes, compressed)))
     }
 
-    /// Fetch the bytes for `hash`, verifying integrity with `verify`
-    /// before trusting a cache hit or caching a fresh download.
+    /// Fetch the bytes for `hash` and map them to `T`, where `map` also
+    /// performs the integrity check as it maps.
     ///
-    /// The verification scheme differs by caller (raw-bytes hash for
-    /// `get_raw`, typed-object hash for `get`), so it's injected as a
-    /// closure. Two integrity properties hold regardless of scheme
-    /// (2026-07-09 audit finding #3):
+    /// The check differs by caller — `get_raw` verifies `Hash::of(bytes)`
+    /// and returns the bytes; `get` parses the typed object and verifies
+    /// `object.hash()`, returning the object — so it's injected as a
+    /// closure that owns the bytes (no separate verify pass, no double
+    /// parse for `get`). Three integrity properties hold regardless of
+    /// scheme (2026-07-09 audit finding #3):
     ///
-    /// * A **poisoned cache hit** is evicted and we fall through to GCS,
-    ///   which may still hold the intact object — a merely-corrupted
-    ///   local cache self-heals rather than failing the read.
+    /// * A **poisoned cache hit** (bytes that fail the check) is evicted
+    ///   and we fall through to GCS, which may still hold the intact
+    ///   object — a merely-corrupted local cache self-heals.
+    /// * An **unreadable cache file** (torn write / zstd decode failure,
+    ///   so `cache_read` returns `None`) is likewise evicted, so `has`
+    ///   stays consistent and future reads can heal.
     /// * A **corrupt download** is rejected *before* `cache_write`, so a
     ///   bad object is never written to the local cache ("never cache a
     ///   failed verification").
-fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Result<Vec<u8>> {
+    fn fetch_map<T>(&self, hash: &Hash, map: impl Fn(Vec<u8>) -> Result<T>) -> Result<T> {
         let cache_path = self.cache_path(hash);
         if cache_path.exists() {
             match self.cache_read(hash) {
-                Some(cached) => match verify(&cached) {
-                    Ok(()) => return Ok(cached),
+                Some(cached) => match map(cached) {
+                    Ok(value) => return Ok(value),
                     Err(err) => {
                         tracing::warn!(
                             target: "agentic-core::gcs_store",
@@ -279,13 +284,15 @@ fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Re
                             error = %err,
                             "cached object failed integrity check; evicting and refetching from GCS",
                         );
-                        // Evict the poisoned entry so `has`/subsequent reads don't keep trusting it.
+                        // Evict the poisoned entry so `has`/subsequent reads
+                        // don't keep trusting it.
                         let _ = fs::remove_file(&cache_path);
                     }
                 },
                 None => {
-                    // Cache file exists but is unreadable/corrupt (e.g. torn write or zstd decode failure).
-                    // Evict so `has` stays consistent and future reads can heal from GCS.
+                    // Cache file exists but is unreadable/corrupt (e.g. torn
+                    // write or zstd decode failure). Evict so `has` stays
+                    // consistent and future reads can heal from GCS.
                     let _ = fs::remove_file(&cache_path);
                 }
             }
@@ -293,11 +300,11 @@ fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Re
         match self.download_compressed(hash)? {
             None => Err(Error::NotFound(*hash)),
             Some((bytes, compressed)) => {
-                // Verify BEFORE caching: a corrupt GCS object must not be
-                // persisted to the local cache.
-                verify(&bytes)?;
+                // Map (which verifies) BEFORE caching: a corrupt GCS object
+                // must not be persisted to the local cache.
+                let value = map(bytes)?;
                 let _ = self.cache_write_compressed(hash, &compressed);
-                Ok(bytes)
+                Ok(value)
             }
         }
     }
@@ -393,23 +400,23 @@ impl ObjectStore for GcsObjectStore {
     }
 
     fn get(&self, hash: &Hash) -> Result<Object> {
-        // Typed objects are addressed by `object.hash()`, so the verify
-        // closure parses and checks that — not `Hash::of(bytes)`.
-        let bytes = self.fetch_checked(hash, |b| {
-            let object: Object = serde_json::from_slice(b)?;
-            check_integrity(hash, object.hash())
-        })?;
-        // INVARIANT: the closure above already parsed these bytes as an
-        // Object successfully, so this second parse cannot fail. The cost
-        // is one extra deserialize of a small typed object (Blob/Tree/
-        // Commit), off the hot restore path (which uses `get_raw`).
-        Ok(serde_json::from_slice(&bytes)?)
+        // Typed objects are addressed by `object.hash()`. Parse once inside
+        // the map closure and verify that hash — no second deserialize.
+        self.fetch_map(hash, |bytes| {
+            let object: Object = serde_json::from_slice(&bytes)?;
+            check_integrity(hash, object.hash())?;
+            Ok(object)
+        })
     }
 
     fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
         // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
-        // contract) — verify against that. Audit finding #3.
-        self.fetch_checked(hash, |b| check_integrity(hash, Hash::of(b)))
+        // contract) — verify against that, then return the bytes
+        // unchanged (zero-copy: `bytes` moves out). Audit finding #3.
+        self.fetch_map(hash, |bytes| {
+            check_integrity(hash, Hash::of(&bytes))?;
+            Ok(bytes)
+        })
     }
 
     fn has(&self, hash: &Hash) -> bool {
