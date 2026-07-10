@@ -86,6 +86,9 @@ pub struct DaemonState {
     /// semaphore purely for logging — the semaphore enforces, this
     /// reports.
     pub commit_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Prompt/tool tree-path prefixes whose blobs skip the scanner's
+    /// entropy heuristic (ADR-0017). From --scanner-exempt-entropy-prefix.
+    pub exempt_entropy_prefixes: Vec<String>,
 }
 
 impl DaemonState {
@@ -159,6 +162,7 @@ impl DaemonState {
                 crate::limits::LimitsConfig::default().commit_queue_depth,
             )),
             commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            exempt_entropy_prefixes: Vec::new(),
         })
     }
 
@@ -178,6 +182,13 @@ impl DaemonState {
         self.commit_slots = Arc::new(tokio::sync::Semaphore::new(cfg.commit_queue_depth));
         self.commit_queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.limits = cfg;
+        self
+    }
+
+    /// Attach the ADR-0017 entropy-exempt path prefixes. Builder-style
+    /// like `with_limits`; call before serving traffic.
+    pub fn with_exempt_entropy_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.exempt_entropy_prefixes = prefixes;
         self
     }
 

@@ -130,6 +130,7 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
             agenticd::limits::LimitsConfig::default().commit_queue_depth,
         )),
         commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        exempt_entropy_prefixes: Vec::new(),
     });
 
     let out = commit::execute(

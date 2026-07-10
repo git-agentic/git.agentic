@@ -92,6 +92,7 @@ pub async fn execute_with_now(
         schema_version,
         tools,
         peer_uid,
+        state.exempt_entropy_prefixes.clone(),
     );
 
     // -- Phase 4: stage + commit + ref update (agentic-core) ------------
@@ -200,6 +201,7 @@ fn assemble_inputs(
     schema_version: Option<String>,
     tools: BTreeMap<String, Vec<u8>>,
     peer_uid: Option<u32>,
+    exempt_entropy_prefixes: Vec<String>,
 ) -> CommitInputs {
     // ADR-0010 Decision 3: `input.prompts` already arrives as
     // `BTreeMap<String, Vec<u8>>` (base64-decoded by serde at the wire
@@ -222,7 +224,7 @@ fn assemble_inputs(
         evals: None,
         cost_cents: 0,
         peer_uid,
-        exempt_entropy_prefixes: Vec::new(),
+        exempt_entropy_prefixes,
     }
 }
 
@@ -268,6 +270,66 @@ mod tests {
     /// the commit orchestrator that don't exercise phases 1 or 2.
     async fn make_state(repo: &std::path::Path) -> Arc<DaemonState> {
         make_state_with_mcp(repo, Vec::new()).await
+    }
+
+    const HIGH_ENTROPY_CHECKPOINT: &[u8] = b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+
+    async fn make_state_with_prefixes(
+        repo: &std::path::Path,
+        prefixes: Vec<String>,
+    ) -> Arc<DaemonState> {
+        let agentic_dir = repo.join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        Arc::new(
+            DaemonState::open(
+                repo.to_path_buf(),
+                agentic_dir,
+                store,
+                None,       // no postgres
+                Vec::new(), // no tracked tables
+                Vec::new(), // no MCP servers
+                Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+            )
+            .await
+            .unwrap()
+            .with_exempt_entropy_prefixes(prefixes),
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_exempts_entropy_under_configured_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state_with_prefixes(dir.path(), vec!["__langgraph__/".to_string()]).await;
+        let mut input = commit_input("langgraph checkpoint");
+        input.prompts.insert(
+            "__langgraph__/abc123/checkpoint.json".to_string(),
+            HIGH_ENTROPY_CHECKPOINT.to_vec(),
+        );
+        execute(state, input, None)
+            .await
+            .expect("high-entropy blob under the configured exempt prefix must commit");
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_entropy_outside_configured_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state_with_prefixes(dir.path(), vec!["__langgraph__/".to_string()]).await;
+        let mut input = commit_input("hostile prompt");
+        input
+            .prompts
+            .insert("notes.txt".to_string(), HIGH_ENTROPY_CHECKPOINT.to_vec());
+        let err = execute(state, input, None)
+            .await
+            .expect_err("entropy hit outside the exempt prefix must still reject");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<agentic_core::Error>(),
+                Some(agentic_core::Error::SecretDetected { .. })
+            )),
+            "rejection must carry the typed SecretDetected; got: {err:#}"
+        );
     }
 
     /// As `make_state`, but with a configured MCP server list. Used by
@@ -515,6 +577,7 @@ mod tests {
             Some("003_add_embeddings".to_string()),
             tools.clone(),
             Some(1234),
+            Vec::new(),
         );
 
         assert_eq!(
@@ -563,7 +626,7 @@ mod tests {
             model: None,
             no_memory: true,
         };
-        let out = assemble_inputs(input, None, None, None, BTreeMap::new(), None);
+        let out = assemble_inputs(input, None, None, None, BTreeMap::new(), None, Vec::new());
         assert_eq!(out.author, "alice@example.com");
         assert_eq!(out.peer_uid, None);
     }

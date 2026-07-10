@@ -88,6 +88,12 @@ struct Args {
     #[arg(long)]
     scanner_allowlist: Option<PathBuf>,
 
+    /// Prompt-tree path prefix whose blobs skip the scanner's entropy
+    /// heuristic (pattern rules still run). ADR-0017. Repeatable.
+    /// Default covers the LangGraph checkpointer's blob namespace.
+    #[arg(long = "scanner-exempt-entropy-prefix", default_values_t = vec!["__langgraph__/".to_string()])]
+    scanner_exempt_entropy_prefixes: Vec<String>,
+
     /// Path to the 32-byte operator approval key for destructive rollback
     /// (ADR-0014). Without it, every `accept_data_loss = true` rollback is
     /// rejected fail-closed. If the flag is passed but the file exists and
@@ -266,6 +272,18 @@ async fn main() -> anyhow::Result<()> {
         "scanner allowlist loaded"
     );
 
+    // ADR-0017: exempt prefixes are relative prompt-tree paths.
+    for p in &args.scanner_exempt_entropy_prefixes {
+        anyhow::ensure!(
+            !p.trim().is_empty(),
+            "--scanner-exempt-entropy-prefix must not be empty"
+        );
+        anyhow::ensure!(
+            !p.starts_with('/'),
+            "--scanner-exempt-entropy-prefix {p:?} must be a relative prompt-tree prefix (no leading '/')"
+        );
+    }
+
     let store = ObjectStoreSpec::parse(&args.object_store, &agentic_dir)
         .context("parsing --object-store")?
         .open(allowlist)
@@ -318,7 +336,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?
         .with_approval_key(approval_key)
-        .with_limits(limits.clone()),
+        .with_limits(limits.clone())
+        .with_exempt_entropy_prefixes(args.scanner_exempt_entropy_prefixes.clone()),
     );
 
     let listener = UnixListener::bind(&socket_path)

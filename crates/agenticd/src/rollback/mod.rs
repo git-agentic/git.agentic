@@ -415,7 +415,7 @@ pub async fn execute(
         evals: None,
         cost_cents: 0,
         peer_uid,
-        exempt_entropy_prefixes: Vec::new(),
+        exempt_entropy_prefixes: state.exempt_entropy_prefixes.clone(),
     };
     let out = stage_and_commit(state.store.as_ref(), &state.refs, &branch, inputs)
         .context("forward-recording rollback commit")?;
