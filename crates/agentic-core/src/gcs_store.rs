@@ -266,20 +266,27 @@ impl GcsObjectStore {
     /// * A **corrupt download** is rejected *before* `cache_write`, so a
     ///   bad object is never written to the local cache ("never cache a
     ///   failed verification").
-    fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Result<Vec<u8>> {
-        if let Some(cached) = self.cache_read(hash) {
-            match verify(&cached) {
-                Ok(()) => return Ok(cached),
-                Err(_) => {
-                    tracing::warn!(
-                        target: "agentic-core::gcs_store",
-                        hash = %hash.to_hex(),
-                        "cached object failed integrity check; evicting and refetching from GCS",
-                    );
-                    // Evict the poisoned entry so `has`/subsequent reads
-                    // don't keep trusting it; ignore unlink errors (a
-                    // concurrent evictor or a since-deleted file is fine).
-                    let _ = fs::remove_file(self.cache_path(hash));
+fn fetch_checked(&self, hash: &Hash, verify: impl Fn(&[u8]) -> Result<()>) -> Result<Vec<u8>> {
+        let cache_path = self.cache_path(hash);
+        if cache_path.exists() {
+            match self.cache_read(hash) {
+                Some(cached) => match verify(&cached) {
+                    Ok(()) => return Ok(cached),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "agentic-core::gcs_store",
+                            hash = %hash.to_hex(),
+                            error = %err,
+                            "cached object failed integrity check; evicting and refetching from GCS",
+                        );
+                        // Evict the poisoned entry so `has`/subsequent reads don't keep trusting it.
+                        let _ = fs::remove_file(&cache_path);
+                    }
+                },
+                None => {
+                    // Cache file exists but is unreadable/corrupt (e.g. torn write or zstd decode failure).
+                    // Evict so `has` stays consistent and future reads can heal from GCS.
+                    let _ = fs::remove_file(&cache_path);
                 }
             }
         }
