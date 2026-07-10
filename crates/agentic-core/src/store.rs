@@ -18,6 +18,27 @@ use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Fail if `computed` doesn't match the content address `declared`.
+///
+/// The single chokepoint for the content-addressed integrity guarantee.
+/// Every read path — `get` (typed, `computed = object.hash()`) and
+/// `get_raw` (raw, `computed = Hash::of(bytes)`) across both store
+/// backends — routes its check through here so a corrupted-at-rest object
+/// can never be returned or parsed. Prior to the 2026-07-09 audit
+/// (finding #3) `get_raw` skipped this entirely, so restore and manifest
+/// reads trusted bytes a bad disk, poisoned cache, or bucket writer could
+/// have altered while keeping the object key — silently falsifying the
+/// "atomic rollback is honest" guarantee.
+pub(crate) fn check_integrity(declared: &Hash, computed: Hash) -> Result<()> {
+    if &computed != declared {
+        return Err(Error::IntegrityError {
+            declared: *declared,
+            computed,
+        });
+    }
+    Ok(())
+}
+
 /// The store contract. MVP implementer is `FsObjectStore`; future
 /// implementers include S3, GCS, and a network-replicated store.
 pub trait ObjectStore: Send + Sync {
@@ -138,13 +159,7 @@ impl ObjectStore for FsObjectStore {
         let object: Object = serde_json::from_slice(&bytes)?;
 
         // Integrity check: did we get back what the address says we should?
-        let computed = object.hash();
-        if &computed != hash {
-            return Err(Error::IntegrityError {
-                declared: *hash,
-                computed,
-            });
-        }
+        check_integrity(hash, object.hash())?;
         Ok(object)
     }
 
@@ -153,7 +168,12 @@ impl ObjectStore for FsObjectStore {
         if !path.exists() {
             return Err(Error::NotFound(*hash));
         }
-        self.read_at(&path)
+        let bytes = self.read_at(&path)?;
+        // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
+        // contract). Verify before returning so a tampered segment or
+        // manifest on disk is rejected, not parsed. Audit finding #3.
+        check_integrity(hash, Hash::of(&bytes))?;
+        Ok(bytes)
     }
 
     fn has(&self, hash: &Hash) -> bool {
@@ -292,6 +312,43 @@ mod tests {
             }
             other => panic!("expected SecretDetected (HighEntropy), got {other:?}"),
         }
+    }
+
+    // Audit finding #3: a raw object (segment/manifest) tampered with on
+    // disk while keeping its object key must be rejected on get_raw, not
+    // returned for parsing.
+    #[test]
+    fn get_raw_rejects_tampered_object_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let hash = store
+            .put_raw(ObjectKind::Segment, b"canonical segment bytes")
+            .unwrap();
+
+        // Overwrite the stored object with different bytes at the same
+        // path (same content address) — the exact shape of a corrupted
+        // disk or a store writer that altered an object in place.
+        let path = store.path_for(&hash);
+        store.write_at(&path, b"tampered bytes").unwrap();
+
+        match store.get_raw(&hash) {
+            Err(Error::IntegrityError { declared, computed }) => {
+                assert_eq!(declared, hash);
+                assert_eq!(computed, Hash::of(b"tampered bytes"));
+                assert_ne!(computed, declared);
+            }
+            other => panic!("expected IntegrityError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_raw_returns_untampered_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let hash = store
+            .put_raw(ObjectKind::Segment, b"canonical segment bytes")
+            .unwrap();
+        assert_eq!(store.get_raw(&hash).unwrap(), b"canonical segment bytes");
     }
 
     #[test]

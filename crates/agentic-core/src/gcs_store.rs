@@ -37,14 +37,14 @@
 //! and read-through hits the local cache after the first call.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
 use crate::scanner::{Allowlist, Scanner};
-use crate::store::ObjectStore;
+use crate::store::{check_integrity, ObjectStore};
 use crate::{Error, Result};
 
 /// Default upstream — GCS's public JSON API host.
@@ -252,6 +252,90 @@ impl GcsObjectStore {
         Ok(Some((bytes, compressed)))
     }
 
+    /// Fetch the bytes for `hash` and map them to `T`, where `map` also
+    /// performs the integrity check as it maps.
+    ///
+    /// The check differs by caller — `get_raw` verifies `Hash::of(bytes)`
+    /// and returns the bytes; `get` parses the typed object and verifies
+    /// `object.hash()`, returning the object — so it's injected as a
+    /// closure that owns the bytes (no separate verify pass, no double
+    /// parse for `get`). Three integrity properties hold regardless of
+    /// scheme (2026-07-09 audit finding #3):
+    ///
+    /// * A **poisoned cache hit** (bytes that fail the check) is evicted
+    ///   and we fall through to GCS, which may still hold the intact
+    ///   object — a merely-corrupted local cache self-heals.
+    /// * An **unreadable cache file** (torn write / zstd decode failure,
+    ///   so `cache_read` returns `None`) is likewise evicted, so `has`
+    ///   stays consistent and future reads can heal.
+    /// * A **corrupt download** is rejected *before* `cache_write`, so a
+    ///   bad object is never written to the local cache ("never cache a
+    ///   failed verification").
+    fn fetch_map<T>(&self, hash: &Hash, map: impl Fn(Vec<u8>) -> Result<T>) -> Result<T> {
+        let cache_path = self.cache_path(hash);
+        if cache_path.exists() {
+            match self.cache_read(hash) {
+                Some(cached) => match map(cached) {
+                    Ok(value) => return Ok(value),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "agentic-core::gcs_store",
+                            hash = %hash.to_hex(),
+                            error = %err,
+                            "cached object failed integrity check; evicting and refetching from GCS",
+                        );
+                        // Evict the poisoned entry so `has`/subsequent reads
+                        // don't keep trusting it.
+                        self.evict_cache_entry(hash, &cache_path);
+                    }
+                },
+                None => {
+                    // Cache file exists but is unreadable/corrupt (e.g. torn
+                    // write or zstd decode failure). Evict so `has` stays
+                    // consistent and future reads can heal from GCS.
+                    self.evict_cache_entry(hash, &cache_path);
+                }
+            }
+        }
+        match self.download_compressed(hash)? {
+            None => Err(Error::NotFound(*hash)),
+            Some((bytes, compressed)) => {
+                // Map (which verifies) BEFORE caching: a corrupt GCS object
+                // must not be persisted to the local cache.
+                let value = map(bytes)?;
+                let _ = self.cache_write_compressed(hash, &compressed);
+                Ok(value)
+            }
+        }
+    }
+
+    /// Best-effort eviction of a corrupt or poisoned cache entry. Removes
+    /// it as a file, falling back to directory removal if the cache path
+    /// was corrupted into a directory (which `remove_file` can't unlink).
+    /// A failure other than "already gone" is logged — an un-evictable
+    /// entry keeps `has()` reporting `true` while every read refetches, so
+    /// it must be diagnosable rather than silently swallowed. Mirrors the
+    /// unlink-logging discipline of the put-rollback path above.
+    fn evict_cache_entry(&self, hash: &Hash, cache_path: &Path) {
+        match fs::remove_file(cache_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(file_err) => {
+                if cache_path.is_dir() && fs::remove_dir_all(cache_path).is_ok() {
+                    return;
+                }
+                tracing::warn!(
+                    target: "agentic-core::gcs_store",
+                    hash = %hash.to_hex(),
+                    error = %file_err,
+                    path = %cache_path.display(),
+                    "failed to evict corrupt/poisoned cache entry; has() may stay \
+                     inconsistent and reads will keep refetching from GCS",
+                );
+            }
+        }
+    }
+
     fn remote_exists(&self, hash: &Hash) -> bool {
         let name = self.object_name(hash);
         let url = self.metadata_url(&name);
@@ -343,31 +427,23 @@ impl ObjectStore for GcsObjectStore {
     }
 
     fn get(&self, hash: &Hash) -> Result<Object> {
-        let bytes = self.get_raw(hash)?;
-        let object: Object = serde_json::from_slice(&bytes)?;
-        let computed = object.hash();
-        if &computed != hash {
-            return Err(Error::IntegrityError {
-                declared: *hash,
-                computed,
-            });
-        }
-        Ok(object)
+        // Typed objects are addressed by `object.hash()`. Parse once inside
+        // the map closure and verify that hash — no second deserialize.
+        self.fetch_map(hash, |bytes| {
+            let object: Object = serde_json::from_slice(&bytes)?;
+            check_integrity(hash, object.hash())?;
+            Ok(object)
+        })
     }
 
     fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
-        if let Some(cached) = self.cache_read(hash) {
-            return Ok(cached);
-        }
-        match self.download_compressed(hash)? {
-            None => Err(Error::NotFound(*hash)),
-            Some((bytes, compressed)) => {
-                // Best-effort cache fill; a write failure here doesn't
-                // affect correctness.
-                let _ = self.cache_write_compressed(hash, &compressed);
-                Ok(bytes)
-            }
-        }
+        // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
+        // contract) — verify against that, then return the bytes
+        // unchanged (zero-copy: `bytes` moves out). Audit finding #3.
+        self.fetch_map(hash, |bytes| {
+            check_integrity(hash, Hash::of(&bytes))?;
+            Ok(bytes)
+        })
     }
 
     fn has(&self, hash: &Hash) -> bool {
@@ -484,5 +560,87 @@ mod tests {
         store.cache_write_compressed(&h, &compressed).unwrap();
         let got = store.cache_read(&h).unwrap();
         assert_eq!(got, payload);
+    }
+
+    // Audit finding #3: a poisoned local cache entry (bytes that don't
+    // match their content address) must never be returned. It is evicted
+    // and the read falls through to GCS. Here the fake endpoint refuses
+    // the connection, so the fall-through fails — the point of the test
+    // is that get_raw does NOT return the poisoned bytes, and that the
+    // bad entry is gone afterwards. Deterministic, no server needed.
+    #[test]
+    fn cache_hit_poisoned_is_evicted_and_not_returned() {
+        let dir = tempdir().unwrap();
+        // Reserve a loopback port then drop the listener so connects to it
+        // get an immediate, deterministic ECONNREFUSED — more robust than
+        // assuming a fixed low port (e.g. :1) happens to be closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            Some(format!("http://{closed_addr}")),
+            None,
+        )
+        .unwrap();
+
+        // Address is Hash::of(good), but we plant Hash-mismatched bytes at
+        // that cache slot — the shape of a corrupted local cache/disk.
+        let good = b"the canonical bytes";
+        let hash = Hash::of(good);
+        let poison = zstd::stream::encode_all(&b"tampered!!"[..], 3).unwrap();
+        store.cache_write_compressed(&hash, &poison).unwrap();
+        assert!(store.cache_path(&hash).exists());
+
+        let result = store.get_raw(&hash);
+        // Never returns the poison. (The fall-through GCS fetch errors
+        // because nothing is listening — that's fine; not-returning-poison
+        // is the property under test.)
+        if let Ok(bytes) = &result {
+            assert_ne!(
+                bytes.as_slice(),
+                b"tampered!!",
+                "poisoned cache bytes must never be returned"
+            );
+        }
+        assert!(result.is_err(), "no server to heal from, so read errors");
+        assert!(
+            !store.cache_path(&hash).exists(),
+            "poisoned cache entry must be evicted"
+        );
+    }
+
+    // A cache path corrupted into a directory can't be unlinked with
+    // remove_file; evict_cache_entry must fall back to directory removal so
+    // an un-evictable entry doesn't keep `has()` inconsistent forever.
+    #[test]
+    fn cache_entry_corrupted_into_directory_is_evicted() {
+        let dir = tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            Some(format!("http://{closed_addr}")),
+            None,
+        )
+        .unwrap();
+
+        // Corrupt the cache slot into a directory (unreadable as a file, so
+        // cache_read returns None → the eviction path runs).
+        let hash = Hash::of(b"anything");
+        let cache_path = store.cache_path(&hash);
+        std::fs::create_dir_all(&cache_path).unwrap();
+        assert!(cache_path.is_dir());
+
+        let _ = store.get_raw(&hash);
+        assert!(
+            !cache_path.exists(),
+            "a cache entry corrupted into a directory must still be evicted"
+        );
     }
 }
