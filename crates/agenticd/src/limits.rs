@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Tunable limits, one field per CLI flag. Static per process — reload
 /// means bouncing the daemon, same as the ADR-0013 scanner allowlist.
@@ -159,6 +159,53 @@ impl Drop for ConnGuard {
     }
 }
 
+struct Bucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Per-UID token bucket. `try_consume` takes `now` as a parameter so
+/// tests drive the clock with plain `Instant` arithmetic — no mock
+/// clock machinery, no sleeps in unit tests.
+pub struct RateLimiter {
+    rate_per_sec: f64,
+    burst: f64,
+    buckets: Mutex<HashMap<u32, Bucket>>,
+}
+
+impl RateLimiter {
+    /// Burst capacity is fixed at 2× the sustained rate (spec §flags).
+    pub fn new(rate_per_uid: u32) -> Self {
+        let rate = f64::from(rate_per_uid);
+        Self {
+            rate_per_sec: rate,
+            burst: rate * 2.0,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take one token from `uid`'s bucket. Returns false when the
+    /// budget is exhausted. A new UID starts with a full burst.
+    pub fn try_consume(&self, uid: u32, now: Instant) -> bool {
+        // INVARIANT: only arithmetic under this lock; no panic path,
+        // so poisoning is unreachable in practice.
+        let mut buckets = self.buckets.lock().expect("RateLimiter mutex poisoned");
+        let b = buckets.entry(uid).or_insert(Bucket {
+            tokens: self.burst,
+            last_refill: now,
+        });
+        let elapsed = now.saturating_duration_since(b.last_refill).as_secs_f64();
+        b.tokens = (b.tokens + elapsed * self.rate_per_sec).min(self.burst);
+        b.last_refill = now;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +320,41 @@ mod tests {
         // Internal check: the per-UID map must not leak an entry per
         // ever-seen UID.
         assert!(gate.counts.lock().expect("gate mutex").per_uid.is_empty());
+    }
+
+    #[test]
+    fn burst_then_exhaustion_then_refill() {
+        let rl = RateLimiter::new(1); // 1 req/s, burst 2
+        let t0 = Instant::now();
+        assert!(rl.try_consume(1000, t0));
+        assert!(rl.try_consume(1000, t0));
+        assert!(!rl.try_consume(1000, t0), "burst of 2 must be exhausted");
+        let t1 = t0 + Duration::from_millis(1100);
+        assert!(rl.try_consume(1000, t1), "1.1s at 1/s refills >= 1 token");
+        assert!(!rl.try_consume(1000, t1), "only ~1.1 tokens refilled");
+    }
+
+    #[test]
+    fn buckets_are_per_uid() {
+        let rl = RateLimiter::new(1);
+        let t0 = Instant::now();
+        assert!(rl.try_consume(1, t0));
+        assert!(rl.try_consume(1, t0));
+        assert!(!rl.try_consume(1, t0));
+        assert!(rl.try_consume(2, t0), "uid 2 has its own bucket");
+    }
+
+    #[test]
+    fn refill_caps_at_burst() {
+        let rl = RateLimiter::new(1); // burst 2
+        let t0 = Instant::now();
+        assert!(rl.try_consume(1, t0));
+        let t1 = t0 + Duration::from_secs(100);
+        assert!(rl.try_consume(1, t1));
+        assert!(rl.try_consume(1, t1));
+        assert!(
+            !rl.try_consume(1, t1),
+            "100s idle must refill to burst (2), not accumulate 100 tokens"
+        );
     }
 }
