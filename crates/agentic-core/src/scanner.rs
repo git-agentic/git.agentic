@@ -10,6 +10,17 @@ use std::collections::BTreeSet;
 const ENTROPY_THRESHOLD: f64 = 4.5;
 const MIN_RUN_LENGTH: usize = 20;
 
+/// Per-call scanning policy (ADR-0017).
+///
+/// `skip_entropy` disables ONLY the Shannon-entropy heuristic — used by
+/// commit staging for declared checkpoint-path blobs, where encoded
+/// payloads make entropy hits 100% false positives. Pattern rules always
+/// run regardless of policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanPolicy {
+    pub skip_entropy: bool,
+}
+
 /// Bytes considered part of the base64-ish alphabet for entropy scanning.
 fn is_base64ish(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-')
@@ -123,6 +134,20 @@ impl Scanner {
 
     /// Returns the list of hits found in `bytes`. Empty Vec means clean.
     pub fn scan(&self, bytes: &[u8]) -> Vec<Hit> {
+        self.scan_with(bytes, ScanPolicy::default())
+    }
+
+    /// Returns the list of hits found in `bytes` according to the provided policy.
+    /// Empty Vec means clean.
+    pub fn scan_with(&self, bytes: &[u8], policy: ScanPolicy) -> Vec<Hit> {
+        let mut hits = self.scan_impl(bytes);
+        if policy.skip_entropy {
+            hits.retain(|h| h.kind != HitKind::HighEntropy);
+        }
+        hits
+    }
+
+    fn scan_impl(&self, bytes: &[u8]) -> Vec<Hit> {
         let mut hits = Vec::new();
 
         // Patterns
@@ -399,5 +424,42 @@ mod tests {
         let al = Allowlist::from_toml(&toml_text).unwrap();
         assert!(al.contains(&h_a));
         assert!(!al.contains(&h_b));
+    }
+
+    #[test]
+    fn scan_with_skip_entropy_suppresses_only_entropy_hits() {
+        let s = Scanner::new();
+        // Contains BOTH a pattern hit (AWS key) and a high-entropy base64 run.
+        let blob = b"AKIAIOSFODNN7EXAMPLE data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+
+        let full = s.scan(blob);
+        assert!(
+            full.iter().any(|h| h.kind == HitKind::HighEntropy),
+            "sanity: full scan must contain an entropy hit; got {full:?}"
+        );
+        assert!(
+            full.iter()
+                .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "aws_access_key_id")),
+            "sanity: full scan must contain the AWS pattern hit; got {full:?}"
+        );
+
+        let skipped = s.scan_with(blob, ScanPolicy { skip_entropy: true });
+        assert!(
+            skipped.iter().all(|h| h.kind != HitKind::HighEntropy),
+            "skip_entropy must suppress every entropy hit; got {skipped:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|h| matches!(&h.kind, HitKind::Pattern(n) if n == "aws_access_key_id")),
+            "pattern rules must still run under skip_entropy; got {skipped:?}"
+        );
+    }
+
+    #[test]
+    fn scan_with_default_policy_equals_scan() {
+        let s = Scanner::new();
+        let blob = b"AKIAIOSFODNN7EXAMPLE data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+        assert_eq!(s.scan(blob), s.scan_with(blob, ScanPolicy::default()));
     }
 }
