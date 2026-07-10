@@ -31,7 +31,16 @@ pub fn resolve_repo(explicit: Option<&str>) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Daemon socket path: the `AGENTIC_SOCKET` environment variable wins
+/// (matching the Python SDK and `run-demo.sh`, which bind under /tmp
+/// because nested repo paths overflow SUN_LEN); otherwise the repo
+/// default `<repo>/.agentic/agenticd.sock`.
 pub fn socket_path(repo: &Path) -> PathBuf {
+    if let Some(p) = std::env::var_os("AGENTIC_SOCKET") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     repo.join(".agentic").join("agenticd.sock")
 }
 
@@ -65,4 +74,33 @@ fn new_correlation_id() -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     format!("cli-{pid}-{n}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Both assertions live in one test: AGENTIC_SOCKET is process-global
+    // state and separate parallel tests would race on it.
+    #[test]
+    fn socket_path_honors_agentic_socket_env() {
+        let saved = std::env::var_os("AGENTIC_SOCKET");
+
+        std::env::set_var("AGENTIC_SOCKET", "/tmp/short.sock");
+        assert_eq!(
+            socket_path(Path::new("/some/repo")),
+            PathBuf::from("/tmp/short.sock")
+        );
+
+        std::env::remove_var("AGENTIC_SOCKET");
+        assert_eq!(
+            socket_path(Path::new("/some/repo")),
+            Path::new("/some/repo/.agentic/agenticd.sock")
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AGENTIC_SOCKET", v),
+            None => std::env::remove_var("AGENTIC_SOCKET"),
+        }
+    }
 }

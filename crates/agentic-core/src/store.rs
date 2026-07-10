@@ -12,7 +12,7 @@
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
-use crate::scanner::{Allowlist, Scanner};
+use crate::scanner::{Allowlist, ScanPolicy, Scanner};
 use crate::{Error, Result};
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,14 @@ pub(crate) fn check_integrity(declared: &Hash, computed: Hash) -> Result<()> {
 /// The store contract. MVP implementer is `FsObjectStore`; future
 /// implementers include S3, GCS, and a network-replicated store.
 pub trait ObjectStore: Send + Sync {
-    fn put(&self, object: &Object) -> Result<Hash>;
+    /// `put` with a per-call scan policy (ADR-0017). Policy only affects
+    /// `Object::Blob` — Trees and Commits are never scanned.
+    fn put_with_policy(&self, object: &Object, policy: ScanPolicy) -> Result<Hash>;
+
+    fn put(&self, object: &Object) -> Result<Hash> {
+        self.put_with_policy(object, ScanPolicy::default())
+    }
+
     fn put_raw(&self, kind: ObjectKind, bytes: &[u8]) -> Result<Hash>;
     fn get(&self, hash: &Hash) -> Result<Object>;
     /// Read the raw uncompressed bytes that were originally `put_raw`'d.
@@ -103,7 +110,7 @@ impl FsObjectStore {
 }
 
 impl ObjectStore for FsObjectStore {
-    fn put(&self, object: &Object) -> Result<Hash> {
+    fn put_with_policy(&self, object: &Object, policy: ScanPolicy) -> Result<Hash> {
         // Scanner pre-hook (ADR-0013). Every user-controlled blob
         // (prompts, tools, model, intent, plan, transcript, evals) is
         // staged via `store.put(&Object::Blob(..))`, so the scanner
@@ -111,7 +118,7 @@ impl ObjectStore for FsObjectStore {
         // contain hashes + metadata, not user data, so they are
         // skipped.
         if let Object::Blob(blob) = object {
-            let hits = self.scanner.scan(&blob.bytes);
+            let hits = self.scanner.scan_with(&blob.bytes, policy);
             if !hits.is_empty() {
                 let h = object.hash();
                 if !self.allowlist.contains(&h) {
@@ -361,5 +368,34 @@ mod tests {
             .expect("clean blob should put");
         assert_eq!(h, Hash::of(blob));
         assert!(store.has(&h));
+    }
+
+    #[test]
+    fn put_with_policy_skip_entropy_accepts_high_entropy_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let bytes = b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi".to_vec();
+        let obj = Object::Blob(Blob::new(bytes));
+        let hash = store
+            .put_with_policy(&obj, crate::scanner::ScanPolicy { skip_entropy: true })
+            .expect("entropy-exempt blob must be accepted");
+        assert!(store.has(&hash));
+    }
+
+    #[test]
+    fn put_with_policy_skip_entropy_still_rejects_pattern_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let bytes = b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec();
+        let obj = Object::Blob(Blob::new(bytes));
+        match store.put_with_policy(&obj, crate::scanner::ScanPolicy { skip_entropy: true }) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected, got {other:?}"),
+        }
     }
 }

@@ -29,23 +29,31 @@ COMPOSE_FILE="${DEMO_DIR}/docker-compose.yml"
 
 DATABASE_URL_BASE="postgres://agentic:agentic@localhost:54322/agentic"
 export DATABASE_URL="${DATABASE_URL_BASE}"
-export AGENTIC_SOCKET="${DEMO_DIR}/.agentic/agenticd.sock"
+# Unix socket paths are capped at ~104 bytes on macOS (SUN_LEN); a
+# checkout nested under .worktrees/ overflows that. Bind under /tmp.
+SOCKET_DIR="$(mktemp -d /tmp/agentic-demo.XXXXXX)"
+export AGENTIC_SOCKET="${SOCKET_DIR}/agenticd.sock"
 AGENTICD_BIN="${REPO_ROOT}/target/release/agenticd"
 AGENTIC_BIN="${REPO_ROOT}/target/release/agentic"
 
 # Container runtime selection. The README advertises "podman OR docker";
-# pick whichever is present. Both speak compose-file v3 well enough for
-# the demo's needs.
-if command -v podman >/dev/null 2>&1; then
-    CONTAINER_RUNTIME=podman
-elif command -v docker >/dev/null 2>&1; then
-    CONTAINER_RUNTIME=docker
-else
-    echo "error: neither podman nor docker found on PATH" >&2
-    exit 1
+# pick whichever is present, or set CONTAINER_RUNTIME=docker|podman to
+# override — presence alone can lie (GitHub's ubuntu runners ship a
+# podman binary whose compose path needs a podman API socket that is
+# not running, so `podman compose up` fails there).
+if [[ -z "${CONTAINER_RUNTIME:-}" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+        CONTAINER_RUNTIME=podman
+    elif command -v docker >/dev/null 2>&1; then
+        CONTAINER_RUNTIME=docker
+    else
+        echo "error: neither podman nor docker found on PATH" >&2
+        exit 1
+    fi
 fi
 compose() { "${CONTAINER_RUNTIME}" compose "$@"; }
 container_run() { "${CONTAINER_RUNTIME}" "$@"; }
+step() { printf "\n=== %s ===\n" "$*"; }
 
 DAEMON_PID=""
 cleanup() {
@@ -53,10 +61,20 @@ cleanup() {
         kill "${DAEMON_PID}" 2>/dev/null || true
     fi
     compose -f "${COMPOSE_FILE}" down -v >/dev/null 2>&1 || true
+    rm -rf "${SOCKET_DIR}"
 }
 trap cleanup EXIT INT TERM
 
-step() { printf "\n=== %s ===\n" "$*"; }
+step "0. python environment (venv + SDK deps)"
+VENV_DIR="${DEMO_DIR}/.venv"
+if ! "${VENV_DIR}/bin/python" -c "import agentic, langgraph, psycopg" >/dev/null 2>&1; then
+    echo "creating ${VENV_DIR} and installing the agentic SDK (+langgraph, psycopg)..."
+    python3 -m venv "${VENV_DIR}"
+    "${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+    "${VENV_DIR}/bin/pip" install --quiet -e "${REPO_ROOT}/sdk/python[langgraph]" "psycopg[binary]>=3.1" \
+        || { echo "error: pip install of demo deps failed; retry with: ${VENV_DIR}/bin/pip install -e '${REPO_ROOT}/sdk/python[langgraph]' 'psycopg[binary]>=3.1'" >&2; exit 1; }
+fi
+export PYTHON="${VENV_DIR}/bin/python"
 
 step "1. starting Postgres + pgvector (${CONTAINER_RUNTIME})"
 compose -f "${COMPOSE_FILE}" up -d >/dev/null
@@ -78,6 +96,9 @@ fi
 step "2. seeding episodes (baseline state)"
 # Restore baseline prompt in case a prior run left the bad one in place.
 git -C "${REPO_ROOT}" checkout -- "examples/langgraph-rollback/prompts/system.txt" 2>/dev/null || true
+# Stale checkpoint envelopes from prior (possibly failed) runs would be
+# swept into the baseline commit by read_prompt_dir; start clean.
+rm -rf "${DEMO_DIR}/prompts/__langgraph__"
 psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -f "${DEMO_DIR}/seed.sql" >/dev/null
 
 step "3. building + starting agenticd"
@@ -85,6 +106,7 @@ step "3. building + starting agenticd"
 rm -rf "${DEMO_DIR}/.agentic"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" init >/dev/null
 "${AGENTICD_BIN}" --repo "${DEMO_DIR}" --postgres "${DATABASE_URL}" --tables episodes:id \
+    --socket "${AGENTIC_SOCKET}" \
     --insecure-allow-any-uid \
     > "${DEMO_DIR}/.agentic/daemon.log" 2>&1 &
 DAEMON_PID=$!

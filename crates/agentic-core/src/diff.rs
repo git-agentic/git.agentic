@@ -262,6 +262,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             peer_uid: None,
+            exempt_entropy_prefixes: Vec::new(),
         }
     }
 

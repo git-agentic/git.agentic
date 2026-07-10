@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
-use crate::scanner::{Allowlist, Scanner};
+use crate::scanner::{Allowlist, ScanPolicy, Scanner};
 use crate::store::{check_integrity, ObjectStore};
 use crate::{Error, Result};
 
@@ -347,14 +347,14 @@ impl GcsObjectStore {
 }
 
 impl ObjectStore for GcsObjectStore {
-    fn put(&self, object: &Object) -> Result<Hash> {
+    fn put_with_policy(&self, object: &Object, policy: ScanPolicy) -> Result<Hash> {
         // Scanner pre-hook (ADR-0013). Reject blobs containing secrets
         // BEFORE any compression / network I/O — by the time bytes
         // would hit GCS the secret has already left the daemon's
         // address space. Trees and Commits contain hashes + metadata,
         // not user data, so they are skipped.
         if let Object::Blob(blob) = object {
-            let hits = self.scanner.scan(&blob.bytes);
+            let hits = self.scanner.scan_with(&blob.bytes, policy);
             if !hits.is_empty() {
                 let h = object.hash();
                 if !self.allowlist.contains(&h) {

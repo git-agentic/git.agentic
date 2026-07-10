@@ -31,6 +31,33 @@ fn parse_tracked_tables(spec: &[String]) -> anyhow::Result<Vec<TrackedTable>> {
         .collect()
 }
 
+/// Validate ADR-0017 entropy-exempt prefixes. Each must be a relative,
+/// trimmed, directory-style prefix ("__langgraph__/"): the staging match
+/// is a raw `starts_with`, so a prefix without a trailing '/' would also
+/// exempt sibling paths like `__langgraph__x/…`, and untrimmed input
+/// would never match at all.
+fn validate_exempt_prefixes(prefixes: &[String]) -> anyhow::Result<()> {
+    for p in prefixes {
+        anyhow::ensure!(
+            !p.is_empty(),
+            "--scanner-exempt-entropy-prefix must not be empty"
+        );
+        anyhow::ensure!(
+            p.trim() == p,
+            "--scanner-exempt-entropy-prefix {p:?} must not contain leading/trailing whitespace"
+        );
+        anyhow::ensure!(
+            !p.starts_with('/'),
+            "--scanner-exempt-entropy-prefix {p:?} must be a relative prompt-tree prefix (no leading '/')"
+        );
+        anyhow::ensure!(
+            p.ends_with('/'),
+            "--scanner-exempt-entropy-prefix {p:?} must end with '/' — the match is a path-prefix match, and without the trailing '/' it would also exempt sibling paths (e.g. {p}x/...)"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "agenticd", version, about = "git.agentic daemon")]
 struct Args {
@@ -87,6 +114,12 @@ struct Args {
     /// invalid blob_hash entries are fatal.
     #[arg(long)]
     scanner_allowlist: Option<PathBuf>,
+
+    /// Prompt-tree path prefix whose blobs skip the scanner's entropy
+    /// heuristic (pattern rules still run). ADR-0017. Repeatable.
+    /// Default covers the LangGraph checkpointer's blob namespace.
+    #[arg(long = "scanner-exempt-entropy-prefix", default_values_t = vec!["__langgraph__/".to_string()])]
+    scanner_exempt_entropy_prefixes: Vec<String>,
 
     /// Path to the 32-byte operator approval key for destructive rollback
     /// (ADR-0014). Without it, every `accept_data_loss = true` rollback is
@@ -266,6 +299,10 @@ async fn main() -> anyhow::Result<()> {
         "scanner allowlist loaded"
     );
 
+    // ADR-0017: exempt prefixes are relative, trimmed, directory-style
+    // prompt-tree paths.
+    validate_exempt_prefixes(&args.scanner_exempt_entropy_prefixes)?;
+
     let store = ObjectStoreSpec::parse(&args.object_store, &agentic_dir)
         .context("parsing --object-store")?
         .open(allowlist)
@@ -318,7 +355,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?
         .with_approval_key(approval_key)
-        .with_limits(limits.clone()),
+        .with_limits(limits.clone())
+        .with_exempt_entropy_prefixes(args.scanner_exempt_entropy_prefixes.clone()),
     );
 
     let listener = UnixListener::bind(&socket_path)
@@ -473,4 +511,61 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("agenticd shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_exempt_prefixes;
+
+    #[test]
+    fn accepts_single_trailing_slash_prefix() {
+        validate_exempt_prefixes(&["__langgraph__/".to_string()])
+            .expect("well-formed relative prefix with trailing slash must validate");
+    }
+
+    #[test]
+    fn accepts_multiple_valid_prefixes() {
+        validate_exempt_prefixes(&["__langgraph__/".to_string(), "checkpoints/sub/".to_string()])
+            .expect("multiple well-formed prefixes must validate");
+    }
+
+    #[test]
+    fn rejects_empty_prefix() {
+        let err =
+            validate_exempt_prefixes(&[String::new()]).expect_err("empty prefix must be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn rejects_absolute_prefix() {
+        let err = validate_exempt_prefixes(&["/abs/".to_string()])
+            .expect_err("absolute prefix must be rejected");
+        assert!(err.to_string().contains("no leading '/'"));
+    }
+
+    #[test]
+    fn rejects_prefix_without_trailing_slash() {
+        // Without the trailing '/', staging's raw `name.starts_with(p)`
+        // would also exempt sibling paths like `__langgraph__x/...`.
+        let err = validate_exempt_prefixes(&["__langgraph__".to_string()])
+            .expect_err("prefix without trailing slash must be rejected");
+        assert!(err.to_string().contains("must end with '/'"));
+    }
+
+    #[test]
+    fn rejects_prefix_with_leading_whitespace() {
+        // Validation must match on the exact string used at staging time
+        // (raw, untrimmed `p`), or a prefix that passes startup checks
+        // could still never match anything in practice.
+        let err = validate_exempt_prefixes(&[" __langgraph__/".to_string()])
+            .expect_err("prefix with leading whitespace must be rejected");
+        assert!(err.to_string().contains("leading/trailing whitespace"));
+    }
+
+    #[test]
+    fn rejects_prefix_with_trailing_whitespace() {
+        let err = validate_exempt_prefixes(&["__langgraph__/ ".to_string()])
+            .expect_err("prefix with trailing whitespace must be rejected");
+        assert!(err.to_string().contains("leading/trailing whitespace"));
+    }
 }

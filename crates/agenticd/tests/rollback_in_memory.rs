@@ -82,6 +82,7 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
             agenticd::limits::LimitsConfig::default().commit_queue_depth,
         )),
         commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        exempt_entropy_prefixes: Vec::new(),
     });
 
     // Commit the baseline (schema_version "001_init", memory snapshot).
@@ -216,6 +217,7 @@ async fn setup_gate_state(
             agenticd::limits::LimitsConfig::default().commit_queue_depth,
         )),
         commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        exempt_entropy_prefixes: Vec::new(),
     };
     let state = if with_key {
         state.with_approval_key(Some(test_key()))
@@ -444,4 +446,82 @@ async fn gate_accepts_valid_token_and_rollback_proceeds() {
         "001_init",
         "schema reversed to the target after an approved destructive rollback"
     );
+}
+
+// ADR-0017: rollback forward-records by re-staging the target commit's
+// prompt blobs. A baseline containing a high-entropy checkpoint blob
+// under an exempt prefix must therefore roll back cleanly — without the
+// exemption threading, the scanner rejects the rollback commit itself.
+#[tokio::test]
+async fn rollback_restages_exempt_checkpoint_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().to_path_buf();
+    let agentic_dir = repo_root.join(".agentic");
+    std::fs::create_dir_all(agentic_dir.join("objects")).unwrap();
+
+    let store: Arc<dyn ObjectStore + Send + Sync> =
+        Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+    let refs = Refs::open(&agentic_dir).unwrap();
+
+    let state = Arc::new(DaemonState {
+        repo_root: repo_root.clone(),
+        store: Arc::clone(&store),
+        refs,
+        commit_lock: Arc::new(Mutex::new(())),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        memory: None,
+        mcp_servers: Vec::new(),
+        http: reqwest::Client::builder()
+            .user_agent("agenticd-test")
+            .build()
+            .unwrap(),
+        peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        approval_key: None,
+        limits: agenticd::limits::LimitsConfig::default(),
+        rate: agenticd::limits::RateLimiter::new(
+            agenticd::limits::LimitsConfig::default().rate_per_uid,
+        ),
+        commit_slots: Arc::new(tokio::sync::Semaphore::new(
+            agenticd::limits::LimitsConfig::default().commit_queue_depth,
+        )),
+        commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        exempt_entropy_prefixes: vec!["__langgraph__/".to_string()],
+    });
+
+    // Baseline commit carrying a high-entropy checkpoint blob.
+    let mut baseline_input = commit_input_no_memory("baseline with checkpoint");
+    baseline_input.prompts.insert(
+        "__langgraph__/abc123/checkpoint.json".to_string(),
+        b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi".to_vec(),
+    );
+    let baseline = commit::execute(Arc::clone(&state), baseline_input, None)
+        .await
+        .expect("baseline with exempt checkpoint blob must commit");
+
+    // Second commit so rollback has somewhere to come back from.
+    commit::execute(Arc::clone(&state), commit_input_no_memory("second"), None)
+        .await
+        .expect("second commit");
+
+    // Roll back to the baseline: re-stages the checkpoint blob.
+    let out = rollback::execute(
+        Arc::clone(&state),
+        RollbackArgs {
+            target: baseline.commit_hash.clone(),
+            dry_run: false,
+            accept_data_loss: false,
+            approval_token: None,
+            repo: repo_root,
+        },
+        None,
+    )
+    .await
+    .expect("rollback across an exempt checkpoint blob must succeed");
+    assert!(out.executed);
+}
+
+fn commit_input_no_memory(message: &str) -> CommitInput {
+    let mut input = commit_input_with_memory(message);
+    input.no_memory = true;
+    input
 }
