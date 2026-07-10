@@ -178,6 +178,31 @@ impl TestDb {
     /// (pg13+) terminates the adapter's still-open pool/poller sessions
     /// so the drop can't hang on them.
     async fn drop(self) {
+        // The adapter's init() may have bound the cluster-scoped logical
+        // replication slot (constant name `agentic_slot`) to this
+        // database — the first test on a fresh cluster wins the create,
+        // and the slot-name lookup is a cluster-wide view, so later
+        // tests don't recreate it. On the pg16 fixture/CI image this
+        // repo pins, `DROP DATABASE` already reclaims a database's own
+        // bound slots as part of the drop (verified empirically: PG15+
+        // behavior). This is defensive portability insurance in case
+        // that ever changes (older Postgres, or a managed Postgres
+        // without auto-slot-cleanup on drop) — logical slots must be
+        // dropped from within their own database, and DROP DATABASE
+        // would otherwise refuse while a slot belongs to the target.
+        // Best-effort like the rest of teardown; an ACTIVE slot can
+        // also refuse to drop, but the poller doesn't hold this slot
+        // active in this suite.
+        if let Ok(conn) = PgPool::connect(&self.url).await {
+            let _ = conn
+                .execute(
+                    "SELECT pg_drop_replication_slot(slot_name) \
+                     FROM pg_replication_slots WHERE database = current_database()",
+                )
+                .await;
+            conn.close().await;
+        }
+
         let _ = self
             .maint_pool
             .execute(format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name).as_str())
@@ -462,12 +487,10 @@ async fn ac1_writes_during_restore_are_reverted() {
 // `#[ignore]` so default `cargo test` skips it; run explicitly:
 //
 //   docker compose -f examples/langgraph-rollback/docker-compose.yml up -d
-//   docker exec agentic-demo-pg psql -U agentic -d agentic \
-//       -c "CREATE EXTENSION IF NOT EXISTS vector"
 //   DATABASE_URL=postgres://agentic:agentic@localhost:54322/agentic \
 //   BENCH_ROWS=1000000 \
 //       cargo test -p agentic-memory --test integration -- \
-//       --ignored --test-threads=1 --nocapture pg_snapshot_perf_smoke
+//       --ignored --nocapture pg_snapshot_perf_smoke
 //
 // Defaults `BENCH_ROWS=10000` so first-time runs finish in seconds. Larger
 // values trade time for fidelity to the §9-shaped 1M-row claim. Numbers
@@ -1312,10 +1335,10 @@ async fn schema_qualified_tracked_table_routes_events() {
     );
     let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
     adapter.init().await.unwrap();
-    // Clear any prior-test residue so the snapshot's strict drain
-    // sees only the rows this test produced. Must run after init(),
-    // which creates public.agentic_change_log — in a per-test
-    // database that table doesn't exist until init() creates it.
+    // Must run after init(), which creates public.agentic_change_log —
+    // in a per-test database that table doesn't exist before init()
+    // installs the triggers. Guarantees the snapshot's strict drain
+    // sees only rows this test produced.
     admin_pool
         .execute("TRUNCATE public.agentic_change_log")
         .await
