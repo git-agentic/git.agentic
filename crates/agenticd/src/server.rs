@@ -30,6 +30,17 @@ use crate::mcp::McpServerSpec;
 use crate::membackend::MemoryBackendSpec;
 use crate::peer_auth::PeerAuthPolicy;
 
+/// Read-idle deadline for a single inbound frame (2026-07-09 audit finding
+/// #5, carve-out). A connection that opens the socket and then never
+/// completes a frame — a slow-drip or forgotten peer — would otherwise pin
+/// a `spawn_local` task forever. The clock is per-frame: it resets on each
+/// successfully read frame, so a long-lived connection issuing requests
+/// within this window is unaffected. Generous by design — a legitimate but
+/// slow first frame must not trip it; a connection idle longer than this
+/// simply reconnects (cheap over a Unix socket). Tunable later; the broader
+/// connection/rate budgets are deferred to issue #118.
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
     /// Filesystem root of the repo (parent of `.agentic/`). Rollback uses
@@ -163,18 +174,48 @@ impl DaemonState {
 }
 
 /// Handle a single accepted connection. Runs the read/dispatch/write loop
-/// until the peer closes the socket.
+/// until the peer closes the socket or misses the read-idle deadline.
 pub async fn handle_connection(
     state: Arc<DaemonState>,
     sock: UnixStream,
     peer_uid: Option<u32>,
+) -> anyhow::Result<()> {
+    handle_connection_with_idle_timeout(state, sock, peer_uid, READ_IDLE_TIMEOUT).await
+}
+
+/// [`handle_connection`] with the read-idle deadline injected, so tests can
+/// exercise the timeout without waiting the production window.
+pub async fn handle_connection_with_idle_timeout(
+    state: Arc<DaemonState>,
+    sock: UnixStream,
+    peer_uid: Option<u32>,
+    read_idle: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
     let mut writer = tokio::io::BufWriter::new(write_half);
 
     loop {
-        let bytes = match read_frame_bytes(&mut reader).await {
+        // Bound the wait for the next complete frame. On elapse we can't
+        // send a structured reply (no correlation_id mid-frame), so we
+        // log-and-close — the same honest failure mode as the oversize
+        // arm below (ADR-0010 Decision 4).
+        let read = match tokio::time::timeout(read_idle, read_frame_bytes(&mut reader)).await {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "agenticd::framing",
+                    peer_uid = ?peer_uid,
+                    idle_timeout_secs = read_idle.as_secs(),
+                    "connection idle beyond read deadline; closing"
+                );
+                return Err(anyhow!(
+                    "connection idle beyond {}s read deadline; closing",
+                    read_idle.as_secs()
+                ));
+            }
+        };
+        let bytes = match read {
             Ok(Some(b)) => b,
             Ok(None) => return Ok(()),
             Err(FrameError::TooLarge(n)) => {
@@ -973,5 +1014,99 @@ mod tests {
             .await
             .unwrap();
         out.commit_hash.parse().unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // Audit finding #5 carve-out — read-idle timeout on the connection
+    // loop. A short injected deadline keeps the tests fast.
+    // -----------------------------------------------------------------
+
+    /// Build a minimal daemon state. Returns the `TempDir` too — the caller
+    /// keeps it alive for the test, and it cleans up on drop.
+    async fn minimal_state() -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
+        use agentic_core::{FsObjectStore, ObjectStore};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let agentic_dir = dir.path().join(".agentic");
+        std::fs::create_dir_all(&agentic_dir).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        let state = Arc::new(
+            DaemonState::open(
+                dir.path().to_path_buf(),
+                agentic_dir,
+                store,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+            )
+            .await
+            .unwrap(),
+        );
+        (state, dir)
+    }
+
+    /// A peer that connects and sends nothing is dropped once the read-idle
+    /// deadline elapses, instead of pinning the handler task forever. The
+    /// handler future isn't `Send` (the daemon drives it via `spawn_local`),
+    /// so we await it directly under an outer guard rather than `spawn`.
+    #[tokio::test]
+    async fn idle_connection_is_dropped_after_deadline() {
+        use std::time::Duration;
+        let (state, _dir) = minimal_state().await;
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let fut =
+            handle_connection_with_idle_timeout(state, server, None, Duration::from_millis(150));
+        // The client holds the socket open but sends nothing.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), fut)
+            .await
+            .expect("handler must return well before the outer 2s guard");
+        let err = outcome.expect_err("an idle connection must be closed with an error");
+        assert!(
+            format!("{err:#}").contains("idle"),
+            "error should name the idle deadline; got: {err:#}"
+        );
+        drop(client);
+    }
+
+    /// A peer sending complete frames spaced *within* the deadline is not
+    /// dropped: the clock resets per frame. A clean close returns Ok. Driven
+    /// on a `LocalSet` because the handler future isn't `Send`.
+    #[tokio::test]
+    async fn well_spaced_frames_are_not_dropped() {
+        use agentic_proto::framing::write_frame;
+        use agentic_proto::{Envelope, Request};
+        use std::time::Duration;
+
+        let (state, _dir) = minimal_state().await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let idle = Duration::from_millis(200);
+
+        let local = tokio::task::LocalSet::new();
+        let handle = local.spawn_local(handle_connection_with_idle_timeout(
+            state, server, None, idle,
+        ));
+        local
+            .run_until(async move {
+                // Two Pings, spaced 120ms apart — each gap is under the 200ms
+                // deadline, so the connection must survive both.
+                for i in 0..2 {
+                    let env = Envelope::new(format!("corr-{i}"), Request::Ping);
+                    write_frame(&mut client, &env).await.unwrap();
+                    // Drain the Pong so the server's write doesn't back up.
+                    let _reply = read_frame_bytes(&mut client).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                }
+                // Clean close: dropping the client ends the loop with Ok.
+                drop(client);
+                let outcome = handle.await.expect("handler task should not panic");
+                assert!(
+                    outcome.is_ok(),
+                    "well-spaced frames + clean close must not error; got: {outcome:?}"
+                );
+            })
+            .await;
     }
 }
