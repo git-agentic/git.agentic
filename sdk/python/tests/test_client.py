@@ -264,8 +264,11 @@ def test_commit_base64_encodes_prompts(short_tmp: Path):
 
 
 def test_request_timeout_raises_retryable_protocol_error(short_tmp: Path):
-    """A daemon that accepts but never replies must fail loudly within the
-    configured deadline instead of hanging forever (issue #124)."""
+    """A daemon that accepts but never replies must fail loudly instead of
+    hanging forever (issue #124). `request_timeout` is a per-operation idle
+    timeout, not a total deadline — with a fully silent peer (this handler
+    never sends a byte) the first `recv` idles out, so the failure lands
+    within one timeout interval."""
     sock_path = short_tmp / "stall.sock"
 
     def handler(conn: socket.socket) -> None:
@@ -282,7 +285,7 @@ def test_request_timeout_raises_retryable_protocol_error(short_tmp: Path):
 
     assert excinfo.value.code == "timeout"
     assert excinfo.value.retryable is True
-    assert elapsed < 0.9, f"must fail within the deadline, took {elapsed:.2f}s"
+    assert elapsed < 0.9, f"idle timeout must fire promptly, took {elapsed:.2f}s"
 
 
 def test_daemon_not_running_raises_protocol_error(short_tmp: Path):
