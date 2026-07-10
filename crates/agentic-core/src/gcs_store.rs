@@ -37,7 +37,7 @@
 //! and read-through hits the local cache after the first call.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -286,14 +286,14 @@ impl GcsObjectStore {
                         );
                         // Evict the poisoned entry so `has`/subsequent reads
                         // don't keep trusting it.
-                        let _ = fs::remove_file(&cache_path);
+                        self.evict_cache_entry(hash, &cache_path);
                     }
                 },
                 None => {
                     // Cache file exists but is unreadable/corrupt (e.g. torn
                     // write or zstd decode failure). Evict so `has` stays
                     // consistent and future reads can heal from GCS.
-                    let _ = fs::remove_file(&cache_path);
+                    self.evict_cache_entry(hash, &cache_path);
                 }
             }
         }
@@ -305,6 +305,33 @@ impl GcsObjectStore {
                 let value = map(bytes)?;
                 let _ = self.cache_write_compressed(hash, &compressed);
                 Ok(value)
+            }
+        }
+    }
+
+    /// Best-effort eviction of a corrupt or poisoned cache entry. Removes
+    /// it as a file, falling back to directory removal if the cache path
+    /// was corrupted into a directory (which `remove_file` can't unlink).
+    /// A failure other than "already gone" is logged — an un-evictable
+    /// entry keeps `has()` reporting `true` while every read refetches, so
+    /// it must be diagnosable rather than silently swallowed. Mirrors the
+    /// unlink-logging discipline of the put-rollback path above.
+    fn evict_cache_entry(&self, hash: &Hash, cache_path: &Path) {
+        match fs::remove_file(cache_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(file_err) => {
+                if cache_path.is_dir() && fs::remove_dir_all(cache_path).is_ok() {
+                    return;
+                }
+                tracing::warn!(
+                    target: "agentic-core::gcs_store",
+                    hash = %hash.to_hex(),
+                    error = %file_err,
+                    path = %cache_path.display(),
+                    "failed to evict corrupt/poisoned cache entry; has() may stay \
+                     inconsistent and reads will keep refetching from GCS",
+                );
             }
         }
     }
@@ -582,6 +609,38 @@ mod tests {
         assert!(
             !store.cache_path(&hash).exists(),
             "poisoned cache entry must be evicted"
+        );
+    }
+
+    // A cache path corrupted into a directory can't be unlinked with
+    // remove_file; evict_cache_entry must fall back to directory removal so
+    // an un-evictable entry doesn't keep `has()` inconsistent forever.
+    #[test]
+    fn cache_entry_corrupted_into_directory_is_evicted() {
+        let dir = tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let store = GcsObjectStore::new(
+            "test-bucket",
+            "p",
+            dir.path(),
+            Some(format!("http://{closed_addr}")),
+            None,
+        )
+        .unwrap();
+
+        // Corrupt the cache slot into a directory (unreadable as a file, so
+        // cache_read returns None → the eviction path runs).
+        let hash = Hash::of(b"anything");
+        let cache_path = store.cache_path(&hash);
+        std::fs::create_dir_all(&cache_path).unwrap();
+        assert!(cache_path.is_dir());
+
+        let _ = store.get_raw(&hash);
+        assert!(
+            !cache_path.exists(),
+            "a cache entry corrupted into a directory must still be evicted"
         );
     }
 }
