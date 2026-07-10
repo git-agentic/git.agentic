@@ -85,16 +85,113 @@ fn schema_scoped_url(base: &str, schema: &str) -> String {
     format!("{base}{sep}options=-csearch_path%3D{schema}%2Cpublic")
 }
 
+/// Serializes `CREATE DATABASE` statements across parallel tests.
+/// Postgres can reject concurrent creates from the same template
+/// ("source database is being accessed by other users"); the guard is
+/// held only for the CREATE, so tests themselves still run in parallel.
+static CREATE_DB_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Swap the database path segment of a Postgres URL. Expects the URL
+/// to carry a database name (both documented fixture URLs do).
+fn url_with_database(base: &str, db: &str) -> String {
+    let (core, query) = match base.split_once('?') {
+        Some((c, q)) => (c, Some(q)),
+        None => (base, None),
+    };
+    let idx = core
+        .rfind('/')
+        .expect("DATABASE_URL must include a database path");
+    let mut out = format!("{}/{db}", &core[..idx]);
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    out
+}
+
+/// A Postgres database owned by exactly one test.
+///
+/// The suite's shared-state flakiness (issue #100) came from resources
+/// that are *database*-scoped, not schema-scoped: the trigger capture
+/// log is pinned to `public.agentic_change_log` by product design, and
+/// the snapshot advisory-lock key is a constant whose lock space is
+/// per-database. One database per test isolates both without touching
+/// product code.
+struct TestDb {
+    name: String,
+    /// Connection URL for this test's database. Feed through
+    /// `schema_scoped_url` exactly like the old shared URL.
+    url: String,
+    /// Pool on the *maintenance* database (the original DATABASE_URL),
+    /// kept for teardown — a session can't drop the database it is
+    /// connected to.
+    maint_pool: PgPool,
+}
+
+impl TestDb {
+    /// `None` when DATABASE_URL is unset — callers keep the suite's
+    /// existing graceful-skip behavior.
+    async fn create(tag: &str) -> Option<TestDb> {
+        let base = database_url()?;
+        let maint_pool = PgPool::connect(&base)
+            .await
+            .expect("connect maintenance pool (is the pg.yml fixture up?)");
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("agentic_test_{nanos}_{tag}");
+        {
+            let _guard = CREATE_DB_LOCK.lock().await;
+            maint_pool
+                .execute(format!("CREATE DATABASE \"{name}\"").as_str())
+                .await
+                .expect("create per-test database");
+        }
+
+        let url = url_with_database(&base, &name);
+        // The adapter's init() validates pgvector but deliberately never
+        // installs it (needs superuser); the fixture's `agentic` user is
+        // the container superuser, so install it here — same division of
+        // labor as CI's "create pgvector extension" step.
+        let setup = PgPool::connect(&url)
+            .await
+            .expect("connect per-test database");
+        setup
+            .execute("CREATE EXTENSION IF NOT EXISTS vector")
+            .await
+            .expect("create vector extension in per-test database");
+        setup.close().await;
+
+        Some(TestDb {
+            name,
+            url,
+            maint_pool,
+        })
+    }
+
+    /// Best-effort teardown, mirroring `drop_schema`: a panicking test
+    /// leaks its database exactly as it leaks its schema today. FORCE
+    /// (pg13+) terminates the adapter's still-open pool/poller sessions
+    /// so the drop can't hang on them.
+    async fn drop(self) {
+        let _ = self
+            .maint_pool
+            .execute(format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name).as_str())
+            .await;
+        self.maint_pool.close().await;
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn bootstrap_produces_a_deterministic_manifest() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("bootstrap").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -131,6 +228,7 @@ async fn bootstrap_produces_a_deterministic_manifest() {
     assert_eq!(m1.manifest.entries[0].row_count, 5);
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 #[tokio::test]
