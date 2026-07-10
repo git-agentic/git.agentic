@@ -10,6 +10,7 @@
 
 pub mod commit;
 pub mod lifecycle;
+pub mod limits;
 pub mod mcp;
 pub mod membackend;
 pub mod migrate;
