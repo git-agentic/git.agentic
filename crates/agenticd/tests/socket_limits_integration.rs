@@ -15,9 +15,20 @@ fn agenticd_bin() -> std::path::PathBuf {
     env!("CARGO_BIN_EXE_agenticd").into()
 }
 
+/// Reaps the spawned daemon on drop so a failing assertion can't leak
+/// an orphaned agenticd process holding the test socket.
+struct DaemonProc(Child);
+
+impl Drop for DaemonProc {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        let _ = self.0.wait();
+    }
+}
+
 /// Spawn the daemon with `extra_args`, wait for the socket. Panics if
 /// the socket never appears.
-async fn spawn_daemon(dir: &TempDir, extra_args: &[&str]) -> (Child, std::path::PathBuf) {
+async fn spawn_daemon(dir: &TempDir, extra_args: &[&str]) -> (DaemonProc, std::path::PathBuf) {
     let sock = dir.path().join("agenticd.sock");
     let mut cmd = Command::new(agenticd_bin());
     cmd.arg("--repo")
@@ -28,7 +39,7 @@ async fn spawn_daemon(dir: &TempDir, extra_args: &[&str]) -> (Child, std::path::
     for a in extra_args {
         cmd.arg(a);
     }
-    let child = cmd.spawn().expect("spawn agenticd");
+    let child = DaemonProc(cmd.spawn().expect("spawn agenticd"));
     for _ in 0..50 {
         if sock.exists() {
             break;
@@ -82,7 +93,7 @@ async fn assert_dropped(sock: &std::path::Path) {
 #[tokio::test]
 async fn global_connection_cap_drops_excess_and_spares_existing() {
     let dir = TempDir::new().unwrap();
-    let (mut child, sock) = spawn_daemon(&dir, &["--max-connections", "2"]).await;
+    let (_daemon, sock) = spawn_daemon(&dir, &["--max-connections", "2"]).await;
 
     let mut c1 = connect_and_ping(&sock, "c1").await;
     let _c2 = connect_and_ping(&sock, "c2").await;
@@ -99,9 +110,6 @@ async fn global_connection_cap_drops_excess_and_spares_existing() {
         .expect("c1 read")
         .expect("c1 must still be served");
     assert!(matches!(reply.payload, Response::Pong));
-
-    child.kill().ok();
-    let _ = child.wait();
 }
 
 #[tokio::test]
@@ -109,7 +117,7 @@ async fn per_uid_connection_cap_drops_excess() {
     let dir = TempDir::new().unwrap();
     // Global cap far above the per-UID cap so the per-UID path is the
     // one that trips: every connection here shares the test's UID.
-    let (mut child, sock) = spawn_daemon(
+    let (_daemon, sock) = spawn_daemon(
         &dir,
         &["--max-connections", "64", "--max-connections-per-uid", "1"],
     )
@@ -117,9 +125,6 @@ async fn per_uid_connection_cap_drops_excess() {
 
     let _c1 = connect_and_ping(&sock, "c1").await;
     assert_dropped(&sock).await;
-
-    child.kill().ok();
-    let _ = child.wait();
 }
 
 #[tokio::test]
