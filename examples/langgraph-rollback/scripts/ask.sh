@@ -15,4 +15,4 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${AGENTIC_SOCKET:=${here}/.agentic/agenticd.sock}"
 export DATABASE_URL AGENTIC_SOCKET
 
-python "${here}/agent.py" "$@"
+"${PYTHON:-python3}" "${here}/agent.py" "$@"
