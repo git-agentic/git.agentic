@@ -74,6 +74,14 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        limits: agenticd::limits::LimitsConfig::default(),
+        rate: agenticd::limits::RateLimiter::new(
+            agenticd::limits::LimitsConfig::default().rate_per_uid,
+        ),
+        commit_slots: Arc::new(tokio::sync::Semaphore::new(
+            agenticd::limits::LimitsConfig::default().commit_queue_depth,
+        )),
+        commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     // Commit the baseline (schema_version "001_init", memory snapshot).
@@ -200,6 +208,14 @@ async fn setup_gate_state(
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        limits: agenticd::limits::LimitsConfig::default(),
+        rate: agenticd::limits::RateLimiter::new(
+            agenticd::limits::LimitsConfig::default().rate_per_uid,
+        ),
+        commit_slots: Arc::new(tokio::sync::Semaphore::new(
+            agenticd::limits::LimitsConfig::default().commit_queue_depth,
+        )),
+        commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
     let state = if with_key {
         state.with_approval_key(Some(test_key()))

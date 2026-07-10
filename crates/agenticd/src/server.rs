@@ -30,17 +30,6 @@ use crate::mcp::McpServerSpec;
 use crate::membackend::MemoryBackendSpec;
 use crate::peer_auth::PeerAuthPolicy;
 
-/// Read-idle deadline for a single inbound frame (2026-07-09 audit finding
-/// #5, carve-out). A connection that opens the socket and then never
-/// completes a frame — a slow-drip or forgotten peer — would otherwise pin
-/// a `spawn_local` task forever. The clock is per-frame: it resets on each
-/// successfully read frame, so a long-lived connection issuing requests
-/// within this window is unaffected. Generous by design — a legitimate but
-/// slow first frame must not trip it; a connection idle longer than this
-/// simply reconnects (cheap over a Unix socket). Tunable later; the broader
-/// connection/rate budgets are deferred to issue #118.
-const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// Long-lived state shared by every connection handler.
 pub struct DaemonState {
     /// Filesystem root of the repo (parent of `.agentic/`). Rollback uses
@@ -83,6 +72,20 @@ pub struct DaemonState {
     /// (Decision 4). Set at startup from `--approval-key-file` via
     /// [`DaemonState::with_approval_key`].
     pub approval_key: Option<agentic_core::approval::ApprovalKey>,
+    /// Static limits in force (issue #118). Set at startup via
+    /// [`DaemonState::with_limits`]; defaults are spec values.
+    pub limits: crate::limits::LimitsConfig,
+    /// Per-UID request rate budget, keyed on the observed peer UID.
+    pub rate: crate::limits::RateLimiter,
+    /// Bound on requests queued-or-executing on `commit_lock`. A
+    /// dispatch arm that would take the lock first takes a slot here;
+    /// `try_acquire` failure is an immediate structured rejection
+    /// instead of a silent unbounded queue.
+    pub commit_slots: Arc<tokio::sync::Semaphore>,
+    /// Observable commit-queue depth (queued + executing). Mirrors the
+    /// semaphore purely for logging — the semaphore enforces, this
+    /// reports.
+    pub commit_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DaemonState {
@@ -148,6 +151,14 @@ impl DaemonState {
             http,
             peer_auth,
             approval_key: None,
+            limits: crate::limits::LimitsConfig::default(),
+            rate: crate::limits::RateLimiter::new(
+                crate::limits::LimitsConfig::default().rate_per_uid,
+            ),
+            commit_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::limits::LimitsConfig::default().commit_queue_depth,
+            )),
+            commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -157,6 +168,40 @@ impl DaemonState {
     pub fn with_approval_key(mut self, key: Option<agentic_core::approval::ApprovalKey>) -> Self {
         self.approval_key = key;
         self
+    }
+
+    /// Attach the limits configuration (issue #118). Builder-style like
+    /// `with_approval_key`; rebuilds the rate limiter and the commit
+    /// queue semaphore to match. Call before serving traffic.
+    pub fn with_limits(mut self, cfg: crate::limits::LimitsConfig) -> Self {
+        self.rate = crate::limits::RateLimiter::new(cfg.rate_per_uid);
+        self.commit_slots = Arc::new(tokio::sync::Semaphore::new(cfg.commit_queue_depth));
+        self.commit_queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.limits = cfg;
+        self
+    }
+
+    /// Take a commit-queue slot, or say the queue is full. Callers turn
+    /// `None` into a `Response::concurrency("commit_queue_full", ..)`
+    /// reply. The slot is held for the queued + lock-held duration, so
+    /// the bound covers everything that can queue on `commit_lock`.
+    pub fn try_commit_slot(&self, peer_uid: Option<u32>) -> Option<CommitSlot> {
+        let permit = Arc::clone(&self.commit_slots).try_acquire_owned().ok()?;
+        let depth = self
+            .commit_queue_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        tracing::debug!(
+            target: "agenticd::limits",
+            depth,
+            peer_uid = ?peer_uid,
+            "commit queue slot acquired"
+        );
+        Some(CommitSlot {
+            _permit: permit,
+            depth: Arc::clone(&self.commit_queue_depth),
+            peer_uid,
+        })
     }
 
     /// Returns `Err` if shutdown has been signalled. Write-path handlers
@@ -173,23 +218,97 @@ impl DaemonState {
     }
 }
 
-/// Handle a single accepted connection. Runs the read/dispatch/write loop
-/// until the peer closes the socket or misses the read-idle deadline.
+/// RAII commit-queue slot (issue #118). Dropping it releases the
+/// semaphore permit and decrements the observable depth gauge.
+pub struct CommitSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+    peer_uid: Option<u32>,
+}
+
+impl Drop for CommitSlot {
+    fn drop(&mut self) {
+        let depth = self
+            .depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        tracing::debug!(
+            target: "agenticd::limits",
+            depth,
+            peer_uid = ?self.peer_uid,
+            "commit queue slot released"
+        );
+    }
+}
+
+/// Write one reply frame under the write-idle deadline (issue #118). A
+/// peer that stops reading fills the socket buffer; without a deadline
+/// the pended `write_all` would pin this task forever. On elapse we
+/// log-and-close — mid-write there is no way to send anything else.
+async fn write_reply<W>(
+    writer: &mut W,
+    reply: &Envelope<Response>,
+    write_idle: std::time::Duration,
+    peer_uid: Option<u32>,
+    // Raw SO_PEERCRED UID (issue #118 final review). Under
+    // --insecure-allow-any-uid `peer_uid` logs as `None`, so this is what
+    // makes the write-idle-close event attributable to a sender.
+    observed_uid: u32,
+    correlation_id: &str,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(write_idle, write_frame(writer, reply)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_elapsed) => {
+            tracing::warn!(
+                target: "agenticd::limits",
+                peer_uid = ?peer_uid,
+                observed_uid,
+                correlation_id = %correlation_id,
+                write_idle_secs = write_idle.as_secs(),
+                "response write stalled beyond write-idle deadline; closing"
+            );
+            Err(anyhow!(
+                "response write stalled beyond {}s write-idle deadline",
+                write_idle.as_secs()
+            ))
+        }
+    }
+}
+
+/// Handle a single accepted connection. Runs the read/dispatch/write
+/// loop until the peer closes, misses the read-idle deadline, stalls a
+/// response write past the write-idle deadline, or exhausts budgets in
+/// a way that closes the connection.
+///
+/// `observed_uid` is the raw SO_PEERCRED UID — the key for limits
+/// accounting in BOTH auth modes. `peer_uid` is the ADR-0012
+/// attestation identity (None under --insecure-allow-any-uid) and is
+/// what dispatch stamps into commits.
 pub async fn handle_connection(
     state: Arc<DaemonState>,
     sock: UnixStream,
+    observed_uid: u32,
     peer_uid: Option<u32>,
 ) -> anyhow::Result<()> {
-    handle_connection_with_idle_timeout(state, sock, peer_uid, READ_IDLE_TIMEOUT).await
+    let read_idle = state.limits.read_idle;
+    let write_idle = state.limits.write_idle;
+    handle_connection_with_deadlines(state, sock, observed_uid, peer_uid, read_idle, write_idle)
+        .await
 }
 
-/// [`handle_connection`] with the read-idle deadline injected, so tests can
-/// exercise the timeout without waiting the production window.
-pub async fn handle_connection_with_idle_timeout(
+/// [`handle_connection`] with both I/O deadlines injected, so tests can
+/// exercise them without waiting the production windows.
+pub async fn handle_connection_with_deadlines(
     state: Arc<DaemonState>,
     sock: UnixStream,
+    observed_uid: u32,
     peer_uid: Option<u32>,
     read_idle: std::time::Duration,
+    write_idle: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = sock.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -244,6 +363,31 @@ pub async fn handle_connection_with_idle_timeout(
                 correlation_id,
                 response,
             }) => {
+                // Issue #118 final review (2026-07-10): an attributable
+                // parse-error reply costs the daemon the same read +
+                // dispatch-adjacent work as a real request, so malformed
+                // envelopes must debit the same per-UID rate budget —
+                // otherwise a peer can spam garbage bytes for free and
+                // never be rate-limited. Debit before replying; if the
+                // budget is already exhausted, close instead of replying
+                // (the peer is over budget, so closing is the honest
+                // failure mode, same shape as the oversize-frame arm
+                // above).
+                if !state
+                    .rate
+                    .try_consume(observed_uid, std::time::Instant::now())
+                {
+                    tracing::warn!(
+                        target: "agenticd::limits",
+                        peer_uid = ?peer_uid,
+                        observed_uid,
+                        correlation_id = %correlation_id,
+                        "rate budget exhausted by malformed envelopes; closing"
+                    );
+                    return Err(anyhow!(
+                        "rate budget exhausted by malformed envelopes; closing"
+                    ));
+                }
                 // Log the parse failure here, before the write attempt,
                 // so a write_frame failure can't swallow the reason this
                 // connection is being closed. The Attributable case still
@@ -267,7 +411,16 @@ pub async fn handle_connection_with_idle_timeout(
                     );
                 }
                 let reply = Envelope::new(correlation_id.clone(), response);
-                if let Err(e) = write_frame(&mut writer, &reply).await {
+                if let Err(e) = write_reply(
+                    &mut writer,
+                    &reply,
+                    write_idle,
+                    peer_uid,
+                    observed_uid,
+                    &correlation_id,
+                )
+                .await
+                {
                     tracing::warn!(
                         target: "agenticd::framing",
                         peer_uid = ?peer_uid,
@@ -275,7 +428,7 @@ pub async fn handle_connection_with_idle_timeout(
                         write_error = %e,
                         "failed to deliver attributable parse-error reply; closing connection"
                     );
-                    return Err(e.into());
+                    return Err(e);
                 }
                 continue;
             }
@@ -289,6 +442,40 @@ pub async fn handle_connection_with_idle_timeout(
                 return Err(anyhow!("malformed envelope: {msg}"));
             }
         };
+
+        // Issue #118: per-UID request rate budget, keyed on the
+        // observed UID. Checked after envelope parse so the rejection
+        // carries the correlation_id. The connection survives — a
+        // rate-limited client backs off and retries on the same socket.
+        if !state
+            .rate
+            .try_consume(observed_uid, std::time::Instant::now())
+        {
+            tracing::warn!(
+                target: "agenticd::limits",
+                peer_uid = ?peer_uid,
+                observed_uid,
+                correlation_id = %correlation_id,
+                "per-UID rate budget exhausted; rejecting request"
+            );
+            let reply = Envelope::new(
+                correlation_id.clone(),
+                Response::concurrency(
+                    "rate_budget_exhausted",
+                    "per-UID request rate budget exhausted; retry shortly",
+                ),
+            );
+            write_reply(
+                &mut writer,
+                &reply,
+                write_idle,
+                peer_uid,
+                observed_uid,
+                &correlation_id,
+            )
+            .await?;
+            continue;
+        }
 
         let response = match dispatch(Arc::clone(&state), request, peer_uid).await {
             Ok(r) => r,
@@ -310,7 +497,16 @@ pub async fn handle_connection_with_idle_timeout(
         // never got a reply for.
         let correlation_id_for_log = correlation_id.clone();
         let reply = Envelope::new(correlation_id, response);
-        if let Err(e) = write_frame(&mut writer, &reply).await {
+        if let Err(e) = write_reply(
+            &mut writer,
+            &reply,
+            write_idle,
+            peer_uid,
+            observed_uid,
+            &correlation_id_for_log,
+        )
+        .await
+        {
             tracing::warn!(
                 target: "agenticd::dispatch",
                 peer_uid = ?peer_uid,
@@ -318,7 +514,7 @@ pub async fn handle_connection_with_idle_timeout(
                 write_error = %e,
                 "failed to deliver dispatch reply; closing connection"
             );
-            return Err(e.into());
+            return Err(e);
         }
     }
 }
@@ -495,6 +691,20 @@ pub(crate) async fn dispatch(
             // fired. Otherwise this request would queue on commit_lock and
             // then race with `Lifecycle::drain` for the in-flight 2PC.
             state.check_shutdown()?;
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Commit"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
             // Re-check after acquire: shutdown may have fired while we
             // waited in the queue. Without this, drain releases the lock
@@ -530,6 +740,20 @@ pub(crate) async fn dispatch(
             // the lock can drop; the rest of diff operates on
             // content-addressed object reads, which are immutable by
             // construction.
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Diff"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let snapshot = {
                 let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
                 state.refs.snapshot()?
@@ -593,6 +817,20 @@ pub(crate) async fn dispatch(
             // Same shutdown discipline as Commit — bail out before queuing
             // and re-check after acquiring the lock.
             state.check_shutdown()?;
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Rollback"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
             state.check_shutdown()?;
             let repo_root = state.repo_root.clone();
@@ -1021,9 +1259,11 @@ mod tests {
     // loop. A short injected deadline keeps the tests fast.
     // -----------------------------------------------------------------
 
-    /// Build a minimal daemon state. Returns the `TempDir` too — the caller
-    /// keeps it alive for the test, and it cleans up on drop.
-    async fn minimal_state() -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
+    /// Build a minimal daemon state with explicit limits. Returns the
+    /// `TempDir` too — the caller keeps it alive for the test.
+    async fn minimal_state_with_limits(
+        cfg: crate::limits::LimitsConfig,
+    ) -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
         use agentic_core::{FsObjectStore, ObjectStore};
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
@@ -1042,9 +1282,107 @@ mod tests {
                 Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .with_limits(cfg),
         );
         (state, dir)
+    }
+
+    /// Build a minimal daemon state. Returns the `TempDir` too — the caller
+    /// keeps it alive for the test, and it cleans up on drop.
+    async fn minimal_state() -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
+        minimal_state_with_limits(crate::limits::LimitsConfig::default()).await
+    }
+
+    /// Issue #118: with the commit queue bounded at 1, a second
+    /// lock-taking request is rejected with a structured retryable
+    /// Concurrency error instead of parking unboundedly, and the depth
+    /// gauge tracks the queued occupant.
+    #[tokio::test]
+    async fn commit_queue_full_rejects_instead_of_parking() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let cfg = crate::limits::LimitsConfig {
+            commit_queue_depth: 1,
+            ..Default::default()
+        };
+        let (state, _dir) = minimal_state_with_limits(cfg).await;
+
+        // Two commits so Diff has refs to resolve.
+        let first = make_commit(&state, "main", "first", b"v1".to_vec()).await;
+        let second = make_commit(&state, "main", "second", b"v2".to_vec()).await;
+        assert_ne!(first, second);
+
+        // Hold commit_lock from the test side so the occupier parks.
+        let guard = Arc::clone(&state.commit_lock).lock_owned().await;
+
+        // Occupier: takes the single queue slot, parks on the lock.
+        let occupier = dispatch(
+            Arc::clone(&state),
+            Request::Diff {
+                from: first.to_hex(),
+                to: "main".to_string(),
+            },
+            None,
+        );
+        tokio::pin!(occupier);
+        tokio::select! {
+            res = &mut occupier => panic!("occupier must park on commit_lock, got {res:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        assert_eq!(
+            state.commit_queue_depth.load(Ordering::Relaxed),
+            1,
+            "gauge must count the parked occupant"
+        );
+
+        // Queue is full: the next lock-taking request is rejected NOW,
+        // not parked.
+        let mut prompts = std::collections::BTreeMap::new();
+        prompts.insert("system.md".to_string(), b"v3".to_vec());
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch(
+                Arc::clone(&state),
+                Request::Commit(agentic_proto::CommitInput {
+                    message: "rejected".to_string(),
+                    author: Some("tester".to_string()),
+                    code_sha: None,
+                    branch: Some("main".to_string()),
+                    prompts,
+                    mcp_servers: Vec::new(),
+                    model: None,
+                    no_memory: true,
+                }),
+                None,
+            ),
+        )
+        .await
+        .expect("rejection must be immediate, not queued")
+        .expect("dispatch returns Ok(Response::Error), not Err");
+        match rejected {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, agentic_proto::ErrorClass::Concurrency);
+                assert_eq!(code, "commit_queue_full");
+                assert!(retryable, "queue-full must be retryable");
+            }
+            other => panic!("expected Concurrency error, got {other:?}"),
+        }
+
+        // Release the lock: the occupier completes and the gauge drains.
+        drop(guard);
+        let response = tokio::time::timeout(Duration::from_secs(2), &mut occupier)
+            .await
+            .expect("occupier completes once lock is free")
+            .expect("occupier diff succeeds");
+        assert!(matches!(response, Response::Diff(_)));
+        assert_eq!(state.commit_queue_depth.load(Ordering::Relaxed), 0);
     }
 
     /// A peer that connects and sends nothing is dropped once the read-idle
@@ -1057,8 +1395,14 @@ mod tests {
         let (state, _dir) = minimal_state().await;
         let (client, server) = tokio::net::UnixStream::pair().unwrap();
 
-        let fut =
-            handle_connection_with_idle_timeout(state, server, None, Duration::from_millis(150));
+        let fut = handle_connection_with_deadlines(
+            state,
+            server,
+            0,
+            None,
+            Duration::from_millis(150),
+            Duration::from_secs(30),
+        );
         // The client holds the socket open but sends nothing.
         let outcome = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
@@ -1085,8 +1429,13 @@ mod tests {
         let idle = Duration::from_millis(200);
 
         let local = tokio::task::LocalSet::new();
-        let handle = local.spawn_local(handle_connection_with_idle_timeout(
-            state, server, None, idle,
+        let handle = local.spawn_local(handle_connection_with_deadlines(
+            state,
+            server,
+            0,
+            None,
+            idle,
+            Duration::from_secs(30),
         ));
         local
             .run_until(async move {
@@ -1108,5 +1457,186 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// Issue #118: a request over the per-UID rate budget gets a
+    /// structured retryable Concurrency reply and the connection
+    /// SURVIVES — after refill the next request succeeds.
+    #[tokio::test]
+    async fn rate_exhausted_request_is_rejected_and_connection_survives() {
+        use agentic_proto::framing::{read_frame, write_frame};
+        use std::time::Duration;
+
+        let cfg = crate::limits::LimitsConfig {
+            rate_per_uid: 1, // burst 2
+            ..Default::default()
+        };
+        let (state, _dir) = minimal_state_with_limits(cfg).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        let handle = local.spawn_local(handle_connection_with_deadlines(
+            state,
+            server,
+            1000, // observed uid — any value; keys the bucket
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+        local
+            .run_until(async move {
+                // The burst of 2 passes.
+                for i in 0..2 {
+                    write_frame(
+                        &mut client,
+                        &Envelope::new(format!("ok-{i}"), Request::Ping),
+                    )
+                    .await
+                    .unwrap();
+                    let reply: Envelope<Response> =
+                        read_frame(&mut client).await.unwrap().expect("reply");
+                    assert!(matches!(reply.payload, Response::Pong));
+                }
+                // The third rapid request trips the budget.
+                write_frame(&mut client, &Envelope::new("limited", Request::Ping))
+                    .await
+                    .unwrap();
+                let reply: Envelope<Response> =
+                    read_frame(&mut client).await.unwrap().expect("reply");
+                match reply.payload {
+                    Response::Error {
+                        class,
+                        code,
+                        retryable,
+                        ..
+                    } => {
+                        assert_eq!(class, agentic_proto::ErrorClass::Concurrency);
+                        assert_eq!(code, "rate_budget_exhausted");
+                        assert!(retryable);
+                    }
+                    other => panic!("expected rate rejection, got {other:?}"),
+                }
+                // Connection survived: after >1s the bucket refills.
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                write_frame(&mut client, &Envelope::new("after-refill", Request::Ping))
+                    .await
+                    .unwrap();
+                let reply: Envelope<Response> =
+                    read_frame(&mut client).await.unwrap().expect("reply");
+                assert!(matches!(reply.payload, Response::Pong));
+                drop(client);
+                let outcome = handle.await.expect("handler must not panic");
+                assert!(outcome.is_ok(), "clean close expected, got {outcome:?}");
+            })
+            .await;
+    }
+
+    /// Issue #118 final review (2026-07-10): malformed-but-attributable
+    /// envelopes (e.g. an unsupported `protocol_version`) must debit the
+    /// same per-UID rate budget as well-formed requests. Otherwise a peer
+    /// can spam garbage bytes forever without ever tripping the limiter,
+    /// since the parse-error reply costs the daemon real work. Once the
+    /// budget is exhausted, the daemon must close instead of replying.
+    #[tokio::test]
+    async fn malformed_envelopes_debit_rate_budget_and_close_when_exhausted() {
+        use agentic_proto::framing::{read_frame, write_frame};
+        use std::time::Duration;
+
+        let cfg = crate::limits::LimitsConfig {
+            rate_per_uid: 1, // burst 2
+            ..Default::default()
+        };
+        let (state, _dir) = minimal_state_with_limits(cfg).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        let handle = local.spawn_local(handle_connection_with_deadlines(
+            state,
+            server,
+            2000, // observed uid — any value; keys the bucket
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+        local
+            .run_until(async move {
+                // A malformed-but-attributable envelope: a correlation_id
+                // we can recover, paired with an unsupported
+                // protocol_version, so parse fails with the Attributable
+                // version_mismatch variant.
+                let malformed = serde_json::json!({
+                    "correlation_id": "m1",
+                    "protocol_version": 9999,
+                    "payload": {"op": "ping"}
+                });
+
+                // The burst of 2 malformed frames each get a structured
+                // Protocol-class reply, and each debits a token.
+                for i in 0..2 {
+                    let mut frame = malformed.clone();
+                    frame["correlation_id"] = serde_json::json!(format!("m{i}"));
+                    write_frame(&mut client, &frame).await.unwrap();
+                    let reply: Envelope<Response> =
+                        read_frame(&mut client).await.unwrap().expect("reply");
+                    match reply.payload {
+                        Response::Error { class, code, .. } => {
+                            assert_eq!(class, agentic_proto::ErrorClass::Protocol);
+                            assert_eq!(code, "version_mismatch");
+                        }
+                        other => panic!("expected protocol error, got {other:?}"),
+                    }
+                }
+
+                // The 3rd malformed frame trips the exhausted budget: the
+                // daemon closes the connection instead of replying.
+                write_frame(&mut client, &malformed).await.unwrap();
+                let read_result = read_frame::<_, Envelope<Response>>(&mut client).await;
+                match read_result {
+                    Ok(None) => {} // clean EOF — connection closed
+                    Ok(Some(reply)) => {
+                        panic!("expected no reply once rate budget is exhausted; got {reply:?}")
+                    }
+                    Err(_) => {} // reset/broken pipe — also an acceptable close
+                }
+
+                let outcome = tokio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("handler must not hang")
+                    .expect("handler task should not panic");
+                let err = outcome.expect_err("handler must close with an error");
+                assert!(
+                    format!("{err:#}").contains("rate budget"),
+                    "error should name the rate budget; got: {err:#}"
+                );
+            })
+            .await;
+    }
+
+    /// Issue #118: a response write that stalls (peer stops reading)
+    /// hits the write-idle deadline instead of pinning the task. Unit
+    /// test of the write helper via a tiny duplex buffer — a real
+    /// UnixStream's kernel buffer is too large to fill with a Pong.
+    #[tokio::test]
+    async fn stalled_response_write_hits_write_idle_deadline() {
+        use std::time::Duration;
+        // 16-byte pipe: the serialized envelope exceeds it, so write_all
+        // pends until someone reads. Nobody reads.
+        let (client, mut server_side) = tokio::io::duplex(16);
+        let reply = Envelope::new("w1".to_string(), Response::Pong);
+        let err = write_reply(
+            &mut server_side,
+            &reply,
+            Duration::from_millis(100),
+            None,
+            0,
+            "w1",
+        )
+        .await
+        .expect_err("stalled write must error out at the deadline");
+        assert!(
+            format!("{err:#}").contains("write-idle"),
+            "error should name the write-idle deadline; got: {err:#}"
+        );
+        drop(client);
     }
 }
