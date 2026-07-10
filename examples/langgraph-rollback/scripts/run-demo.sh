@@ -176,7 +176,11 @@ step "11. ask again — empathetic answer + clean memory"
 "${DEMO_DIR}/scripts/ask.sh" "I'm thinking about cancelling my subscription."
 
 step "12. log"
-"${AGENTIC_BIN}" --repo "${DEMO_DIR}" log --oneline | head -10
+# --limit instead of `| head`: head closing the pipe early makes the Rust
+# CLI panic on SIGPIPE (broken pipe, exit 101) whenever the history has
+# more than 10 entries — which depends on how many LangGraph steps the
+# three asks produced (bug-135).
+"${AGENTIC_BIN}" --repo "${DEMO_DIR}" log --limit 10 --oneline
 
 echo
 echo "✓ broken-prompt demo complete"
