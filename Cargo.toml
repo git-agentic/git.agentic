@@ -70,4 +70,8 @@ agentic-proto = { path = "crates/agentic-proto" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = "symbols"
+# Stripping disabled due to macOS ld linker issue with proc-macro dylibs:
+# "strip = symbols" corrupts sqlx-macros dylib (mis-aligned LINKEDIT string pool
+# at dlopen). Even "strip = debuginfo" fails on this machine. Fallback: no strip.
+# Issue #124 gap 1, bug-132.
+strip = false
