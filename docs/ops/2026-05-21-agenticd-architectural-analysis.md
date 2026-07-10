@@ -1,5 +1,13 @@
 # Architectural Analysis — `crates/agenticd/` (the daemon)
 
+> **Status (2026-07-10): CLOSED — historical record.** All eleven recommendations
+> (A1–A11) landed on `main` and were verified code-grounded when tracking issue
+> [#34](https://github.com/git-agentic/git.agentic/issues/34) closed on 2026-07-10.
+> This document stays in place because accepted ADRs (0010, 0011) link to its
+> finding anchors. Do not treat its "recommended" items as open work; the code
+> on `main` is the current state.
+
+
 **Date:** 2026-05-21
 **Focus area:** `crates/agenticd/src/` (six files, 1503 lines) + call-graph extensions into `agentic-core`, `agentic-memory`, `agentic-proto`.
 **Produced by:** the `han:architectural-analysis` skill — five agents in pipeline: `structural-analyst`, `behavioral-analyst`, `concurrency-analyst`, `risk-analyst`, `software-architect`.

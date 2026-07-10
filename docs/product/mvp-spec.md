@@ -55,7 +55,7 @@ A `git.agentic` commit content-addresses all six dimensions into one immutable o
 
 ### In scope
 
-1. **CLI tool `agentic`** — `init`, `commit`, `log`, `checkout`, `rollback`, `diff`, `branch`.
+1. **CLI tool `agentic`** — `init`, `commit`, `log`, `status`, `diff`, `rollback` (plus `ping`, `resolve`, `cat-object`). *As shipped:* the originally-specced `checkout` and `branch` subcommands did not land in v1.0 — branch refs exist in the daemon and the SDK's checkpointer uses per-thread branches, but branch manipulation from the CLI is v1.1 work.
 2. **Rust core engine** — content-addressed object store, snapshot algorithm, rollback algorithm, schema-compat checks.
 3. **Python SDK** — `agentic.commit(...)`, `agentic.rollback(version)`, context-manager hooks for capturing prompts/tools/model.
 4. **One memory backend adapter: Postgres + pgvector.** Copy-on-write snapshots via Postgres logical replication slots and content-addressed embedding tables. Single backend, deep integration.

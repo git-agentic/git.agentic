@@ -26,14 +26,22 @@ A recorded asciinema of one end-to-end run is checked in at [`demo.cast`](demo.c
 
 ```bash
 cd examples/langgraph-rollback
-python -m venv .venv
+./scripts/run-demo.sh
+```
+
+The script bootstraps its own Python venv at `.venv` (SDK + LangGraph +
+psycopg, idempotent) on first run — no manual Python setup is needed. To
+drive the agent by hand instead, create the same venv yourself:
+
+```bash
+python3 -m venv .venv
 .venv/bin/pip install -e '../../sdk/python[langgraph]' 'psycopg[binary]>=3.1'
-PATH="$PWD/.venv/bin:$PATH" ./scripts/run-demo.sh
 ```
 
 The script:
 
-1. brings up Postgres + pgvector via `podman compose`,
+1. brings up Postgres + pgvector via `podman compose` or `docker compose`
+   (auto-detected; override with `CONTAINER_RUNTIME=docker|podman`),
 2. seeds 5 baseline `episodes` rows,
 3. builds `agenticd` and `agentic`, starts the daemon bound to this
    directory with `--postgres … --tables episodes:id`,
