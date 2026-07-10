@@ -160,3 +160,41 @@ jobs:
         run: cargo test -p agenticd --test reverse_migration -- --ignored --nocapture
       - name: commit-with-memory suite
         run: cargo test -p agenticd --test commit_with_memory -- --ignored --nocapture
+
+  # Release-profile build on macOS. CI otherwise builds debug only, which
+  # made proc-macro corruption (issue #124 gap 1) invisible. The new macOS
+  # linker corrupts stripped proc-macro dylibs at dlopen time; both
+  # strip="symbols" and strip="debuginfo" failed. Release builds exercise
+  # this, guarding against linker/profile breakage.
+  release-build:
+    name: release build (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: build release binaries
+        run: cargo build --release -p agenticd -p agentic-cli
+      - name: smoke-run binaries
+        run: |
+          ./target/release/agenticd --help >/dev/null
+          ./target/release/agentic --help >/dev/null
+
+  # The broken-prompt demo, end-to-end. The demo IS the MVP discipline
+  # (CLAUDE.md); the ADR-0013 scanner regression (issue #124 gap 5) sat
+  # unnoticed since 2026-05-21 because nothing ran it. run-demo.sh
+  # bootstraps its own venv and picks docker when podman is absent.
+  demo:
+    name: demo smoke (run-demo.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install postgres client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - name: run the broken-prompt demo end-to-end
+        run: ./examples/langgraph-rollback/scripts/run-demo.sh
