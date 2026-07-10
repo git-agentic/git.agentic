@@ -250,6 +250,10 @@ async fn write_reply<W>(
     reply: &Envelope<Response>,
     write_idle: std::time::Duration,
     peer_uid: Option<u32>,
+    // Raw SO_PEERCRED UID (issue #118 final review). Under
+    // --insecure-allow-any-uid `peer_uid` logs as `None`, so this is what
+    // makes the write-idle-close event attributable to a sender.
+    observed_uid: u32,
     correlation_id: &str,
 ) -> anyhow::Result<()>
 where
@@ -262,6 +266,7 @@ where
             tracing::warn!(
                 target: "agenticd::limits",
                 peer_uid = ?peer_uid,
+                observed_uid,
                 correlation_id = %correlation_id,
                 write_idle_secs = write_idle.as_secs(),
                 "response write stalled beyond write-idle deadline; closing"
@@ -358,6 +363,31 @@ pub async fn handle_connection_with_deadlines(
                 correlation_id,
                 response,
             }) => {
+                // Issue #118 final review (2026-07-10): an attributable
+                // parse-error reply costs the daemon the same read +
+                // dispatch-adjacent work as a real request, so malformed
+                // envelopes must debit the same per-UID rate budget —
+                // otherwise a peer can spam garbage bytes for free and
+                // never be rate-limited. Debit before replying; if the
+                // budget is already exhausted, close instead of replying
+                // (the peer is over budget, so closing is the honest
+                // failure mode, same shape as the oversize-frame arm
+                // above).
+                if !state
+                    .rate
+                    .try_consume(observed_uid, std::time::Instant::now())
+                {
+                    tracing::warn!(
+                        target: "agenticd::limits",
+                        peer_uid = ?peer_uid,
+                        observed_uid,
+                        correlation_id = %correlation_id,
+                        "rate budget exhausted by malformed envelopes; closing"
+                    );
+                    return Err(anyhow!(
+                        "rate budget exhausted by malformed envelopes; closing"
+                    ));
+                }
                 // Log the parse failure here, before the write attempt,
                 // so a write_frame failure can't swallow the reason this
                 // connection is being closed. The Attributable case still
@@ -381,8 +411,15 @@ pub async fn handle_connection_with_deadlines(
                     );
                 }
                 let reply = Envelope::new(correlation_id.clone(), response);
-                if let Err(e) =
-                    write_reply(&mut writer, &reply, write_idle, peer_uid, &correlation_id).await
+                if let Err(e) = write_reply(
+                    &mut writer,
+                    &reply,
+                    write_idle,
+                    peer_uid,
+                    observed_uid,
+                    &correlation_id,
+                )
+                .await
                 {
                     tracing::warn!(
                         target: "agenticd::framing",
@@ -428,7 +465,15 @@ pub async fn handle_connection_with_deadlines(
                     "per-UID request rate budget exhausted; retry shortly",
                 ),
             );
-            write_reply(&mut writer, &reply, write_idle, peer_uid, &correlation_id).await?;
+            write_reply(
+                &mut writer,
+                &reply,
+                write_idle,
+                peer_uid,
+                observed_uid,
+                &correlation_id,
+            )
+            .await?;
             continue;
         }
 
@@ -457,6 +502,7 @@ pub async fn handle_connection_with_deadlines(
             &reply,
             write_idle,
             peer_uid,
+            observed_uid,
             &correlation_id_for_log,
         )
         .await
@@ -1485,6 +1531,87 @@ mod tests {
             .await;
     }
 
+    /// Issue #118 final review (2026-07-10): malformed-but-attributable
+    /// envelopes (e.g. an unsupported `protocol_version`) must debit the
+    /// same per-UID rate budget as well-formed requests. Otherwise a peer
+    /// can spam garbage bytes forever without ever tripping the limiter,
+    /// since the parse-error reply costs the daemon real work. Once the
+    /// budget is exhausted, the daemon must close instead of replying.
+    #[tokio::test]
+    async fn malformed_envelopes_debit_rate_budget_and_close_when_exhausted() {
+        use agentic_proto::framing::{read_frame, write_frame};
+        use std::time::Duration;
+
+        let cfg = crate::limits::LimitsConfig {
+            rate_per_uid: 1, // burst 2
+            ..Default::default()
+        };
+        let (state, _dir) = minimal_state_with_limits(cfg).await;
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        let handle = local.spawn_local(handle_connection_with_deadlines(
+            state,
+            server,
+            2000, // observed uid — any value; keys the bucket
+            None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ));
+        local
+            .run_until(async move {
+                // A malformed-but-attributable envelope: a correlation_id
+                // we can recover, paired with an unsupported
+                // protocol_version, so parse fails with the Attributable
+                // version_mismatch variant.
+                let malformed = serde_json::json!({
+                    "correlation_id": "m1",
+                    "protocol_version": 9999,
+                    "payload": {"op": "ping"}
+                });
+
+                // The burst of 2 malformed frames each get a structured
+                // Protocol-class reply, and each debits a token.
+                for i in 0..2 {
+                    let mut frame = malformed.clone();
+                    frame["correlation_id"] = serde_json::json!(format!("m{i}"));
+                    write_frame(&mut client, &frame).await.unwrap();
+                    let reply: Envelope<Response> =
+                        read_frame(&mut client).await.unwrap().expect("reply");
+                    match reply.payload {
+                        Response::Error { class, code, .. } => {
+                            assert_eq!(class, agentic_proto::ErrorClass::Protocol);
+                            assert_eq!(code, "version_mismatch");
+                        }
+                        other => panic!("expected protocol error, got {other:?}"),
+                    }
+                }
+
+                // The 3rd malformed frame trips the exhausted budget: the
+                // daemon closes the connection instead of replying.
+                write_frame(&mut client, &malformed).await.unwrap();
+                let read_result = read_frame::<_, Envelope<Response>>(&mut client).await;
+                match read_result {
+                    Ok(None) => {} // clean EOF — connection closed
+                    Ok(Some(reply)) => {
+                        panic!("expected no reply once rate budget is exhausted; got {reply:?}")
+                    }
+                    Err(_) => {} // reset/broken pipe — also an acceptable close
+                }
+
+                let outcome = tokio::time::timeout(Duration::from_secs(2), handle)
+                    .await
+                    .expect("handler must not hang")
+                    .expect("handler task should not panic");
+                let err = outcome.expect_err("handler must close with an error");
+                assert!(
+                    format!("{err:#}").contains("rate budget"),
+                    "error should name the rate budget; got: {err:#}"
+                );
+            })
+            .await;
+    }
+
     /// Issue #118: a response write that stalls (peer stops reading)
     /// hits the write-idle deadline instead of pinning the task. Unit
     /// test of the write helper via a tiny duplex buffer — a real
@@ -1501,6 +1628,7 @@ mod tests {
             &reply,
             Duration::from_millis(100),
             None,
+            0,
             "w1",
         )
         .await
