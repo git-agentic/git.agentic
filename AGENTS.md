@@ -112,3 +112,5 @@ When in doubt, these are authoritative:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — what's accepted right now, code style, ADR process
 
 For anything that affects the architecture (new crate, wire-protocol change, new dependency in the daemon), open a new ADR under `docs/adr/` using ADR-0001's format. Submit it before the implementation so the design can be argued without the code in the way.
+
+## Imported Claude Cowork project instructions
