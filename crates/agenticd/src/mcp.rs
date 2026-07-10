@@ -35,6 +35,66 @@ pub struct McpServerSpec {
     pub url: String,
 }
 
+/// A configured MCP URL rejected by the ADR-0016 policy. Surfaced at
+/// daemon startup (via [`parse_mcp_spec`]), so it aborts before the daemon
+/// serves rather than classifying on the wire.
+#[derive(Debug, thiserror::Error)]
+pub enum McpUrlError {
+    #[error("MCP url {url:?} is not a valid URL: {source}")]
+    Unparseable {
+        url: String,
+        source: url::ParseError,
+    },
+    #[error(
+        "MCP url {url:?} uses scheme {scheme:?}; only https is allowed (http is permitted \
+         only for loopback hosts). Front a remote MCP server with TLS. (ADR-0016)"
+    )]
+    DisallowedScheme { url: String, scheme: String },
+    #[error(
+        "MCP url {url:?} uses http:// with non-loopback host {host:?}; http is permitted only \
+         for localhost / 127.0.0.0/8 / ::1. Use https for remote servers. (ADR-0016)"
+    )]
+    NonLoopbackHttp { url: String, host: String },
+}
+
+/// Validate one configured MCP URL against the ADR-0016 policy: https is
+/// always allowed; http only when the host is loopback. Called at startup
+/// for every `--mcp` entry.
+pub fn validate_mcp_url(raw: &str) -> Result<(), McpUrlError> {
+    let parsed = url::Url::parse(raw).map_err(|source| McpUrlError::Unparseable {
+        url: raw.to_string(),
+        source,
+    })?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            if url_host_is_loopback(&parsed) {
+                Ok(())
+            } else {
+                Err(McpUrlError::NonLoopbackHttp {
+                    url: raw.to_string(),
+                    host: parsed.host_str().unwrap_or("").to_string(),
+                })
+            }
+        }
+        other => Err(McpUrlError::DisallowedScheme {
+            url: raw.to_string(),
+            scheme: other.to_string(),
+        }),
+    }
+}
+
+/// Whether a URL's host is loopback: the `localhost` domain, an IPv4 in
+/// `127.0.0.0/8`, or the IPv6 `::1`.
+fn url_host_is_loopback(parsed: &url::Url) -> bool {
+    match parsed.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<'a> {
     jsonrpc: &'a str,
@@ -160,6 +220,26 @@ pub async fn fingerprint_one_with_limits(
         .await
         .with_context(|| format!("POST {}", spec.url))?;
     let status = resp.status();
+    // ADR-0016: the daemon client is built with redirects disabled, so a
+    // 3xx here is a redirect the server tried and we refused to follow —
+    // the SSRF vector this policy closes. Reject it, naming the Location so
+    // a misconfiguration is debuggable, rather than chasing it to an
+    // unconfigured (possibly internal) host.
+    if status.is_redirection() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<none>")
+            .to_string();
+        return Err(anyhow!(
+            "MCP server {} returned redirect HTTP {} to {:?}; refusing to follow it \
+             (redirects are disabled per ADR-0016). Point --mcp at the final URL.",
+            spec.name,
+            status,
+            location
+        ));
+    }
     let bytes = read_body_capped(resp, limits.max_response_bytes, &spec.name).await?;
     if !status.is_success() {
         let excerpt_len = bytes.len().min(ERROR_BODY_EXCERPT_BYTES);
@@ -304,9 +384,13 @@ pub fn parse_mcp_spec(items: &[String]) -> anyhow::Result<Vec<McpServerSpec>> {
             if name.is_empty() || url.is_empty() {
                 return Err(anyhow!("--mcp expects non-empty name and url, got {s:?}"));
             }
+            let url = url.trim();
+            // ADR-0016: enforce the URL policy at startup so a disallowed
+            // scheme aborts the daemon before it serves.
+            validate_mcp_url(url)?;
             Ok(McpServerSpec {
                 name: name.trim().to_string(),
-                url: url.trim().to_string(),
+                url: url.to_string(),
             })
         })
         .collect()
@@ -348,6 +432,64 @@ mod tests {
         assert!(parse_mcp_spec(&["no-equals-sign".into()]).is_err());
         assert!(parse_mcp_spec(&["=http://x".into()]).is_err());
         assert!(parse_mcp_spec(&["name=".into()]).is_err());
+    }
+
+    // ADR-0016 URL policy: https always allowed; http only for loopback.
+    #[test]
+    fn url_policy_allows_https_and_loopback_http() {
+        for ok in [
+            "https://mcp.example.com/rpc",
+            "https://10.0.0.5:8443", // https to any host is fine
+            "http://localhost:8001",
+            "http://127.0.0.1:8002/rpc",
+            "http://127.5.5.5:9000", // all of 127.0.0.0/8 is loopback
+            "http://[::1]:8003",
+        ] {
+            validate_mcp_url(ok).unwrap_or_else(|e| panic!("{ok} should be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn url_policy_rejects_non_loopback_http() {
+        let err = validate_mcp_url("http://mcp.example.com/rpc").unwrap_err();
+        assert!(
+            matches!(err, McpUrlError::NonLoopbackHttp { .. }),
+            "got {err:?}"
+        );
+        // A public IP over http is also rejected.
+        assert!(matches!(
+            validate_mcp_url("http://8.8.8.8:80").unwrap_err(),
+            McpUrlError::NonLoopbackHttp { .. }
+        ));
+    }
+
+    #[test]
+    fn url_policy_rejects_other_schemes() {
+        for bad in ["ftp://host/x", "file:///etc/passwd", "gopher://host"] {
+            assert!(
+                matches!(
+                    validate_mcp_url(bad).unwrap_err(),
+                    McpUrlError::DisallowedScheme { .. }
+                ),
+                "{bad} should be a DisallowedScheme"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_mcp_spec_enforces_url_policy_at_startup() {
+        // A non-loopback http URL aborts the whole parse (startup rejection).
+        let err = parse_mcp_spec(&["remote=http://evil.example.com/rpc".into()]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("loopback"),
+            "startup must reject non-loopback http; got: {err:#}"
+        );
+        // Loopback http and https still parse.
+        assert!(parse_mcp_spec(&[
+            "local=http://localhost:8001".into(),
+            "remote=https://mcp.example.com".into(),
+        ])
+        .is_ok());
     }
 
     // ---------------------------------------------------------------
@@ -439,6 +581,57 @@ mod tests {
             }
         });
         (addr, handle)
+    }
+
+    /// Spawn a fake server that answers one POST with a 302 redirect to
+    /// `location` — the shape ADR-0016's redirect ban defends against.
+    async fn spawn_redirecting_server(location: &str) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let location = location.to_string();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (addr, handle)
+    }
+
+    /// A client built the way `DaemonState` builds the daemon's client:
+    /// redirects disabled (ADR-0016).
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fingerprint_rejects_redirect_naming_location() {
+        // The server tries to bounce us at an "internal" address (the shape
+        // of the metadata-server SSRF). With redirects disabled the daemon
+        // must refuse and surface the Location, not chase it.
+        let (addr, h) = spawn_redirecting_server("http://169.254.169.254/latest/meta-data").await;
+        let spec = McpServerSpec {
+            name: "redirector".into(),
+            url: format!("http://{addr}/"),
+        };
+        let err = fingerprint_one(&no_redirect_client(), &spec)
+            .await
+            .expect_err("a redirect must be rejected, not followed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("redirect"), "should name it a redirect: {msg}");
+        assert!(
+            msg.contains("169.254.169.254"),
+            "should surface the Location target: {msg}"
+        );
+        h.await.ok();
     }
 
     fn tiny_limits() -> McpLimits {
