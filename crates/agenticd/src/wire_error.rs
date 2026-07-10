@@ -35,6 +35,25 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
     // wraps `agentic_core::Error` and `sqlx::Error` — so we look at
     // the most-specific layer before falling through. Raw sqlx errors
     // are classified inside `classify_memory_error`'s `Sqlx` arm.
+    // ADR-0014 approval-gate rejections: structural, the caller must obtain
+    // a valid operator approval, so never retryable. A distinct code per
+    // variant lets operators alert on specific rejection modes.
+    if let Some(gate) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::rollback::ApprovalError>())
+    {
+        use crate::rollback::ApprovalError as A;
+        use agentic_core::approval::ApprovalRejection as R;
+        let code = match gate {
+            A::KeyNotConfigured => "approval_key_not_configured",
+            A::NoPeerUid => "approval_no_peer_uid",
+            A::TokenRequired => "approval_required",
+            A::Rejected(R::Malformed) => "approval_token_malformed",
+            A::Rejected(R::Expired { .. }) => "approval_token_expired",
+            A::Rejected(R::InvalidSignature) => "approval_token_invalid_signature",
+        };
+        return Response::validation(code, message);
+    }
     if let Some(mem) = err.chain().find_map(|e| e.downcast_ref::<MemoryError>()) {
         let (class, code, retryable) = classify_memory_error(mem);
         return Response::error(class, code, message, retryable);
@@ -258,6 +277,57 @@ mod tests {
                 assert!(!retryable);
             }
             _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn approval_gate_errors_classify_as_non_retryable_validation() {
+        use crate::rollback::ApprovalError;
+        use agentic_core::approval::ApprovalRejection;
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (
+                anyhow::Error::new(ApprovalError::KeyNotConfigured),
+                "approval_key_not_configured",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::NoPeerUid),
+                "approval_no_peer_uid",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::TokenRequired),
+                "approval_required",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::Rejected(ApprovalRejection::Malformed)),
+                "approval_token_malformed",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::Rejected(ApprovalRejection::Expired {
+                    ttl: 300,
+                })),
+                "approval_token_expired",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::Rejected(ApprovalRejection::InvalidSignature)),
+                "approval_token_invalid_signature",
+            ),
+        ];
+        for (err, expected_code) in cases {
+            // Wrap in a context layer the way the real call site does.
+            let err = err.context("rolling back");
+            match map_anyhow_to_response_error(err) {
+                Response::Error {
+                    class,
+                    code,
+                    retryable,
+                    ..
+                } => {
+                    assert_eq!(class, ErrorClass::Validation, "code {expected_code}");
+                    assert_eq!(code, expected_code);
+                    assert!(!retryable, "approval rejections are never retryable");
+                }
+                _ => panic!("expected Response::Error for {expected_code}"),
+            }
         }
     }
 

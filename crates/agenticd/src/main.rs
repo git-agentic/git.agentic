@@ -87,6 +87,61 @@ struct Args {
     /// invalid blob_hash entries are fatal.
     #[arg(long)]
     scanner_allowlist: Option<PathBuf>,
+
+    /// Path to the 32-byte operator approval key for destructive rollback
+    /// (ADR-0014). Without it, every `accept_data_loss = true` rollback is
+    /// rejected fail-closed. If the flag is passed but the file exists and
+    /// is readable yet is not exactly 32 bytes, the daemon aborts startup
+    /// (an operator who configured a key but got it wrong should find out
+    /// loudly); an absent, unreadable, or empty file leaves the daemon
+    /// running with destructive rollback disabled.
+    #[arg(long)]
+    approval_key_file: Option<PathBuf>,
+}
+
+/// Load the ADR-0014 approval key per Decisions 4 and 6.
+///
+/// Reconciliation of the two decisions, keeping the abort case narrow so a
+/// key that only gates destructive rollback can't take down all daemon
+/// traffic:
+/// * flag absent, or file unreadable, or file empty → `None` (fail-closed;
+///   destructive rollback rejected, daemon runs — Decision 4).
+/// * file readable and non-empty but not exactly 32 bytes → abort startup
+///   (clear operator misconfiguration — Decision 6).
+fn load_approval_key(
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<Option<agentic_core::approval::ApprovalKey>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "agenticd::approval",
+                path = %path.display(),
+                error = %e,
+                "approval key file unreadable; destructive rollback disabled (fail-closed)"
+            );
+            return Ok(None);
+        }
+    };
+    if bytes.is_empty() {
+        tracing::warn!(
+            target: "agenticd::approval",
+            path = %path.display(),
+            "approval key file is empty; destructive rollback disabled (fail-closed)"
+        );
+        return Ok(None);
+    }
+    let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes).with_context(|| {
+        format!(
+            "approval key file {} is malformed; refusing to start",
+            path.display()
+        )
+    })?;
+    tracing::info!(target: "agenticd::approval", "approval key loaded; destructive rollback enabled");
+    Ok(Some(key))
 }
 
 #[tokio::main]
@@ -192,6 +247,10 @@ async fn main() -> anyhow::Result<()> {
             .context("startup ref reconciliation")?;
     }
 
+    // ADR-0014: load the approval key (or fail-closed None) BEFORE binding
+    // the socket, so a malformed key aborts startup before accepting work.
+    let approval_key = load_approval_key(args.approval_key_file.as_deref())?;
+
     let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
         DaemonState::open(
@@ -203,7 +262,8 @@ async fn main() -> anyhow::Result<()> {
             mcp_servers,
             Arc::clone(&peer_auth),
         )
-        .await?,
+        .await?
+        .with_approval_key(approval_key),
     );
 
     let listener = UnixListener::bind(&socket_path)
