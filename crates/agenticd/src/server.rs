@@ -93,6 +93,16 @@ impl DaemonState {
 
         let http = reqwest::Client::builder()
             .user_agent(concat!("agenticd/", env!("CARGO_PKG_VERSION")))
+            // ADR-0016: never follow redirects. This client fingerprints
+            // operator-configured MCP servers; a redirect from one of them
+            // could bounce the request to an unconfigured (internal) host —
+            // e.g. the Cloud Run metadata server — whose response would then
+            // be committed. Disabling redirects makes the reachable-host set
+            // exactly the configured `--mcp` list. INVARIANT: this client is
+            // shared (`DaemonState.http`); any future non-MCP use that
+            // legitimately needs redirects MUST build its own client rather
+            // than relaxing this policy.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building HTTP client")?;
 
