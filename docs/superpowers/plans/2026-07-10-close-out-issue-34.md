@@ -295,9 +295,11 @@ description.
 | A10 | #44 | #75 | `<file:line>` | landed |
 | A11 | #45 | #77 (ADR-0007 via #76) | `<file:line>` | landed |
 
-Deferred system-level concerns landed separately via ADR-0010 + ADR-0011
-(#33, merged). A12 remains intentionally-not-addressed per the audit
-(documents strengths / benign findings, not work).
+Deferred system-level concerns were split out via #33 into ADR-0010
+(Accepted; implemented via #74) and ADR-0011 (Proposed; A5's tactical
+`spawn_blocking` shim covers it meanwhile). A12 remains
+intentionally-not-addressed per the audit (documents strengths / benign
+findings, not work).
 
 Audit doc marker sync: `<PR link from Task 4 Step 4>`.
 

@@ -1,7 +1,7 @@
 # Design: Verify & close tracking issue #34
 
 **Date:** 2026-07-10
-**Status:** Approved
+**Status:** Approved by Toni Bergholm, 2026-07-10
 **Scope:** Close-out of GitHub issue #34 — "agenticd architectural-analysis follow-ups (2026-05-21)"
 
 ## Goal
@@ -30,8 +30,10 @@ issue (#35–#45). All child issues are closed, each via a merged PR:
 | v1.1 | A10 `SegmentManifest::from_canonical_bytes` | #44 | #75 |
 | v1.1 | A11 diff atomicity via `Refs::snapshot` | #45 | #77 (ADR-0007 via #76) |
 
-Deferred system-level concerns landed separately via ADR-0010 + ADR-0011
-(#33, merged). A12 is intentionally-not-addressed per the audit.
+Deferred system-level concerns were split out via #33 into ADR-0010
+(Accepted; implemented via #74) and ADR-0011 (Proposed; A5's tactical
+`spawn_blocking` shim covers it meanwhile). A12 is
+intentionally-not-addressed per the audit.
 
 Audit doc: `docs/ops/2026-05-21-agenticd-architectural-analysis.md`.
 
