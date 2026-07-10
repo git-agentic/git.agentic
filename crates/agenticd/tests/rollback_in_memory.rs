@@ -165,13 +165,18 @@ fn downcast_approval(err: &anyhow::Error) -> &ApprovalError {
 
 /// Build an in-memory-backed daemon state (optionally with the approval
 /// key) and commit a baseline so there's a resolvable rollback target.
-/// Returns `(state, adapter, baseline_hash_hex)`.
-async fn setup_gate_state(with_key: bool) -> (Arc<DaemonState>, Arc<InMemoryAdapter>, String) {
+/// Returns `(state, adapter, baseline_hash_hex, tempdir)` — the caller must
+/// keep the `TempDir` alive for the test's duration; it cleans up on drop.
+async fn setup_gate_state(
+    with_key: bool,
+) -> (
+    Arc<DaemonState>,
+    Arc<InMemoryAdapter>,
+    String,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let repo_root = dir.path().to_path_buf();
-    // Leak the tempdir so its path stays valid for the test's lifetime;
-    // the OS reclaims it on process exit (test binary).
-    std::mem::forget(dir);
     let agentic_dir = repo_root.join(".agentic");
     std::fs::create_dir_all(agentic_dir.join("objects")).unwrap();
 
@@ -210,7 +215,7 @@ async fn setup_gate_state(with_key: bool) -> (Arc<DaemonState>, Arc<InMemoryAdap
     )
     .await
     .expect("baseline commit");
-    (state, adapter, baseline.commit_hash)
+    (state, adapter, baseline.commit_hash, dir)
 }
 
 fn destructive_args(target: &str, token: Option<String>) -> RollbackArgs {
@@ -235,7 +240,7 @@ async fn assert_no_side_effects(state: &DaemonState, before_tip: Option<agentic_
 
 #[tokio::test]
 async fn gate_rejects_when_no_key_configured() {
-    let (state, _adapter, baseline) = setup_gate_state(false).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(false).await;
     let tip = state.refs.read_branch("main").unwrap();
     // A well-formed token is present but the daemon has no key → still fail
     // closed (Decision 4): the key, not the token, is the gate.
@@ -256,7 +261,7 @@ async fn gate_rejects_when_no_key_configured() {
 
 #[tokio::test]
 async fn gate_rejects_when_peer_uid_absent() {
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     // Insecure mode: peer_uid is None. Even a key + token can't bind.
     let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
@@ -273,7 +278,7 @@ async fn gate_rejects_when_peer_uid_absent() {
 
 #[tokio::test]
 async fn gate_rejects_when_token_missing() {
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     let err = rollback::execute(
         Arc::clone(&state),
@@ -291,7 +296,7 @@ async fn gate_rejects_when_token_missing() {
 
 #[tokio::test]
 async fn gate_rejects_wrong_uid_token() {
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     // Token bound to uid 2000, but the connection's uid is 1000.
     let tok = generate_token(&test_key(), &baseline, 2000, now_secs());
@@ -314,7 +319,7 @@ async fn gate_rejects_before_dry_run_branch() {
     // ADR-0014 Decision 1: the gate is evaluated before the dry-run
     // branch, so a *dry-run* destructive rollback with no token is still
     // rejected — you can't probe a destructive plan without approval.
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     let args = RollbackArgs {
         target: baseline.clone(),
@@ -335,7 +340,7 @@ async fn gate_rejects_before_dry_run_branch() {
 
 #[tokio::test]
 async fn gate_rejects_expired_token() {
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     // Timestamp far in the past → outside the 300s window.
     let tok = generate_token(
@@ -360,7 +365,7 @@ async fn gate_rejects_expired_token() {
 
 #[tokio::test]
 async fn gate_rejects_malformed_token() {
-    let (state, _adapter, baseline) = setup_gate_state(true).await;
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
     let tip = state.refs.read_branch("main").unwrap();
     let err = rollback::execute(
         Arc::clone(&state),
@@ -380,7 +385,7 @@ async fn gate_rejects_malformed_token() {
 async fn gate_accepts_valid_token_and_rollback_proceeds() {
     // Full happy path: valid token → gate passes → destructive rollback
     // executes end-to-end (schema reversed, forward-record commit written).
-    let (state, adapter, baseline) = setup_gate_state(true).await;
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
 
     // Contaminate: bump schema + dirty data, and provide the down.sql the
     // reverse-migration loader reads.

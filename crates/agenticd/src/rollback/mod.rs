@@ -105,6 +105,18 @@ impl ApprovalError {
     }
 }
 
+/// The redacted `token_prefix` for the audit event (Decision 5): the first
+/// 8 hex chars of the HMAC tag — the part after the `<unix_ts>:` prefix.
+/// That's what an operator matches against their issuance log; the leading
+/// timestamp digits would not correlate. A partial leak is bounded, and the
+/// operator holds the full token. A malformed token with no `:` falls back
+/// to the first 8 chars of whatever was supplied, so the rejection is still
+/// traceable.
+fn token_prefix_for_audit(token: &str) -> String {
+    let hmac_part = token.split_once(':').map(|(_, tag)| tag).unwrap_or(token);
+    hmac_part.chars().take(8).collect()
+}
+
 /// Emit the ADR-0014 Decision 5 audit event for one `accept_data_loss=true`
 /// attempt. Fires on EVERY branch — accepted and every rejection — so an
 /// attacker probing for the gate shows up and operators can alert on
@@ -116,10 +128,7 @@ fn audit_forced_data_loss(
     decision: &str,
     token: Option<&str>,
 ) {
-    // Only the first 8 hex chars of the token are logged (Decision 5): a
-    // partial leak is bounded and the operator has the full token in their
-    // issuance log.
-    let token_prefix = token.map(|t| t.chars().take(8).collect::<String>());
+    let token_prefix = token.map(token_prefix_for_audit);
     if decision == "accepted" {
         tracing::info!(
             target: "agenticd::audit",
@@ -521,5 +530,20 @@ mod tests {
         // like; rollback to it is well-defined (no memory restore needed).
         let target = commit_with(None, Some("002_baseline".into()));
         assert!(validate_target_shape(&target, &empty_hash()).is_ok());
+    }
+
+    // ADR-0014 Decision 5: the audited token_prefix is the HMAC tag's first
+    // 8 hex chars (after the `<ts>:`), not the leading timestamp digits.
+    #[test]
+    fn token_prefix_uses_the_hmac_tag_not_the_timestamp() {
+        assert_eq!(
+            token_prefix_for_audit("1783665769:5c108bdc6825b47518600804"),
+            "5c108bdc",
+            "prefix must come from the hmac tag, not the timestamp"
+        );
+        // Malformed (no colon): best-effort first 8 of whatever was supplied.
+        assert_eq!(token_prefix_for_audit("garbage-token"), "garbage-");
+        // Short tag: whatever's there, without panicking.
+        assert_eq!(token_prefix_for_audit("100:ab"), "ab");
     }
 }
