@@ -356,7 +356,9 @@ async fn main() -> anyhow::Result<()> {
 
                         let state = state.clone();
                         tokio::task::spawn_local(async move {
-                            if let Err(e) = handle_connection(state, sock, carried_uid).await {
+                            if let Err(e) =
+                                handle_connection(state, sock, peer_uid, carried_uid).await
+                            {
                                 tracing::warn!(
                                     target: "agenticd::accept",
                                     error = %format!("{e:#}"),
