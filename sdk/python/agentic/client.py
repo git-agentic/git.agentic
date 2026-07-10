@@ -360,8 +360,9 @@ class AgenticClient:
             ) from e
         except TimeoutError as e:
             raise AgenticProtocolError(
-                f"daemon did not respond within {phase_timeout}s at "
-                f"{self.socket_path}; it may be stalled — see its log",
+                f"daemon socket operation timed out after {phase_timeout}s at "
+                f"{self.socket_path} (per-operation idle timeout, not a total "
+                f"deadline); the daemon may be stalled — see its log",
                 code="timeout",
                 retryable=True,
                 class_token="protocol",
