@@ -6,12 +6,12 @@ const repo = 'https://github.com/git-agentic/src-control';
 ---
 <Base
   title="src-control — version control built for fleets of agents"
-  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, per-path encryption, Git import/export."
+  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, signed commits, sealed agent-session transcripts, sc-native network transports, full Git interop."
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Phases 1–9 implemented</span>
+    <span class="badge"><span class="pulse"></span>Phases 1–31 built</span>
     <span class="badge">Rust</span>
     <span class="badge">Builds on Git, not against it</span>
   </div>
@@ -49,9 +49,17 @@ $ cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill
 <span class="comment"># independent zero-residue proof (snapshots the filesystem before/after)</span>
 $ bash demo/run_demo.sh
 
-<span class="comment"># interoperate with Git: import a repo's HEAD, export history back</span>
+<span class="comment"># agent workspaces: fork N workspaces, run a command in each, harvest results</span>
+$ sc work --agents 4 -- cargo test
+
+<span class="comment"># seal an agent-session transcript and attach it to a commit, signed</span>
+$ sc transcript attach HEAD session.json --sign
+
+<span class="comment"># interoperate with Git: import a repo's HEAD, export history back,
+# or use a Git repo (local or GitHub over https/ssh) as a remote</span>
 $ sc import --repo /path/to/git/repo
-$ sc export --to /path/to/git/repo</code></pre>
+$ sc export --to /path/to/git/repo
+$ sc clone https://github.com/org/repo.git ./mirror</code></pre>
 
   <h2>How it works</h2>
   <ul class="plain">
@@ -67,20 +75,37 @@ $ sc export --to /path/to/git/repo</code></pre>
     <li>Native committed secrets: env vars and keys committed into repo
       state, encrypted at rest and in transit, decrypted only in an
       authorized execution context</li>
-    <li>Durable <code>.sc/</code> repos: branches, merge, accidental-secret
-      scanning, local remotes, per-path encryption, packfiles/GC</li>
-    <li>Git interop via <code>gix</code>, isolated in one crate — imports an
-      existing repo's HEAD in-process, exports src-control history back to
-      Git commits</li>
+    <li>Durable <code>.sc/</code> repos: branches, merge with real conflict
+      ergonomics (<code>sc conflicts</code>/<code>sc resolve</code>), history
+      editing (cherry-pick, rebase, amend, undo), sparse checkouts,
+      accidental-secret scanning, per-path encryption, packfiles/GC</li>
+    <li>Provenance built in: Ed25519-signed commits with
+      <code>sc verify --require</code> as a history-rewrite tripwire, and
+      sealed agent-session transcripts attached to commits — plaintext
+      never enters the object store; a keyless clone gets ciphertext
+      only</li>
+    <li>sc-native transports over SSH and HTTP — token-based access
+      control, connection caps, session timeouts, streaming packs that
+      move multi-GiB repos in bounded RAM — plus partial clone</li>
+    <li>Git interop via <code>gix</code>, isolated in one crate — import a
+      repo's HEAD in-process, export history back to Git commits, or sync
+      bidirectionally with a Git remote, local or hosted (GitHub over
+      https/ssh)</li>
   </ul>
 
   <h2>Status</h2>
   <p class="mute">
-    Phases 1–9 are implemented and tested: in-RAM virtual worktrees,
-    committed secrets, persistent repos, merge, secret scanning, remotes,
-    encrypted paths, packfiles/GC, and Git export. Beyond the P9 roadmap:
-    network transports, richer merge ergonomics, secret/permission
-    lifecycle, sparse/subtree sharing, signed provenance.
+    Phases 1–31 are built and tested. The arc so far: in-RAM virtual
+    worktrees and committed secrets (P1–2); persistent repos, merge,
+    secret scanning, remotes, encrypted paths, packfiles/GC, Git
+    export (P3–9); bidirectional Git sync, secret/permission lifecycle
+    with rotation, revocation tombstones and bulk re-wrap, SSH transport,
+    agent workspaces and durable sessions with auto-merge, history
+    editing (P10–21); signed commits, merge ergonomics, sparse checkouts,
+    streaming pack transfer, sc-native HTTP transport with token access
+    control, partial clone, security hardening, sealed agent-session
+    transcripts, and listener resource limits (P22–31). Feature phases
+    ship with runnable proof scripts — see <code>demo/</code> in the repo.
   </p>
 
   <p class="mute">
