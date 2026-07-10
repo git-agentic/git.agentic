@@ -43,6 +43,9 @@ mypy agentic
 - **Rust:** `rustfmt` defaults; `clippy` with `-D warnings`. No `unwrap()` in non-test code paths without a `// SAFETY:` or `// INVARIANT:` comment explaining why it cannot panic.
 - **Python:** `ruff` for lint and format; `mypy --strict` for the public SDK surface. Type-hint everything in `agentic/`.
 - **Docs:** Markdown, semantic line breaks. Every ADR has a stable numeric prefix and `Status:` line. New ADRs require an owner and a date.
+  `Status:` records decision state only (Proposed/Accepted), never implementation state;
+  an ADR that `Closes:` a threat-model row gains a `Closed in: <PR/commit> (<date>)` line when the control lands,
+  and the threat-model row points back at the ADR.
 
 ## Commit messages
 

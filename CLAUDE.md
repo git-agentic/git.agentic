@@ -92,7 +92,7 @@ How to apply:
 
 - **Rust.** `rustfmt` defaults; `clippy` with `-D warnings`. No `unwrap()` in non-test code without a `// SAFETY:` or `// INVARIANT:` comment explaining why it cannot panic. `thiserror` for library crates, `anyhow` for binary crates.
 - **Python.** `ruff` lint + format; `mypy --strict` on the public SDK surface. Type-hint everything in `agentic/`.
-- **Docs.** Markdown with semantic line breaks. Every ADR has a numeric prefix, a `Status:` line, an owner, and a date.
+- **Docs.** Markdown with semantic line breaks. Every ADR has a numeric prefix, a `Status:` line, an owner, and a date. `Status:` records decision state only (Proposed/Accepted), never implementation state; an ADR that `Closes:` a threat-model row gains a `Closed in: <PR/commit> (<date>)` line when the control lands, and the threat-model row points back at the ADR.
 - **Commits.** Plain prose, imperative mood. No conventional-commits ceremony in the MVP phase. One conceptual change per PR; refactors and feature work go in separate PRs. PR descriptions explain the *why*, not just the *what*.
 
 ## What not to do
@@ -118,7 +118,7 @@ What the demo requires:
 - `agentic diff` makes the multi-dimensional regression visible at a glance.
 - `agentic rollback` restores all six tuple dimensions atomically, including reverse schema migrations, in under 5s end-to-end on the target hardware.
 
-Performance targets (from [`snapshot-model.md`](docs/architecture/snapshot-model.md) §9): commit < 2s, rollback < 5s, diff < 1s, write overhead < 5ms p99, snapshot storage < 2× changed data amortized. These are commitments, not aspirations.
+Performance targets (from [`snapshot-model.md`](docs/architecture/snapshot-model.md) §9): commit < 2s, rollback < 5s, diff < 1s, write overhead < 5ms p99, snapshot storage < 2× changed data amortized. These are the v1.0 commitments — but rollback < 5s is **not yet verified at the committed shape** (1M-row pgvector + 10 commits): the only measurement there is 10.34 s on laptop-class hardware, and [`benchmarks.md`](docs/architecture/benchmarks.md) names a representative cloud-class run as the unambiguous verification, tracked in [issue #132](https://github.com/git-agentic/git.agentic/issues/132). Until that run lands, treat < 5s as the target under verification, not a demonstrated property. The demo-scale rollback (~1 s observed) and the other §9 rows measure green at the shapes tested so far.
 
 ## Agent skills
 
@@ -132,7 +132,7 @@ Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 
 ### Domain docs
 
-Single-context: one `CONTEXT.md` (not yet written) + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 ## Canonical references
 
