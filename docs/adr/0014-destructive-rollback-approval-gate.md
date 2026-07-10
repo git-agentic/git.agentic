@@ -4,6 +4,7 @@
 **Date:** 2026-05-21
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-002 (sibling worker triggers destructive down-migration via `Rollback { accept_data_loss: true }`)
+**Closed in:** `beacd65` / PR #121 (2026-07-10) — approval gate implemented; interim hard-reject shipped earlier in `aabcbda` / PR #114
 **Relates to:** [ADR-0002](./0002-substrate-and-supercommit.md) Decision 5 (bounded rollback for destructive migrations), [ADR-0004](./0004-realtime-agenticd-for-executor.md) Decision 4 (loud-fail discipline), [ADR-0012](./0012-socket-peer-authentication.md) Decision 2 (`peer_uid` on every accepted connection), [issue #37 / audit §A8](../ops/2026-05-21-agenticd-architectural-analysis.md#a8) (the reverse-migration outer-transaction work that wired `accept_data_loss` end-to-end).
 
 ## Context

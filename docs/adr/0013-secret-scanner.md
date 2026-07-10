@@ -5,6 +5,7 @@
 **Amended:** 2026-05-21 (Decision 4: allowlist scope is BLAKE3, not SHA-256 — matches the merged PR-3 implementation, which reuses `agentic-core::Hash` for system consistency and avoids a `sha2` dependency)
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-009 (the secret scanner advertised in `CLAUDE.md` / `AGENTS.md` / `docs/architecture/overview.md` / `docs/product/competitive-brief-entire.md` is not implemented in code today).
+**Closed in:** `b26777d` (2026-05-21) — scanner pre-hook wired into `put_raw`; entropy-only checkpoint-prefix exemption later narrowed by [ADR-0017](./0017-entropy-exemption-for-checkpoint-paths.md).
 **Relates to:** [ADR-0001](./0001-architecture-foundations.md) Decision 6 ("Apache 2.0, batteries-included by default"), [ADR-0002](./0002-substrate-and-supercommit.md) Decision 3 (2PC staging order) and Decision 6 (storage abstraction), [ADR-0011](./0011-objectstore-async-trait-shape.md) (the trait this hook will follow into v1.1).
 
 ## Context

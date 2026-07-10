@@ -1,9 +1,10 @@
 # ADR-0012: Socket Peer Authentication and Commit Attestation
 
-**Status:** Proposed
+**Status:** Accepted (2026-07-10 — status line reconciled; the decision was ratified in practice when the implementation landed and ADR-0014 built on it)
 **Date:** 2026-05-21
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-001 (exfiltration via `ReadObject`), TM-003 (integrity forgery via `Commit`)
+**Closed in:** `864b5c3` (2026-05-21) — `SO_PEERCRED` accept-loop check + peer-UID threading; hardened by issue #118 per-UID admission control (`crates/agenticd/src/limits.rs`)
 **Relates to:** [ADR-0001](./0001-architecture-foundations.md) Decision 1 (tuple-as-version), [ADR-0002](./0002-substrate-and-supercommit.md) Decision 6 (Commit object as platform API contract), [ADR-0003](./0003-claude-agent-sdk-integration.md) Decision 3 (framework-neutral SDK contract), [ADR-0004](./0004-realtime-agenticd-for-executor.md) (sidecar deployment shape).
 
 ## Context

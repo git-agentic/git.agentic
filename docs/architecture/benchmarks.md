@@ -127,7 +127,7 @@ unaffected.
 - **Snapshot O(n²) fix landed earlier.** `bootstrap_table` previously called `canonical_size()` (full re-serialisation) on every row. Replaced with a running-byte counter; 100K snapshot went from unrunnable to 8.87 ms (now 5.60 ms with measurement noise).
 - **p99 per-blob write number** requires Criterion's `--save-baseline` + raw-sample analysis; currently we publish the median only.
 - **Snapshot storage amortisation** (< 2× changed data) needs a segment-size sampling job that walks the object store after a series of commits with varying delta sizes.
-- **Representative-cloud-instance run** of `pg_snapshot_perf_smoke` at `BENCH_ROWS=1000000` is the unambiguous §9 commitment. Laptop numbers here are a "ranged signal, not an SLA" — useful for spotting regressions, not for public commitments.
+- **Representative-cloud-instance run** of `pg_snapshot_perf_smoke` at `BENCH_ROWS=1000000` is the unambiguous §9 commitment. Laptop numbers here are a "ranged signal, not an SLA" — useful for spotting regressions, not for public commitments. Tracked in [issue #132](https://github.com/git-agentic/git.agentic/issues/132).
 
 ## How to reproduce
 

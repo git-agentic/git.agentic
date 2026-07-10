@@ -1,6 +1,6 @@
 # ADR-0006: ObjectStore Backend Trait — Formalising the v1.1 Storage-Layer Swap
 
-**Status:** Proposed
+**Status:** Accepted (2026-07-10 — status line reconciled; the trait and the GCS backend shipped with the ADR-0004 sidecar work)
 **Date:** 2026-05-21
 **Deciders:** Toni
 **Extends:** [ADR-0002](./0002-substrate-and-supercommit.md) Decision 6 (post-Git substrate as v2+ option behind a stable platform API contract)
