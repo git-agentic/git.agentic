@@ -178,6 +178,7 @@ fn bench_commit(c: &mut Criterion) {
                     evals: None,
                     cost_cents: 0,
                     peer_uid: None,
+                    exempt_entropy_prefixes: Vec::new(),
                 };
                 (dir, store, refs, inputs)
             },

@@ -28,6 +28,7 @@
 use crate::hash::Hash;
 use crate::object::{Blob, Commit, Object, ObjectKind, Tree, TypedRef};
 use crate::refs::Refs;
+use crate::scanner::ScanPolicy;
 use crate::store::ObjectStore;
 use crate::{Error, Result};
 
@@ -69,6 +70,12 @@ pub struct CommitInputs {
     /// `None` when the daemon is running under `--insecure-allow-any-uid`
     /// or when commits originate from non-socket paths (e.g. unit tests).
     pub peer_uid: Option<u32>,
+
+    /// Prompt/tool tree-path prefixes whose blobs skip the scanner's
+    /// entropy heuristic (ADR-0017). Pattern rules still run. Populated
+    /// by the daemon from `--scanner-exempt-entropy-prefix`; empty means
+    /// full scanning for every blob.
+    pub exempt_entropy_prefixes: Vec<String>,
 }
 
 /// Outputs of a successful commit.
@@ -109,8 +116,8 @@ pub fn stage_and_commit_with_now<S: ObjectStore + ?Sized>(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<CommitOutputs> {
     // -- Step 1: stage all non-Git blobs ---------------------------------
-    let prompts_hash = stage_blob_tree(store, &inputs.prompts)?;
-    let tools_hash = stage_blob_tree(store, &inputs.tools)?;
+    let prompts_hash = stage_blob_tree(store, &inputs.prompts, &inputs.exempt_entropy_prefixes)?;
+    let tools_hash = stage_blob_tree(store, &inputs.tools, &inputs.exempt_entropy_prefixes)?;
     let model_hash = stage_optional_blob(store, inputs.model.as_deref().map(str::as_bytes))?;
     let intent_hash = stage_optional_blob(store, inputs.intent.as_deref())?;
     let plan_hash = stage_optional_blob(store, inputs.plan.as_deref())?;
@@ -161,13 +168,24 @@ pub fn stage_and_commit_with_now<S: ObjectStore + ?Sized>(
 fn stage_blob_tree<S: ObjectStore + ?Sized>(
     store: &S,
     entries: &BTreeMap<String, Vec<u8>>,
+    exempt_prefixes: &[String],
 ) -> Result<Option<Hash>> {
     if entries.is_empty() {
         return Ok(None);
     }
     let mut tree = Tree::new();
     for (name, bytes) in entries {
-        let blob_hash = store.put(&Object::Blob(Blob::new(bytes.clone())))?;
+        let policy = if exempt_prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+            tracing::info!(
+                target: "agentic_core::scanner",
+                path = %name,
+                "entropy heuristic exempted for declared checkpoint path (ADR-0017)"
+            );
+            ScanPolicy { skip_entropy: true }
+        } else {
+            ScanPolicy::default()
+        };
+        let blob_hash = store.put_with_policy(&Object::Blob(Blob::new(bytes.clone())), policy)?;
         tree.insert(
             name.clone(),
             TypedRef {
@@ -246,6 +264,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             peer_uid: None,
+            exempt_entropy_prefixes: Vec::new(),
         }
     }
 
@@ -308,12 +327,14 @@ mod tests {
         let a = stage_blob_tree(
             &store,
             &BTreeMap::from([("p.txt".to_string(), b"hi".to_vec())]),
+            &[],
         )
         .unwrap()
         .unwrap();
         let b = stage_blob_tree(
             &store,
             &BTreeMap::from([("p.txt".to_string(), b"hi".to_vec())]),
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -352,6 +373,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             peer_uid: None,
+            exempt_entropy_prefixes: Vec::new(),
         };
 
         let a = stage_and_commit_with_now(&store_a, &refs_a, "main", inputs(), fixed_now).unwrap();
@@ -391,6 +413,7 @@ mod tests {
             evals: None,
             cost_cents: 0,
             peer_uid: None,
+            exempt_entropy_prefixes: Vec::new(),
         };
 
         let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -399,5 +422,69 @@ mod tests {
         let b = stage_and_commit_with_now(&store_b, &refs_b, "main", inputs(), t2).unwrap();
 
         assert_ne!(a.commit_hash, b.commit_hash);
+    }
+
+    const HIGH_ENTROPY_CHECKPOINT: &[u8] = b"data: aB3xQ9zPmK7nR2vL5jH8wY4tF6cN1oUgEi";
+
+    #[test]
+    fn staging_exempts_entropy_for_matching_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic = dir.path().join(".agentic");
+        let store = FsObjectStore::open(agentic.join("objects")).unwrap();
+        let refs = Refs::open(&agentic).unwrap();
+
+        let mut inputs = fresh_inputs("checkpoint commit");
+        inputs.prompts.insert(
+            "__langgraph__/abc123/checkpoint.json".to_string(),
+            HIGH_ENTROPY_CHECKPOINT.to_vec(),
+        );
+        inputs.exempt_entropy_prefixes = vec!["__langgraph__/".to_string()];
+
+        stage_and_commit(&store, &refs, "main", inputs)
+            .expect("high-entropy blob under an exempt prefix must commit");
+    }
+
+    #[test]
+    fn staging_rejects_entropy_outside_exempt_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic = dir.path().join(".agentic");
+        let store = FsObjectStore::open(agentic.join("objects")).unwrap();
+        let refs = Refs::open(&agentic).unwrap();
+
+        let mut inputs = fresh_inputs("not a checkpoint");
+        inputs
+            .prompts
+            .insert("notes.txt".to_string(), HIGH_ENTROPY_CHECKPOINT.to_vec());
+        inputs.exempt_entropy_prefixes = vec!["__langgraph__/".to_string()];
+
+        match stage_and_commit(&store, &refs, "main", inputs) {
+            Err(Error::SecretDetected { .. }) => {}
+            other => panic!("expected SecretDetected outside the exempt prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staging_rejects_pattern_hits_even_under_exempt_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let agentic = dir.path().join(".agentic");
+        let store = FsObjectStore::open(agentic.join("objects")).unwrap();
+        let refs = Refs::open(&agentic).unwrap();
+
+        let mut inputs = fresh_inputs("checkpoint with a real secret");
+        inputs.prompts.insert(
+            "__langgraph__/abc123/checkpoint.json".to_string(),
+            b"hello\nAKIAIOSFODNN7EXAMPLE\nworld".to_vec(),
+        );
+        inputs.exempt_entropy_prefixes = vec!["__langgraph__/".to_string()];
+
+        match stage_and_commit(&store, &refs, "main", inputs) {
+            Err(Error::SecretDetected { hits }) => {
+                assert!(hits.iter().any(|h| matches!(
+                    &h.kind,
+                    crate::scanner::HitKind::Pattern(n) if n == "aws_access_key_id"
+                )));
+            }
+            other => panic!("expected SecretDetected for the AWS pattern, got {other:?}"),
+        }
     }
 }

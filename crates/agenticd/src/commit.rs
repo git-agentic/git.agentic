@@ -222,6 +222,7 @@ fn assemble_inputs(
         evals: None,
         cost_cents: 0,
         peer_uid,
+        exempt_entropy_prefixes: Vec::new(),
     }
 }
 
