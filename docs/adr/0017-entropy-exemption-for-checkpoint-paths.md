@@ -39,12 +39,12 @@ opaque strings and get no framework-specific meaning in the daemon.
 The prefix list is daemon configuration:
 `--scanner-exempt-entropy-prefix` (repeatable), defaulting to
 `__langgraph__/`, following the `--scanner-allowlist` precedent.
-Prefixes must be non-empty relative paths; the daemon refuses to start
-otherwise.
-An empty list (passing the flag zero times is not possible once a default
-exists; operators can pass a never-matching prefix to disable) — rather,
-operators who want full scanning everywhere run with
-`--scanner-exempt-entropy-prefix "__disabled__/"`.
+Prefixes must be non-empty, trimmed, relative, directory-style paths
+(no leading `/`, and must end with `/` since the match is a path-prefix
+match); the daemon refuses to start otherwise.
+The default cannot be removed by passing the flag zero times, so operators
+who want full scanning everywhere disable the exemption by passing a
+never-matching prefix such as `--scanner-exempt-entropy-prefix "__disabled__/"`.
 
 ## Decision 3: observability
 

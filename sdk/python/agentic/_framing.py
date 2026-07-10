@@ -48,7 +48,14 @@ def read_frame(sock: socket.socket) -> Any:
 
 
 def _read_exact(sock: socket.socket, n: int) -> bytes:
-    """Read exactly ``n`` bytes from ``sock`` or raise ``FrameError``."""
+    """Read exactly ``n`` bytes from ``sock`` or raise ``FrameError``.
+
+    The socket timeout (``sock.settimeout``) applies per ``recv`` call, not
+    to this function as a whole: it is an idle timeout, not a total
+    deadline. A peer that keeps sending at least one byte before each
+    per-recv timeout elapses can drip data indefinitely and extend the
+    total wall-clock time of this call well past the configured timeout.
+    """
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))

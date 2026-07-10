@@ -330,10 +330,17 @@ class AgenticClient:
         # malformed payload) raise AgenticProtocolError so callers can
         # write `except AgenticProtocolError` and catch them as a class.
         # Inheritance from AgenticError is preserved for catch-all sites.
+        # Tracks which timeout bound is in force so a TimeoutError can name
+        # the number that actually applied: connect() is bounded by
+        # connect_timeout, everything after by request_timeout. Without
+        # this a timeout during connect() would misreport request_timeout,
+        # naming the wrong deadline in the error message.
+        phase_timeout: float = self.connect_timeout
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(self.connect_timeout)
                 sock.connect(str(self.socket_path))
+                phase_timeout = self.request_timeout
                 sock.settimeout(self.request_timeout)
                 write_frame(sock, envelope)
                 reply = read_frame(sock)
@@ -353,7 +360,7 @@ class AgenticClient:
             ) from e
         except TimeoutError as e:
             raise AgenticProtocolError(
-                f"daemon did not respond within {self.request_timeout}s at "
+                f"daemon did not respond within {phase_timeout}s at "
                 f"{self.socket_path}; it may be stalled — see its log",
                 code="timeout",
                 retryable=True,
