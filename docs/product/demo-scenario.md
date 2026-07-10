@@ -32,7 +32,7 @@ A `git revert` of the prompt change doesn't fix anything: the schema is still bu
 
 ## The demo walkthrough
 
-The demo is a single shell session. It runs in under five minutes from `git clone`.
+The demo is a single shell session. It runs in under five minutes from `git clone` — CI-verified: the `demo` job runs it end-to-end on a fresh runner on every pull request, in under 2 minutes with cached cargo dependencies.
 
 ```bash
 # Setup (one time)

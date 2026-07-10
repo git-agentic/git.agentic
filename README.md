@@ -14,7 +14,7 @@ A commit captures all six dimensions atomically. A rollback restores all six coh
 
 ## Status
 
-**MVP code complete; repo went public 2026-05-22.** The 12-week build landed weeks 1–11 on `main`; the final week is verification, design-partner outreach, and demo polish. The cold-start "under 5 minutes from `git clone`" line in the demo is verified on developer machines with warm cargo caches; a fresh-machine timing is still in flight. See [`docs/product/roadmap.md`](docs/product/roadmap.md) for week-by-week progress and what's safe to depend on.
+**Open-source MVP complete; repo went public 2026-05-22.** The 12-week build landed in full; production validation is in progress — design-partner use in real deployments is the bar before v1.0 language. The "under 5 minutes from `git clone`" demo claim is CI-verified: a `demo` CI job runs the whole broken-prompt scenario end-to-end on a fresh runner on every pull request (under 2 minutes with cached cargo dependencies). See [`docs/product/roadmap.md`](docs/product/roadmap.md) for the build's historical record.
 
 ## Why this exists
 
@@ -26,7 +26,7 @@ We build it.
 
 ## What ships in the MVP
 
-- **`agentic` CLI** — `init`, `commit`, `log`, `diff`, `rollback`, `branch`, `status`.
+- **`agentic` CLI** — `init`, `commit`, `log`, `diff`, `rollback`, `status` (plus `ping`, `resolve`, `cat-object`).
 - **`agenticd` daemon** — Rust binary that owns the content-addressed object store and the snapshot/rollback engine.
 - **Python SDK (`agentic-sdk`)** — typed client, plus a drop-in LangGraph checkpointer.
 - **One memory backend:** Postgres + pgvector, deeply integrated.
@@ -88,7 +88,7 @@ git.agentic/
 │   │   ├── roadmap.md            12-week build narrative; repo went public 2026-05-22
 │   │   └── demo-scenario.md      the canonical demo
 │   ├── adr/
-│   │   └── 0001-architecture-foundations.md
+│   │   └── 0001 … 0017 — accepted architectural decision records
 │   └── architecture/
 │       ├── overview.md           system diagram and component boundaries
 │       └── snapshot-model.md     the technical heart
@@ -115,7 +115,7 @@ pytest
 The broken-prompt walkthrough lives at [`examples/langgraph-rollback/`](examples/langgraph-rollback/). Everything below is rooted there:
 
 - [`scripts/run-demo.sh`](examples/langgraph-rollback/scripts/run-demo.sh) starts Postgres+pgvector via the local `docker-compose.yml`, `cargo build`s `agenticd` + `agentic` from the workspace, then drives the commit → break → rollback cycle end-to-end.
-- The Python LangGraph agent runs locally via `python agent.py`, invoked by [`scripts/ask.sh`](examples/langgraph-rollback/scripts/ask.sh). Follow the venv + pip-install step in the demo's own [`README`](examples/langgraph-rollback/README.md) before running the script — the script itself does not bring up a Python environment.
+- The Python LangGraph agent runs locally via `python agent.py`, invoked by [`scripts/ask.sh`](examples/langgraph-rollback/scripts/ask.sh). `run-demo.sh` bootstraps its own Python venv (with the SDK, LangGraph, and psycopg) at `examples/langgraph-rollback/.venv` on first run — no manual Python setup is needed; the demo's own [`README`](examples/langgraph-rollback/README.md) covers running the agent by hand.
 
 `agenticd` and the agent are both local processes, not containers.
 

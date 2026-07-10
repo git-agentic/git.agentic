@@ -11,7 +11,7 @@ const repo = 'https://github.com/git-agentic/git.agentic';
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>v1.0 shipped · v1.1 in progress</span>
+    <span class="badge"><span class="pulse"></span>Open-source MVP complete · production validation in progress</span>
     <span class="badge">Apache 2.0</span>
     <span class="badge">Rust core · Python SDK</span>
   </div>
@@ -100,9 +100,9 @@ $ cd git.agentic/examples/langgraph-rollback
 $ docker-compose up -d              <span class="comment"># Postgres + pgvector</span>
 $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks, rolls back</span></code></pre>
 
-  <h2>What shipped in v1.0</h2>
+  <h2>What's in the open-source MVP</h2>
   <ul class="plain">
-    <li><code>agentic</code> CLI — <code>init</code>, <code>commit</code>, <code>log</code>, <code>diff</code>, <code>rollback</code>, <code>branch</code>, <code>status</code></li>
+    <li><code>agentic</code> CLI — <code>init</code>, <code>commit</code>, <code>log</code>, <code>diff</code>, <code>rollback</code>, <code>status</code></li>
     <li><code>agenticd</code> daemon — Rust, owns the object store and snapshot engine</li>
     <li>Python SDK — typed client, drop-in LangGraph checkpointer</li>
     <li>One memory backend: Postgres + pgvector, deeply integrated</li>
@@ -111,19 +111,21 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
   </ul>
 
   <p class="faint">
-    Not in v1.0: web UI, hosted SaaS, eval/CI pipelines, MCP registry,
+    Not in the MVP: web UI, hosted SaaS, eval/CI pipelines, MCP registry,
     sandbox execution, A2A routing, additional memory backends, additional
     frameworks. See <a href={`${repo}/blob/main/docs/adr/0001-architecture-foundations.md`}>ADR-0001</a> §9–§10 for why.
   </p>
 
   <h2>Status</h2>
   <p class="mute">
-    v1.0 shipped May 2026 with the public repo release: object store,
-    atomic memory snapshot, rollback with reverse migrations, MCP
-    fingerprinting, six-dimension diff, Python SDK + LangGraph checkpointer,
-    and the broken-prompt demo. v1.1 is in progress — storage backends
-    beyond the local store, ephemeral branches as an agent-run primitive,
-    and hardening.
+    The open-source MVP went public May 2026: object store, atomic memory
+    snapshot, rollback with reverse migrations, MCP fingerprinting,
+    six-dimension diff, Python SDK + LangGraph checkpointer, and the
+    broken-prompt demo — CI replays the demo end-to-end on every pull
+    request. Production validation is in progress: design-partner use in
+    real deployments is the bar before we call it v1.0. In-progress
+    workstreams: storage backends beyond the local store, ephemeral
+    branches as an agent-run primitive, and hardening.
   </p>
 
   <h2>Design partners</h2>

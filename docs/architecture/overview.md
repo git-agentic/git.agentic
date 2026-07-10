@@ -209,7 +209,21 @@ Total wall-clock target: < 5s for typical rollbacks.
 
 ## 6. Security model (MVP)
 
-The daemon runs as the same user as the application. There is no authentication on the socket beyond filesystem permissions. The object store is unencrypted at rest. Secrets are not yet machine-rejected: [ADR-0013](../adr/0013-secret-scanner.md) specifies a `put_raw`-time pattern + entropy scanner that will hard-reject matched blobs with a typed `SecretDetected` error; the implementation lands in PR-3 of the v1.0 hardening sprint. Until it does, operators must not commit secrets to prompts or memory.
+The daemon runs as the same user as the application.
+Socket access is peer-authenticated per [ADR-0012](../adr/0012-socket-peer-authentication.md):
+the daemon checks the connecting process's UID via `SO_PEERCRED` against an
+`--allowed-uid` allowlist, and refuses to start without one unless
+`--insecure-allow-any-uid` is passed explicitly (demo and development only).
+Availability limits on the socket (connection caps, per-UID rate budget, idle
+timeouts) ship per issue #118 as `agenticd` flags.
+The object store is unencrypted at rest.
+Secrets are machine-rejected at write time: the [ADR-0013](../adr/0013-secret-scanner.md)
+pattern + entropy scanner hard-rejects matched blobs with a typed
+`SecretDetected` error before any bytes touch disk.
+Two sanctioned relaxations exist: a blob-hash allowlist (ADR-0013 Decision 4)
+and a path-scoped entropy exemption for declared checkpoint blobs
+([ADR-0017](../adr/0017-entropy-exemption-for-checkpoint-paths.md), default
+prefix `__langgraph__/`) — pattern rules always run.
 
 Post-MVP, we add:
 

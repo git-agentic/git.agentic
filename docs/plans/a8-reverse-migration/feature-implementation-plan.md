@@ -1,5 +1,10 @@
 # Implementation plan — A8 reverse-migration outer tx + restore-guard fix + wire `accept_data_loss`
 
+> **Status (2026-07-10): EXECUTED — historical record.** This plan shipped in
+> May 2026 (issue #37). It is kept for the audit trail; the code on `main` is
+> the current state.
+
+
 ## Source Specification
 
 - **GitHub issue #37** (`must-fix-v1.0`, milestone `v1.0`) — acceptance criteria.
