@@ -37,6 +37,7 @@ mod writeback;
 
 use std::path::PathBuf;
 
+use agentic_core::approval::{verify_token, ApprovalRejection};
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
 use agentic_core::{Commit, Hash};
@@ -55,8 +56,143 @@ pub struct RollbackArgs {
     pub target: String,
     pub dry_run: bool,
     pub accept_data_loss: bool,
+    /// Operator approval token for the ADR-0014 destructive-rollback gate.
+    /// Only consulted when `accept_data_loss` is `true`.
+    pub approval_token: Option<String>,
     /// Filesystem root of the repo (where `prompts/` lives).
     pub repo: PathBuf,
+}
+
+/// Rejection from the ADR-0014 destructive-rollback approval gate. Every
+/// variant maps to a `RollbackForcedDataLoss` audit `decision` (emitted by
+/// [`approval_gate`] before the error is returned) and is classified on the
+/// wire as non-retryable `Validation` — the caller must obtain a valid
+/// operator approval; retrying the identical request can never succeed.
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalError {
+    #[error(
+        "accept_data_loss=true requires an operator approval token (ADR-0014), but this \
+         daemon has no --approval-key-file configured — failing closed. Destructive rollback \
+         is unavailable until an approval key is provisioned."
+    )]
+    KeyNotConfigured,
+    #[error(
+        "accept_data_loss=true cannot be authorized because the connection has no attested \
+         peer UID (the daemon is running with --insecure-allow-any-uid). An approval token \
+         binds to a specific worker UID (ADR-0014 Decision 2), so destructive rollback is \
+         refused in this mode."
+    )]
+    NoPeerUid,
+    #[error(
+        "accept_data_loss=true requires an approval_token, but none was supplied (ADR-0014). \
+         Have the operator mint one with `agentic rollback --approval <commit> --uid <uid> \
+         --key-file <path>`."
+    )]
+    TokenRequired,
+    #[error("approval token rejected: {0}")]
+    Rejected(#[from] ApprovalRejection),
+}
+
+impl ApprovalError {
+    /// The `RollbackForcedDataLoss` audit `decision` string (Decision 5).
+    fn audit_decision(&self) -> &'static str {
+        match self {
+            ApprovalError::KeyNotConfigured => "rejected_no_key_configured",
+            ApprovalError::NoPeerUid => "rejected_no_peer_uid",
+            ApprovalError::TokenRequired => "rejected_no_token",
+            ApprovalError::Rejected(r) => r.audit_decision(),
+        }
+    }
+}
+
+/// Emit the ADR-0014 Decision 5 audit event for one `accept_data_loss=true`
+/// attempt. Fires on EVERY branch — accepted and every rejection — so an
+/// attacker probing for the gate shows up and operators can alert on
+/// `decision = "rejected_*"` rates. `warn` for rejections, `info` for the
+/// accepted path.
+fn audit_forced_data_loss(
+    peer_uid: Option<u32>,
+    target_commit_hash: &str,
+    decision: &str,
+    token: Option<&str>,
+) {
+    // Only the first 8 hex chars of the token are logged (Decision 5): a
+    // partial leak is bounded and the operator has the full token in their
+    // issuance log.
+    let token_prefix = token.map(|t| t.chars().take(8).collect::<String>());
+    if decision == "accepted" {
+        tracing::info!(
+            target: "agenticd::audit",
+            event = "RollbackForcedDataLoss",
+            audit_event_version = 1u32,
+            ?peer_uid,
+            target_commit_hash,
+            decision,
+            ?token_prefix,
+        );
+    } else {
+        tracing::warn!(
+            target: "agenticd::audit",
+            event = "RollbackForcedDataLoss",
+            audit_event_version = 1u32,
+            ?peer_uid,
+            target_commit_hash,
+            decision,
+            ?token_prefix,
+        );
+    }
+}
+
+/// The ADR-0014 approval gate. Called only when `accept_data_loss == true`,
+/// before any object-store or Postgres work and before the dry-run branch,
+/// so a rejected request has zero side effects. Emits exactly one audit
+/// event and returns `Ok(())` only when a valid token is present.
+fn approval_gate(
+    state: &DaemonState,
+    target_hash: &Hash,
+    peer_uid: Option<u32>,
+    approval_token: Option<&str>,
+) -> Result<(), ApprovalError> {
+    let commit_hash = target_hash.to_hex(); // lowercase 64-hex (Decision 2)
+    let reject = |err: ApprovalError| -> ApprovalError {
+        audit_forced_data_loss(peer_uid, &commit_hash, err.audit_decision(), approval_token);
+        err
+    };
+
+    // (a) No key configured → fail closed (Decision 4). No override.
+    let Some(key) = state.approval_key.as_ref() else {
+        return Err(reject(ApprovalError::KeyNotConfigured));
+    };
+    // (b) No attested peer UID (insecure mode) → can't bind the token to a
+    // worker, so refuse. ADR-0012 × ADR-0014 interaction; the demo never
+    // hits this (Decision 4).
+    let Some(uid) = peer_uid else {
+        return Err(reject(ApprovalError::NoPeerUid));
+    };
+    // (c) Key present but no token supplied.
+    let Some(token) = approval_token else {
+        return Err(reject(ApprovalError::TokenRequired));
+    };
+    // (d) Verify.
+    if let Err(rej) = verify_token(key, &commit_hash, uid, token, now_unix_seconds()) {
+        return Err(reject(ApprovalError::Rejected(rej)));
+    }
+    // (e) Valid — audit the accepted path too.
+    audit_forced_data_loss(peer_uid, &commit_hash, "accepted", approval_token);
+    Ok(())
+}
+
+/// Current wall-clock in Unix seconds, for the approval TTL check.
+fn now_unix_seconds() -> u64 {
+    // INVARIANT: the system clock is after the Unix epoch on any real
+    // deployment; `duration_since(UNIX_EPOCH)` only errors for a clock set
+    // before 1970. The `unwrap_or(0)` degrades that impossible case to
+    // "epoch", which makes every non-epoch token read as expired — the
+    // safe (reject) direction for a security gate.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub async fn execute(
@@ -68,6 +204,21 @@ pub async fn execute(
         .refs
         .resolve(&args.target)?
         .ok_or_else(|| anyhow!("ref not found: {}", args.target))?;
+
+    // ADR-0014 destructive-rollback approval gate. Evaluated before any
+    // object-store or Postgres work and before the dry-run branch, so a
+    // rejected request has zero side effects. Only destructive rollbacks
+    // (`accept_data_loss = true`) pass through it.
+    if args.accept_data_loss {
+        approval_gate(
+            &state,
+            &target_hash,
+            peer_uid,
+            args.approval_token.as_deref(),
+        )
+        .map_err(anyhow::Error::new)?;
+    }
+
     let target = load_commit(&state, &target_hash)?;
     validate_target_shape(&target, &target_hash)?;
 

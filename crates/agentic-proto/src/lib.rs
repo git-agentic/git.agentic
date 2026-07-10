@@ -80,6 +80,13 @@ pub enum Request {
         target: String,
         dry_run: bool,
         accept_data_loss: bool,
+        /// Operator approval token for `accept_data_loss = true` requests
+        /// (ADR-0014). Additive field: older clients omit it and it
+        /// deserializes as `None`, which the daemon rejects fail-closed
+        /// when `accept_data_loss` is set. Ignored when `accept_data_loss`
+        /// is `false`. Wire format `"<unix_ts>:<hex_hmac>"`.
+        #[serde(default)]
+        approval_token: Option<String>,
     },
 
     /// Look up a single ref → commit hash.
@@ -347,6 +354,9 @@ impl From<RequestV0> for Request {
                 target,
                 dry_run,
                 accept_data_loss,
+                // v0 predates the approval gate; a v0 destructive rollback
+                // therefore carries no token and is rejected fail-closed.
+                approval_token: None,
             },
             RequestV0::ResolveRef { name } => Request::ResolveRef { name },
             RequestV0::ReadObject { hash } => Request::ReadObject { hash },

@@ -116,9 +116,15 @@ enum Command {
 
     /// Roll back to a previous agent version. Forward-records the
     /// rollback as a new commit so history is preserved.
+    ///
+    /// Also the operator's approval-token issuer (ADR-0014): pass
+    /// `--approval <commit-hash> --uid <worker-uid> --key-file <path>` to
+    /// mint a destructive-rollback token to stdout without contacting the
+    /// daemon.
     Rollback {
-        /// Target ref (commit hash or branch name).
-        target: String,
+        /// Target ref (commit hash or branch name). Required for an actual
+        /// rollback; ignored in `--approval` token-issuance mode.
+        target: Option<String>,
         /// Show the plan without executing.
         #[arg(long)]
         dry_run: bool,
@@ -129,6 +135,22 @@ enum Command {
         /// migrations whose reverse loses data between snapshot and now.
         #[arg(long)]
         accept_data_loss: bool,
+        /// Operator approval token authorizing an `--accept-data-loss`
+        /// rollback (ADR-0014). Obtained out-of-band from an operator via
+        /// the `--approval` issuance mode.
+        #[arg(long)]
+        approval_token: Option<String>,
+        /// Issuance mode: mint an approval token for this commit hash and
+        /// print it to stdout (no daemon contact). Requires `--uid` and
+        /// `--key-file`.
+        #[arg(long, value_name = "COMMIT_HASH")]
+        approval: Option<String>,
+        /// Worker UID the minted token is bound to (issuance mode).
+        #[arg(long)]
+        uid: Option<u32>,
+        /// Path to the 32-byte approval key (issuance mode).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
 }
 
@@ -162,8 +184,52 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             yes,
             accept_data_loss,
-        } => cmd_rollback(&repo, target, dry_run, yes, accept_data_loss, cli.json).await,
+            approval_token,
+            approval,
+            uid,
+            key_file,
+        } => {
+            if let Some(commit_hash) = approval {
+                // Issuance mode: mint a token, no daemon contact.
+                return cmd_mint_approval(&commit_hash, uid, key_file);
+            }
+            let target = target
+                .ok_or_else(|| anyhow!("rollback requires a target ref (or use --approval)"))?;
+            cmd_rollback(
+                &repo,
+                target,
+                dry_run,
+                yes,
+                accept_data_loss,
+                approval_token,
+                cli.json,
+            )
+            .await
+        }
     }
+}
+
+/// ADR-0014 operator token issuer. Reads the 32-byte key, mints a token
+/// bound to `(commit_hash, uid, now)`, prints it to stdout. Does not
+/// require the daemon.
+fn cmd_mint_approval(
+    commit_hash: &str,
+    uid: Option<u32>,
+    key_file: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let uid = uid.ok_or_else(|| anyhow!("--approval requires --uid <worker-uid>"))?;
+    let key_file = key_file.ok_or_else(|| anyhow!("--approval requires --key-file <path>"))?;
+    let bytes = std::fs::read(&key_file)
+        .with_context(|| format!("reading approval key {}", key_file.display()))?;
+    let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes)
+        .with_context(|| format!("approval key {} is malformed", key_file.display()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| anyhow!("system clock is before the Unix epoch"))?;
+    let token = agentic_core::approval::generate_token(&key, commit_hash, uid, now);
+    println!("{token}");
+    Ok(())
 }
 
 async fn cmd_rollback(
@@ -172,6 +238,7 @@ async fn cmd_rollback(
     dry_run: bool,
     yes: bool,
     accept_data_loss: bool,
+    approval_token: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
     if !dry_run && !yes {
@@ -182,6 +249,7 @@ async fn cmd_rollback(
                 target: target.clone(),
                 dry_run: true,
                 accept_data_loss,
+                approval_token: approval_token.clone(),
             },
         )
         .await?
@@ -215,6 +283,7 @@ async fn cmd_rollback(
             target,
             dry_run,
             accept_data_loss,
+            approval_token,
         },
     )
     .await?;

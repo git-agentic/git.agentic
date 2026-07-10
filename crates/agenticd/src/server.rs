@@ -66,6 +66,12 @@ pub struct DaemonState {
     /// startup from CLI flags; carried here so `DaemonState::open`
     /// callers in integration tests can construct one explicitly.
     pub peer_auth: Arc<PeerAuthPolicy>,
+    /// Operator approval key for destructive-rollback tokens (ADR-0014).
+    /// `None` — the default — means no key is configured, so every
+    /// `accept_data_loss = true` request is rejected fail-closed
+    /// (Decision 4). Set at startup from `--approval-key-file` via
+    /// [`DaemonState::with_approval_key`].
+    pub approval_key: Option<agentic_core::approval::ApprovalKey>,
 }
 
 impl DaemonState {
@@ -120,7 +126,16 @@ impl DaemonState {
             mcp_servers,
             http,
             peer_auth,
+            approval_key: None,
         })
+    }
+
+    /// Attach an operator approval key (ADR-0014). Builder-style so the
+    /// startup path can chain it after `open`; tests and the no-key
+    /// deployment leave it `None`.
+    pub fn with_approval_key(mut self, key: Option<agentic_core::approval::ApprovalKey>) -> Self {
+        self.approval_key = key;
+        self
     }
 
     /// Returns `Err` if shutdown has been signalled. Write-path handlers
@@ -522,6 +537,7 @@ pub(crate) async fn dispatch(
             target,
             dry_run,
             accept_data_loss,
+            approval_token,
         } => {
             // Same shutdown discipline as Commit — bail out before queuing
             // and re-check after acquiring the lock.
@@ -535,6 +551,7 @@ pub(crate) async fn dispatch(
                     target,
                     dry_run,
                     accept_data_loss,
+                    approval_token,
                     repo: repo_root,
                 },
                 peer_uid,

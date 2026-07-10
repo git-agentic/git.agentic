@@ -121,6 +121,7 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
             .build()
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        approval_key: None,
     });
 
     let out = commit::execute(

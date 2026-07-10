@@ -1,6 +1,6 @@
 # ADR-0014: Destructive-Rollback Approval Gate
 
-**Status:** Proposed
+**Status:** Accepted (2026-07-09)
 **Date:** 2026-05-21
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-002 (sibling worker triggers destructive down-migration via `Rollback { accept_data_loss: true }`)

@@ -10,6 +10,7 @@
 //! and snapshot/restore algorithms are stubbed and land in weeks 1–5 of the
 //! roadmap.
 
+pub mod approval;
 pub mod commit;
 pub mod diff;
 pub mod gcs_store;
