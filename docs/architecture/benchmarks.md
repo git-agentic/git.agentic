@@ -92,8 +92,8 @@ Source: [`crates/agentic-core/benches/store.rs`](../../crates/agentic-core/bench
 
 Audit finding #3 added a `Hash::of(bytes)` check to every `get_raw` read
 (segments + manifests on the restore path). The added cost is exactly one
-BLAKE3 pass over the decompressed bytes. Single-shot wall timings (release,
-laptop; 200-iter mean per size):
+BLAKE3 pass over the decompressed bytes. Wall timings (release laptop;
+200-iter mean per size):
 
 ```
 size        get_raw (with verify)   added Hash::of      added share
