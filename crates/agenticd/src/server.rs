@@ -83,6 +83,20 @@ pub struct DaemonState {
     /// (Decision 4). Set at startup from `--approval-key-file` via
     /// [`DaemonState::with_approval_key`].
     pub approval_key: Option<agentic_core::approval::ApprovalKey>,
+    /// Static limits in force (issue #118). Set at startup via
+    /// [`DaemonState::with_limits`]; defaults are spec values.
+    pub limits: crate::limits::LimitsConfig,
+    /// Per-UID request rate budget, keyed on the observed peer UID.
+    pub rate: crate::limits::RateLimiter,
+    /// Bound on requests queued-or-executing on `commit_lock`. A
+    /// dispatch arm that would take the lock first takes a slot here;
+    /// `try_acquire` failure is an immediate structured rejection
+    /// instead of a silent unbounded queue.
+    pub commit_slots: Arc<tokio::sync::Semaphore>,
+    /// Observable commit-queue depth (queued + executing). Mirrors the
+    /// semaphore purely for logging — the semaphore enforces, this
+    /// reports.
+    pub commit_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DaemonState {
@@ -148,6 +162,14 @@ impl DaemonState {
             http,
             peer_auth,
             approval_key: None,
+            limits: crate::limits::LimitsConfig::default(),
+            rate: crate::limits::RateLimiter::new(
+                crate::limits::LimitsConfig::default().rate_per_uid,
+            ),
+            commit_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::limits::LimitsConfig::default().commit_queue_depth,
+            )),
+            commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -157,6 +179,40 @@ impl DaemonState {
     pub fn with_approval_key(mut self, key: Option<agentic_core::approval::ApprovalKey>) -> Self {
         self.approval_key = key;
         self
+    }
+
+    /// Attach the limits configuration (issue #118). Builder-style like
+    /// `with_approval_key`; rebuilds the rate limiter and the commit
+    /// queue semaphore to match. Call before serving traffic.
+    pub fn with_limits(mut self, cfg: crate::limits::LimitsConfig) -> Self {
+        self.rate = crate::limits::RateLimiter::new(cfg.rate_per_uid);
+        self.commit_slots = Arc::new(tokio::sync::Semaphore::new(cfg.commit_queue_depth));
+        self.commit_queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.limits = cfg;
+        self
+    }
+
+    /// Take a commit-queue slot, or say the queue is full. Callers turn
+    /// `None` into a `Response::concurrency("commit_queue_full", ..)`
+    /// reply. The slot is held for the queued + lock-held duration, so
+    /// the bound covers everything that can queue on `commit_lock`.
+    pub fn try_commit_slot(&self, peer_uid: Option<u32>) -> Option<CommitSlot> {
+        let permit = Arc::clone(&self.commit_slots).try_acquire_owned().ok()?;
+        let depth = self
+            .commit_queue_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        tracing::debug!(
+            target: "agenticd::limits",
+            depth,
+            peer_uid = ?peer_uid,
+            "commit queue slot acquired"
+        );
+        Some(CommitSlot {
+            _permit: permit,
+            depth: Arc::clone(&self.commit_queue_depth),
+            peer_uid,
+        })
     }
 
     /// Returns `Err` if shutdown has been signalled. Write-path handlers
@@ -170,6 +226,29 @@ impl DaemonState {
             ));
         }
         Ok(())
+    }
+}
+
+/// RAII commit-queue slot (issue #118). Dropping it releases the
+/// semaphore permit and decrements the observable depth gauge.
+pub struct CommitSlot {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+    peer_uid: Option<u32>,
+}
+
+impl Drop for CommitSlot {
+    fn drop(&mut self) {
+        let depth = self
+            .depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        tracing::debug!(
+            target: "agenticd::limits",
+            depth,
+            peer_uid = ?self.peer_uid,
+            "commit queue slot released"
+        );
     }
 }
 
@@ -495,6 +574,20 @@ pub(crate) async fn dispatch(
             // fired. Otherwise this request would queue on commit_lock and
             // then race with `Lifecycle::drain` for the in-flight 2PC.
             state.check_shutdown()?;
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Commit"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
             // Re-check after acquire: shutdown may have fired while we
             // waited in the queue. Without this, drain releases the lock
@@ -530,6 +623,20 @@ pub(crate) async fn dispatch(
             // the lock can drop; the rest of diff operates on
             // content-addressed object reads, which are immutable by
             // construction.
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Diff"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let snapshot = {
                 let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
                 state.refs.snapshot()?
@@ -593,6 +700,20 @@ pub(crate) async fn dispatch(
             // Same shutdown discipline as Commit — bail out before queuing
             // and re-check after acquiring the lock.
             state.check_shutdown()?;
+            let Some(_slot) = state.try_commit_slot(peer_uid) else {
+                tracing::warn!(
+                    target: "agenticd::limits",
+                    peer_uid = ?peer_uid,
+                    depth = state
+                        .commit_queue_depth
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "commit queue full; rejecting Rollback"
+                );
+                return Ok(Response::concurrency(
+                    "commit_queue_full",
+                    "commit queue is full; retry shortly",
+                ));
+            };
             let _guard = Arc::clone(&state.commit_lock).lock_owned().await;
             state.check_shutdown()?;
             let repo_root = state.repo_root.clone();
@@ -1021,9 +1142,11 @@ mod tests {
     // loop. A short injected deadline keeps the tests fast.
     // -----------------------------------------------------------------
 
-    /// Build a minimal daemon state. Returns the `TempDir` too — the caller
-    /// keeps it alive for the test, and it cleans up on drop.
-    async fn minimal_state() -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
+    /// Build a minimal daemon state with explicit limits. Returns the
+    /// `TempDir` too — the caller keeps it alive for the test.
+    async fn minimal_state_with_limits(
+        cfg: crate::limits::LimitsConfig,
+    ) -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
         use agentic_core::{FsObjectStore, ObjectStore};
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
@@ -1042,9 +1165,107 @@ mod tests {
                 Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .with_limits(cfg),
         );
         (state, dir)
+    }
+
+    /// Build a minimal daemon state. Returns the `TempDir` too — the caller
+    /// keeps it alive for the test, and it cleans up on drop.
+    async fn minimal_state() -> (std::sync::Arc<DaemonState>, tempfile::TempDir) {
+        minimal_state_with_limits(crate::limits::LimitsConfig::default()).await
+    }
+
+    /// Issue #118: with the commit queue bounded at 1, a second
+    /// lock-taking request is rejected with a structured retryable
+    /// Concurrency error instead of parking unboundedly, and the depth
+    /// gauge tracks the queued occupant.
+    #[tokio::test]
+    async fn commit_queue_full_rejects_instead_of_parking() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let cfg = crate::limits::LimitsConfig {
+            commit_queue_depth: 1,
+            ..Default::default()
+        };
+        let (state, _dir) = minimal_state_with_limits(cfg).await;
+
+        // Two commits so Diff has refs to resolve.
+        let first = make_commit(&state, "main", "first", b"v1".to_vec()).await;
+        let second = make_commit(&state, "main", "second", b"v2".to_vec()).await;
+        assert_ne!(first, second);
+
+        // Hold commit_lock from the test side so the occupier parks.
+        let guard = Arc::clone(&state.commit_lock).lock_owned().await;
+
+        // Occupier: takes the single queue slot, parks on the lock.
+        let occupier = dispatch(
+            Arc::clone(&state),
+            Request::Diff {
+                from: first.to_hex(),
+                to: "main".to_string(),
+            },
+            None,
+        );
+        tokio::pin!(occupier);
+        tokio::select! {
+            res = &mut occupier => panic!("occupier must park on commit_lock, got {res:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        assert_eq!(
+            state.commit_queue_depth.load(Ordering::Relaxed),
+            1,
+            "gauge must count the parked occupant"
+        );
+
+        // Queue is full: the next lock-taking request is rejected NOW,
+        // not parked.
+        let mut prompts = std::collections::BTreeMap::new();
+        prompts.insert("system.md".to_string(), b"v3".to_vec());
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch(
+                Arc::clone(&state),
+                Request::Commit(agentic_proto::CommitInput {
+                    message: "rejected".to_string(),
+                    author: Some("tester".to_string()),
+                    code_sha: None,
+                    branch: Some("main".to_string()),
+                    prompts,
+                    mcp_servers: Vec::new(),
+                    model: None,
+                    no_memory: true,
+                }),
+                None,
+            ),
+        )
+        .await
+        .expect("rejection must be immediate, not queued")
+        .expect("dispatch returns Ok(Response::Error), not Err");
+        match rejected {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, agentic_proto::ErrorClass::Concurrency);
+                assert_eq!(code, "commit_queue_full");
+                assert!(retryable, "queue-full must be retryable");
+            }
+            other => panic!("expected Concurrency error, got {other:?}"),
+        }
+
+        // Release the lock: the occupier completes and the gauge drains.
+        drop(guard);
+        let response = tokio::time::timeout(Duration::from_secs(2), &mut occupier)
+            .await
+            .expect("occupier completes once lock is free")
+            .expect("occupier diff succeeds");
+        assert!(matches!(response, Response::Diff(_)));
+        assert_eq!(state.commit_queue_depth.load(Ordering::Relaxed), 0);
     }
 
     /// A peer that connects and sends nothing is dropped once the read-idle

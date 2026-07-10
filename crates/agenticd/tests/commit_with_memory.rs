@@ -122,6 +122,14 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        limits: agenticd::limits::LimitsConfig::default(),
+        rate: agenticd::limits::RateLimiter::new(
+            agenticd::limits::LimitsConfig::default().rate_per_uid,
+        ),
+        commit_slots: Arc::new(tokio::sync::Semaphore::new(
+            agenticd::limits::LimitsConfig::default().commit_queue_depth,
+        )),
+        commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     let out = commit::execute(
