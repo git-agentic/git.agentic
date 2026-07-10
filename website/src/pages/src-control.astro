@@ -21,8 +21,8 @@ const repo = 'https://github.com/git-agentic/src-control';
   <p class="lead">
     A next-generation version control system built around a
     snapshot-and-tag model (Jujutsu-inspired), with in-memory virtual
-    worktrees, native committed secrets, and per-file permissions as the
-    long-term thesis.
+    worktrees, native committed secrets, and recipient-encrypted paths —
+    full path-level permissions are the long-term thesis.
   </p>
 
   <p class="mute">
@@ -68,7 +68,9 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
       are shared, never copied</li>
     <li>Content lives only in RAM and touches disk <em>only</em> on an
       explicit checkout — no FUSE mount, no kernel extension, which is what
-      makes "zero residual artifacts" provable rather than aspirational</li>
+      makes "zero residual artifacts" provable rather than aspirational.
+      Tools that need real files (compilers, test runners) get a
+      materialized temp checkout, auto-cleaned</li>
     <li>Bounded blob budget with LRU eviction; optional spill to an
       auto-cleaned content-addressed temp dir keeps the zero-residue
       guarantee</li>
@@ -106,6 +108,10 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
     control, partial clone, security hardening, sealed agent-session
     transcripts, and listener resource limits (P22–31). Feature phases
     ship with runnable proof scripts — see <code>demo/</code> in the repo.
+    Pre-1.0 and design-partner alpha: the cryptography has not had an
+    independent audit, and the sc-native HTTP transport does not yet
+    speak TLS — the near-term promise is parallel agent workspaces and
+    provenance, not production secret management.
   </p>
 
   <p class="mute">

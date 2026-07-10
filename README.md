@@ -14,7 +14,7 @@ A commit captures all six dimensions atomically. A rollback restores all six coh
 
 ## Status
 
-**v1.0 shipped; repo went public 2026-05-22.** The 12-week build landed in full; current work is verification, hardening, and design-partner outreach. The "under 5 minutes from `git clone`" demo claim is CI-verified: a `demo` CI job runs the whole broken-prompt scenario end-to-end on a fresh runner on every pull request (under 2 minutes with cached cargo dependencies). See [`docs/product/roadmap.md`](docs/product/roadmap.md) for the build's historical record.
+**Open-source MVP complete; repo went public 2026-05-22.** The 12-week build landed in full; production validation is in progress — design-partner use in real deployments is the bar before v1.0 language. The "under 5 minutes from `git clone`" demo claim is CI-verified: a `demo` CI job runs the whole broken-prompt scenario end-to-end on a fresh runner on every pull request (under 2 minutes with cached cargo dependencies). See [`docs/product/roadmap.md`](docs/product/roadmap.md) for the build's historical record.
 
 ## Why this exists
 
