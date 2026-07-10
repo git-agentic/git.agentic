@@ -263,6 +263,28 @@ def test_commit_base64_encodes_prompts(short_tmp: Path):
     assert sent["blob.bin"] == base64.b64encode(b"\x00\x01\xff").decode("ascii")
 
 
+def test_request_timeout_raises_retryable_protocol_error(short_tmp: Path):
+    """A daemon that accepts but never replies must fail loudly within the
+    configured deadline instead of hanging forever (issue #124)."""
+    sock_path = short_tmp / "stall.sock"
+
+    def handler(conn: socket.socket) -> None:
+        conn.recv(4)  # swallow the frame header, never reply
+        time.sleep(1.0)
+
+    _spawn_mock_daemon(sock_path, handler)
+    client = AgenticClient(socket_path=sock_path, request_timeout=0.2)
+
+    start = time.monotonic()
+    with pytest.raises(AgenticProtocolError) as excinfo:
+        client.ping()
+    elapsed = time.monotonic() - start
+
+    assert excinfo.value.code == "timeout"
+    assert excinfo.value.retryable is True
+    assert elapsed < 0.9, f"must fail within the deadline, took {elapsed:.2f}s"
+
+
 def test_daemon_not_running_raises_protocol_error(short_tmp: Path):
     """Transport failures route through AgenticProtocolError so callers can
     write `except AgenticProtocolError:` and catch wire-level issues as a

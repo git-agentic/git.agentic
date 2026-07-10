@@ -171,8 +171,16 @@ class AgenticClient:
     _correlation_counter = itertools.count(1)
     _lock = threading.Lock()
 
-    def __init__(self, socket_path: Path | str = DEFAULT_SOCKET_PATH) -> None:
+    def __init__(
+        self,
+        socket_path: Path | str = DEFAULT_SOCKET_PATH,
+        *,
+        connect_timeout: float = 5.0,
+        request_timeout: float = 30.0,
+    ) -> None:
         self.socket_path = Path(socket_path)
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
 
     @classmethod
     def default(cls) -> "AgenticClient":
@@ -324,7 +332,9 @@ class AgenticClient:
         # Inheritance from AgenticError is preserved for catch-all sites.
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(self.connect_timeout)
                 sock.connect(str(self.socket_path))
+                sock.settimeout(self.request_timeout)
                 write_frame(sock, envelope)
                 reply = read_frame(sock)
         except (FileNotFoundError, ConnectionRefusedError) as e:
@@ -339,6 +349,14 @@ class AgenticClient:
                 str(e),
                 code="framing_error",
                 retryable=False,
+                class_token="protocol",
+            ) from e
+        except TimeoutError as e:
+            raise AgenticProtocolError(
+                f"daemon did not respond within {self.request_timeout}s at "
+                f"{self.socket_path}; it may be stalled — see its log",
+                code="timeout",
+                retryable=True,
                 class_token="protocol",
             ) from e
         except OSError as e:
