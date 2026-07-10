@@ -442,7 +442,7 @@ Each architectural recommendation has its own GH issue. Tracking meta-issue list
 | A5 | Move GCS blocking I/O off LocalSet via `spawn_blocking` | [#40](https://github.com/git-agentic/git.agentic/issues/40) **DONE** | `hardening-sprint` | — |
 | A6 | Structured `Response::Error` + framing-error envelope | [#41](https://github.com/git-agentic/git.agentic/issues/41) **DONE** | `hardening-sprint` | — |
 | A7 | Parallelise MCP fingerprinting with `FuturesUnordered` | [#42](https://github.com/git-agentic/git.agentic/issues/42) **DONE** | `hardening-sprint` | — |
-| A9 | Complete `MemoryAdapter` trait | [#43](https://github.com/git-agentic/git.agentic/issues/43) **PARTIAL** | `v1.1` | — |
+| A9 | Complete `MemoryAdapter` trait | [#43](https://github.com/git-agentic/git.agentic/issues/43) **DONE** | `v1.1` | — |
 | A10 | Add `SegmentManifest::from_canonical_bytes` | [#44](https://github.com/git-agentic/git.agentic/issues/44) **DONE** | `v1.1` | — |
 | A11 | `Diff` atomicity | [#45](https://github.com/git-agentic/git.agentic/issues/45) **DONE** | `v1.1` | — |
 
