@@ -106,9 +106,9 @@ BLAKE3 runs at ~2 GB/s here, so the verification adds ~0.5 ms per MiB read.
 The added-share climbs with object size only because `get_raw` itself is
 cheap (file read + zstd decode); in absolute terms a full restore's added
 cost is `total_restored_bytes / 2 GB/s` — sub-millisecond at demo scale and
-a few milliseconds even for large manifests, against a rollback budget of
-< 5 s that is dominated by Postgres INSERT replay (102 ms @ 10K rows →
-10.34 s @ 1M rows above). The §9 rollback/commit/write-overhead targets are
+a few milliseconds even for large manifests. Relative to the demo-scale
+rollback target (< 5 s), Postgres INSERT replay is still dominant (102 ms @
+10K rows; 10.34 s @ 1M rows on this laptop, above). The §9 rollback/commit/write-overhead targets are
 unaffected.
 
 ## Coverage gaps (tracked)
