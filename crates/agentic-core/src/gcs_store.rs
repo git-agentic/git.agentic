@@ -544,12 +544,17 @@ mod tests {
     #[test]
     fn cache_hit_poisoned_is_evicted_and_not_returned() {
         let dir = tempdir().unwrap();
+        // Reserve a loopback port then drop the listener so connects to it
+        // get an immediate, deterministic ECONNREFUSED — more robust than
+        // assuming a fixed low port (e.g. :1) happens to be closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_addr = listener.local_addr().unwrap();
+        drop(listener);
         let store = GcsObjectStore::new(
             "test-bucket",
             "p",
             dir.path(),
-            // An address that refuses connects: port 1 on loopback.
-            Some("http://127.0.0.1:1".into()),
+            Some(format!("http://{closed_addr}")),
             None,
         )
         .unwrap();
