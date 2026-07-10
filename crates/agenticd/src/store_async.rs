@@ -120,7 +120,11 @@ mod tests {
     }
 
     impl ObjectStore for SlowStore {
-        fn put(&self, object: &Object) -> agentic_core::Result<Hash> {
+        fn put_with_policy(
+            &self,
+            object: &Object,
+            _policy: agentic_core::scanner::ScanPolicy,
+        ) -> agentic_core::Result<Hash> {
             self.inner.put(object)
         }
         fn put_raw(&self, kind: ObjectKind, bytes: &[u8]) -> agentic_core::Result<Hash> {
