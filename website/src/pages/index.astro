@@ -56,15 +56,16 @@ const pkgRegistry = 'https://github.com/git-agentic/pkg-registry';
       A checkout assumes one developer, one directory, one disk. Agents want
       N parallel worktrees, now, and gone without a trace afterwards.
       src-control forks copy-on-write worktrees entirely in RAM — checkout
-      to disk only when you ask — with native committed secrets, per-path
-      encryption, and Git import/export.
+      to disk only when you ask — with native committed secrets, signed
+      commits, sealed agent-session transcripts, and bidirectional Git
+      sync (local or GitHub).
     </p>
     <pre><code><span class="comment"># fork 4 parallel in-RAM worktrees off one snapshot</span>
 $ sc demo --agents 4
 
-<span class="comment"># independent before/after filesystem diff: zero residue</span>
-$ bash demo/run_demo.sh</code></pre>
-    <p class="meta">Rust · Phases 1–9 implemented</p>
+<span class="comment"># agent workspaces: run a command across N forks, harvest results</span>
+$ sc work --agents 4 -- cargo test</code></pre>
+    <p class="meta">Rust · Phases 1–31 built</p>
     <p><a href="/src-control">Full page →</a> &nbsp; <a href={srcControl}>GitHub →</a></p>
   </section>
 
