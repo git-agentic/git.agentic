@@ -97,6 +97,37 @@ struct Args {
     /// running with destructive rollback disabled.
     #[arg(long)]
     approval_key_file: Option<PathBuf>,
+
+    /// Global cap on concurrently open socket connections. Issue #118.
+    #[arg(long, default_value_t = 64)]
+    max_connections: usize,
+
+    /// Per-UID cap on concurrently open socket connections. Keys on the
+    /// observed SO_PEERCRED UID in both auth modes. Issue #118.
+    #[arg(long, default_value_t = 16)]
+    max_connections_per_uid: usize,
+
+    /// Per-UID request rate budget in requests/second (burst capacity
+    /// is 2x). Exhaustion gets a retryable Concurrency-class reply;
+    /// the connection survives. Issue #118.
+    #[arg(long, default_value_t = 200)]
+    rate_per_uid: u32,
+
+    /// Max requests queued-or-executing on the daemon's commit lock.
+    /// Overflow gets a retryable Concurrency-class reply. Issue #118.
+    #[arg(long, default_value_t = 8)]
+    commit_queue_depth: usize,
+
+    /// Seconds a connection may go without completing an inbound frame
+    /// before it is closed. Per-frame clock. Issue #118 (promotes the
+    /// previously hardcoded 30s read-idle timeout).
+    #[arg(long, default_value_t = 30)]
+    read_idle_secs: u64,
+
+    /// Seconds a response write may stall (peer not reading) before the
+    /// connection is closed. Issue #118.
+    #[arg(long, default_value_t = 30)]
+    write_idle_secs: u64,
 }
 
 /// Load the ADR-0014 approval key per Decisions 4 and 6.
@@ -185,6 +216,29 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Issue #118: limits are validated before any I/O so a zeroed-out
+    // flag aborts startup instead of running a daemon that rejects
+    // everything.
+    let limits = agenticd::limits::LimitsConfig {
+        max_connections: args.max_connections,
+        max_connections_per_uid: args.max_connections_per_uid,
+        rate_per_uid: args.rate_per_uid,
+        commit_queue_depth: args.commit_queue_depth,
+        read_idle: std::time::Duration::from_secs(args.read_idle_secs),
+        write_idle: std::time::Duration::from_secs(args.write_idle_secs),
+    };
+    limits.validate().context("validating socket limit flags")?;
+    tracing::info!(
+        target: "agenticd::limits",
+        max_connections = limits.max_connections,
+        max_connections_per_uid = limits.max_connections_per_uid,
+        rate_per_uid = limits.rate_per_uid,
+        commit_queue_depth = limits.commit_queue_depth,
+        read_idle_secs = limits.read_idle.as_secs(),
+        write_idle_secs = limits.write_idle.as_secs(),
+        "socket limits in force"
+    );
+
     let agentic_dir = args.repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
@@ -263,7 +317,8 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&peer_auth),
         )
         .await?
-        .with_approval_key(approval_key),
+        .with_approval_key(approval_key)
+        .with_limits(limits.clone()),
     );
 
     let listener = UnixListener::bind(&socket_path)
@@ -301,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
     // tasks hold `commit_lock`, and if the LocalSet stops being polled
     // the drain would deadlock waiting on a lock no task can release.
     // (Spotted by Copilot review on PR #50.)
+    let conn_gate = agenticd::limits::ConnGate::new(&limits);
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async move {
@@ -339,6 +395,41 @@ async fn main() -> anyhow::Result<()> {
                             drop(sock);
                             continue;
                         }
+
+                        // Issue #118: connection caps, keyed on the
+                        // observed UID. No frame has been read, so a
+                        // structured reply is impossible — log-and-close,
+                        // same shape as the allowlist rejection above.
+                        let conn_guard = match conn_gate.try_admit(peer_uid) {
+                            Ok(g) => g,
+                            Err(rej) => {
+                                use agenticd::limits::ConnRejection;
+                                match rej {
+                                    ConnRejection::GlobalCap { current, cap } => {
+                                        tracing::warn!(
+                                            target: "agenticd::limits",
+                                            peer_uid,
+                                            peer_pid = ?peer_pid,
+                                            current,
+                                            cap,
+                                            "connection rejected: global connection cap"
+                                        );
+                                    }
+                                    ConnRejection::PerUidCap { uid, current, cap } => {
+                                        tracing::warn!(
+                                            target: "agenticd::limits",
+                                            peer_uid = uid,
+                                            peer_pid = ?peer_pid,
+                                            current,
+                                            cap,
+                                            "connection rejected: per-UID connection cap"
+                                        );
+                                    }
+                                }
+                                drop(sock);
+                                continue;
+                            }
+                        };
                         tracing::debug!(
                             target: "agenticd::accept",
                             peer_uid,
@@ -356,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
 
                         let state = state.clone();
                         tokio::task::spawn_local(async move {
+                            let _conn_guard = conn_guard;
                             if let Err(e) =
                                 handle_connection(state, sock, peer_uid, carried_uid).await
                             {
