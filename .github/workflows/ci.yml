@@ -183,10 +183,15 @@ jobs:
   # The broken-prompt demo, end-to-end. The demo IS the MVP discipline
   # (CLAUDE.md); the ADR-0013 scanner regression (issue #124 gap 5) sat
   # unnoticed since 2026-05-21 because nothing ran it. run-demo.sh
-  # bootstraps its own venv and picks docker when podman is absent.
+  # bootstraps its own venv. CONTAINER_RUNTIME is pinned to docker:
+  # ubuntu runners ship a podman binary whose compose path needs a
+  # podman API socket that is not running, so autodetection picks a
+  # runtime that cannot `compose up`.
   demo:
     name: demo smoke (run-demo.sh)
     runs-on: ubuntu-latest
+    env:
+      CONTAINER_RUNTIME: docker
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0

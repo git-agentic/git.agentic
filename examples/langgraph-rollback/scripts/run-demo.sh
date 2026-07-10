@@ -37,15 +37,19 @@ AGENTICD_BIN="${REPO_ROOT}/target/release/agenticd"
 AGENTIC_BIN="${REPO_ROOT}/target/release/agentic"
 
 # Container runtime selection. The README advertises "podman OR docker";
-# pick whichever is present. Both speak compose-file v3 well enough for
-# the demo's needs.
-if command -v podman >/dev/null 2>&1; then
-    CONTAINER_RUNTIME=podman
-elif command -v docker >/dev/null 2>&1; then
-    CONTAINER_RUNTIME=docker
-else
-    echo "error: neither podman nor docker found on PATH" >&2
-    exit 1
+# pick whichever is present, or set CONTAINER_RUNTIME=docker|podman to
+# override — presence alone can lie (GitHub's ubuntu runners ship a
+# podman binary whose compose path needs a podman API socket that is
+# not running, so `podman compose up` fails there).
+if [[ -z "${CONTAINER_RUNTIME:-}" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+        CONTAINER_RUNTIME=podman
+    elif command -v docker >/dev/null 2>&1; then
+        CONTAINER_RUNTIME=docker
+    else
+        echo "error: neither podman nor docker found on PATH" >&2
+        exit 1
+    fi
 fi
 compose() { "${CONTAINER_RUNTIME}" compose "$@"; }
 container_run() { "${CONTAINER_RUNTIME}" "$@"; }
