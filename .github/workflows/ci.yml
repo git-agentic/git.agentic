@@ -151,12 +151,11 @@ jobs:
         # seed.sql, CI does it here.
         run: docker exec -e PGPASSWORD=agentic agentic-ci-pg psql -U agentic -d agentic -c 'CREATE EXTENSION IF NOT EXISTS vector;'
       - name: memory adapter suite (snapshot/restore)
-        # --test-threads=1 is required by the suite's own contract (see
-        # its module doc): public.agentic_change_log is shared across
-        # test schemas by design, so parallel tests interfere with each
-        # other's trigger events. Verified: parallel runs fail two
-        # tests; single-threaded is green.
-        run: cargo test -p agentic-memory --test integration -- --ignored --nocapture --test-threads=1
+        # Runs at default parallelism: each test provisions its own
+        # database (issue #100), so the suite no longer needs
+        # --test-threads=1. Keeping it parallel here is deliberate —
+        # CI is the regression guard for the isolation.
+        run: cargo test -p agentic-memory --test integration -- --ignored --nocapture
       - name: reverse migration suite
         run: cargo test -p agenticd --test reverse_migration -- --ignored --nocapture
       - name: commit-with-memory suite
