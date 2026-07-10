@@ -7,24 +7,26 @@
 //! ```bash
 //! podman compose -f tests/fixtures/pg.yml up -d
 //! DATABASE_URL=postgres://agentic:agentic@localhost:54321/agentic \
-//!   cargo test -p agentic-memory --test integration -- --ignored --test-threads=1
+//!   cargo test -p agentic-memory --test integration -- --ignored
 //! ```
 //!
 //! Or with the demo's Postgres on port 54322:
 //!
 //! ```bash
 //! docker compose -f examples/langgraph-rollback/docker-compose.yml up -d
-//! docker exec agentic-demo-pg psql -U agentic -d agentic -c "CREATE EXTENSION IF NOT EXISTS vector"
 //! DATABASE_URL=postgres://agentic:agentic@localhost:54322/agentic \
-//!   cargo test -p agentic-memory --test integration -- --ignored --test-threads=1
+//!   cargo test -p agentic-memory --test integration -- --ignored
 //! ```
 //!
-//! Every test allocates its own schema (`agentic_test_<nanos>`) so user
-//! data is isolated. **Run with `--test-threads=1`**: `public.agentic_change_log`
-//! is shared across schemas by design (one daemon = one database = one
-//! log), so concurrent tests interfere with each other's trigger events
-//! and with restore's TRUNCATE-of-change_log behavior (audit §A1 / issue
-//! #35). Each test drops its schema on teardown.
+//! Every test provisions its own *database* (`agentic_test_<nanos>_<tag>`,
+//! see `TestDb`) and drops it on teardown, so the suite is safe at default
+//! test parallelism (issue #100). Databases — not schemas — are the
+//! isolation unit because two shared resources are database-scoped by
+//! product design: `public.agentic_change_log` (one daemon = one database
+//! = one log) and the constant snapshot advisory-lock key. The connecting
+//! user must be allowed to CREATE DATABASE / CREATE EXTENSION (the fixture
+//! user is the container superuser). Within its database each test still
+//! creates a scratch schema for its tracked tables.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -234,17 +236,14 @@ async fn bootstrap_produces_a_deterministic_manifest() {
 #[tokio::test]
 #[ignore]
 async fn install_helpers_is_idempotent() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("idem").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
-    let cfg = PgConfig::new(url, Vec::new());
+    let cfg = PgConfig::new(db.url.clone(), Vec::new());
     let mut a = PostgresAdapter::connect(cfg.clone(), store.clone())
         .await
         .unwrap();
@@ -253,6 +252,7 @@ async fn install_helpers_is_idempotent() {
     a.init().await.unwrap();
     let v = a.current_schema_version().await.unwrap();
     assert_eq!(v, "0.0.0", "no migrations recorded yet");
+    db.drop().await;
 }
 
 /// The advisory lock used by `snapshot()` must be observable from a
@@ -268,13 +268,11 @@ async fn snapshot_serialises_through_advisory_lock() {
     // changing it server-side without updating tests should fail loudly.
     const SNAPSHOT_KEY: i64 = 0x6167_656e_7469_635f;
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("lock").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -331,6 +329,7 @@ async fn snapshot_serialises_through_advisory_lock() {
     assert_eq!(handle.schema_version, "0.0.0");
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// AC1 for issue #35 / audit §A1: writes that occur while a restore is in
@@ -344,13 +343,11 @@ async fn snapshot_serialises_through_advisory_lock() {
 async fn ac1_writes_during_restore_are_reverted() {
     use std::time::Duration;
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("ac1").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -455,6 +452,7 @@ async fn ac1_writes_during_restore_are_reverted() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 // ── §9 performance smoke ──────────────────────────────────────────────────────
@@ -544,13 +542,11 @@ fn fmt_dur(d: std::time::Duration) -> String {
 #[tokio::test]
 #[ignore]
 async fn pg_snapshot_perf_smoke() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping perf smoke");
-            return;
-        }
+    let Some(db) = TestDb::create("perf").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
     let n = bench_rows();
 
     let dir = tempfile::tempdir().unwrap();
@@ -638,6 +634,7 @@ async fn pg_snapshot_perf_smoke() {
     eprintln!();
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 // ── Data-integrity error paths ────────────────────────────────────────────────
 
@@ -651,13 +648,11 @@ async fn pg_snapshot_perf_smoke() {
 #[tokio::test]
 #[ignore]
 async fn init_rejects_null_primary_key() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("nullpk").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -712,6 +707,7 @@ async fn init_rejects_null_primary_key() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// A column whose decode would fail (NaN floats can't round-trip through
@@ -722,13 +718,11 @@ async fn init_rejects_null_primary_key() {
 #[tokio::test]
 #[ignore]
 async fn init_rejects_non_finite_float() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("nan").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -791,6 +785,7 @@ async fn init_rejects_non_finite_float() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// A `TrackedTable.pk` that names a column that doesn't exist in the
@@ -800,13 +795,11 @@ async fn init_rejects_non_finite_float() {
 #[tokio::test]
 #[ignore]
 async fn init_rejects_absent_primary_key_column() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("absentpk").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -846,6 +839,7 @@ async fn init_rejects_absent_primary_key_column() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// Happy-path regression guard: a finite float column must round-trip
@@ -856,13 +850,11 @@ async fn init_rejects_absent_primary_key_column() {
 #[tokio::test]
 #[ignore]
 async fn init_accepts_finite_floats_and_nullable_non_pk_columns() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("floats").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -923,6 +915,7 @@ async fn init_accepts_finite_floats_and_nullable_non_pk_columns() {
     assert_eq!(total, 3, "all three rows should land in the snapshot");
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// ±Infinity are also non-finite — same JSON-can't-represent issue as
@@ -930,13 +923,11 @@ async fn init_accepts_finite_floats_and_nullable_non_pk_columns() {
 #[tokio::test]
 #[ignore]
 async fn init_rejects_positive_and_negative_infinity() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("inf").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     for (literal, label) in [("Infinity", "+Inf"), ("-Infinity", "-Inf")] {
         let dir = tempfile::tempdir().unwrap();
@@ -992,6 +983,7 @@ async fn init_rejects_positive_and_negative_infinity() {
 
         drop_schema(&admin_pool, &schema).await;
     }
+    db.drop().await;
 }
 
 /// A delete envelope with a NULL or absent PK must fail restore loudly
@@ -1005,13 +997,11 @@ async fn restore_rejects_delete_envelope_with_null_pk() {
     use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
     use agentic_memory::segment::{Segment, SegmentManifest, SegmentRef};
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("delnull").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1088,6 +1078,7 @@ async fn restore_rejects_delete_envelope_with_null_pk() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// Same shape but with the PK column absent from the delete row
@@ -1099,13 +1090,11 @@ async fn restore_rejects_delete_envelope_with_absent_pk() {
     use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
     use agentic_memory::segment::{Segment, SegmentManifest, SegmentRef};
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("delabsent").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1177,6 +1166,7 @@ async fn restore_rejects_delete_envelope_with_absent_pk() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// The snapshot fence's strict drain mode must (a) refuse to snapshot
@@ -1188,13 +1178,11 @@ async fn restore_rejects_delete_envelope_with_absent_pk() {
 #[tokio::test]
 #[ignore]
 async fn snapshot_strict_drain_preserves_bad_row_on_block() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("strictdrain").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1278,6 +1266,7 @@ async fn snapshot_strict_drain_preserves_bad_row_on_block() {
     let _ = admin_pool
         .execute("DELETE FROM public.agentic_change_log WHERE table_name = 'public.not_tracked'")
         .await;
+    db.drop().await;
 }
 
 /// A schema-qualified `TrackedTable.name` (e.g. `"public.episodes"`)
@@ -1298,13 +1287,11 @@ async fn snapshot_strict_drain_preserves_bad_row_on_block() {
 #[tokio::test]
 #[ignore]
 async fn schema_qualified_tracked_table_routes_events() {
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("qualified").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1312,12 +1299,6 @@ async fn schema_qualified_tracked_table_routes_events() {
     let admin_pool = PgPool::connect(&url).await.unwrap();
     let schema = fresh_schema_name();
     make_schema(&admin_pool, &schema).await.unwrap();
-    // Clear any prior-test residue so the snapshot's strict drain
-    // sees only the rows this test produced.
-    admin_pool
-        .execute("TRUNCATE public.agentic_change_log")
-        .await
-        .unwrap();
 
     // Configure with the SCHEMA-QUALIFIED form — the path that was
     // broken before the resolver fix.
@@ -1331,6 +1312,14 @@ async fn schema_qualified_tracked_table_routes_events() {
     );
     let mut adapter = PostgresAdapter::connect(cfg, store).await.unwrap();
     adapter.init().await.unwrap();
+    // Clear any prior-test residue so the snapshot's strict drain
+    // sees only the rows this test produced. Must run after init(),
+    // which creates public.agentic_change_log — in a per-test
+    // database that table doesn't exist until init() creates it.
+    admin_pool
+        .execute("TRUNCATE public.agentic_change_log")
+        .await
+        .unwrap();
 
     let handle = adapter
         .snapshot()
@@ -1356,6 +1345,7 @@ async fn schema_qualified_tracked_table_routes_events() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 // ── Restore batching edge cases (PR #92 review follow-ups) ───────────────────
@@ -1408,13 +1398,11 @@ fn write_single_segment(
 async fn restore_handles_duplicate_pk_within_a_batch() {
     use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("duppk").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1481,6 +1469,7 @@ async fn restore_handles_duplicate_pk_within_a_batch() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// An empty delete envelope (`{"op": "delete", "row": {}}`) has no PK
@@ -1492,13 +1481,11 @@ async fn restore_handles_duplicate_pk_within_a_batch() {
 async fn restore_rejects_empty_delete_envelope() {
     use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("emptydel").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1550,6 +1537,7 @@ async fn restore_rejects_empty_delete_envelope() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
 
 /// Mode transitions mid-segment must flush. A sequence of
@@ -1562,13 +1550,11 @@ async fn restore_rejects_empty_delete_envelope() {
 async fn restore_preserves_order_across_mode_transitions() {
     use agentic_memory::adapter::{MemoryAdapter as _, SnapshotHandle};
 
-    let url = match database_url() {
-        Some(u) => u,
-        None => {
-            eprintln!("DATABASE_URL not set — skipping integration test");
-            return;
-        }
+    let Some(db) = TestDb::create("modes").await else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
     };
+    let url = db.url.clone();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsObjectStore::open(dir.path().join("objects")).unwrap());
@@ -1624,4 +1610,5 @@ async fn restore_preserves_order_across_mode_transitions() {
     );
 
     drop_schema(&admin_pool, &schema).await;
+    db.drop().await;
 }
