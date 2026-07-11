@@ -1,7 +1,10 @@
 # The Snapshot Model
 
-**Status:** Design — not yet implemented
-**Last updated:** 2026-05-19
+**Status:** Implemented — the design below shipped in the v1.0 MVP
+(`agentic-core` object store, `agentic-memory` segment snapshot/restore, `agenticd` commit/rollback).
+This document remains the authoritative specification;
+§9's verification state is tracked in [`benchmarks.md`](benchmarks.md).
+**Last updated:** 2026-07-11
 
 This document specifies the technical heart of `git.agentic`: how we represent an agent's behavioral state as content-addressed objects, and how we snapshot and restore that state atomically.
 
@@ -261,7 +264,12 @@ The PII story will need refinement with a real security review. Documented now s
 | Write overhead | < 5ms per row | p99 latency added to agent writes by segment streaming |
 | Snapshot storage | < 2× changed data | Amortized over many snapshots |
 
-These are aspirational and will be re-tuned as we benchmark. The point is to commit to numbers publicly so we don't ship a fast demo and a slow product.
+These are the binding v1.0 numbers — see [`CONTEXT.md`](../../CONTEXT.md) for the commitment vs target-under-verification vocabulary.
+The point of committing to numbers publicly is so we don't ship a fast demo and a slow product.
+As of 2026-07-11, `rollback` < 5s is a **target under verification** at the committed shape
+(only measurement: 10.34 s on laptop-class hardware; cloud-class run tracked in
+[issue #132](https://github.com/git-agentic/git.agentic/issues/132));
+the other rows measure green at the shapes tested so far.
 
 See [`benchmarks.md`](benchmarks.md) for the latest measured numbers and which targets remain pending an integration benchmark.
 
