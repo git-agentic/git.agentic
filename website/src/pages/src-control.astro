@@ -87,7 +87,7 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
       never enters the object store; a keyless clone gets ciphertext
       only</li>
     <li>sc-native transports over SSH and HTTP(S) — in-binary TLS
-      (<code>sc+https://</code>, first-connection pinning), token-based
+      (<code>sc+https://</code>, first-connection (TOFU) pinning), token-based
       access control, connection caps, session timeouts, streaming packs
       that move multi-GiB repos in bounded RAM — plus partial clone</li>
     <li>Git interop via <code>gix</code>, isolated in one crate — import a

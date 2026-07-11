@@ -80,9 +80,9 @@ $ sentinel audit is-odd 3.0.1
       bubblewrap&nbsp;+&nbsp;Landlock): lifecycle scripts get no network,
       no credential env vars, no writes outside a fixed floor, no
       <code>$HOME</code> reads, and no executing binaries outside an
-      approved floor unless a capability is approved; detected violations
-      can quarantine that exact tarball fleet-wide (auto-quarantine is
-      opt-in)</li>
+      approved floor — each denial lifted only by an approved capability;
+      detected violations can quarantine that exact tarball fleet-wide
+      (auto-quarantine is opt-in and auth-gated)</li>
     <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
       CLI whose exit codes make <code>sentinel audit</code> a CI gate;
       <code>sentinel explain</code> turns a verdict into per-finding
