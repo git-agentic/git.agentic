@@ -76,11 +76,13 @@ $ sentinel audit is-odd 3.0.1
       signing — capability manifests, and a hard privilege boundary: the
       agent can request an approval, only a human can grant it, enforced
       by signed Ed25519 role tokens on the control plane</li>
-    <li>Deny-by-default sandbox (macOS Seatbelt, Linux bubblewrap):
-      lifecycle scripts get no network, no credential env vars, no writes
-      outside a fixed floor, and no <code>$HOME</code> reads unless a
-      capability is approved; detected violations quarantine that exact
-      tarball fleet-wide</li>
+    <li>Deny-by-default sandbox (macOS Seatbelt, Linux
+      bubblewrap&nbsp;+&nbsp;Landlock): lifecycle scripts get no network,
+      no credential env vars, no writes outside a fixed floor, no
+      <code>$HOME</code> reads, and no executing binaries outside an
+      approved floor unless a capability is approved; detected violations
+      can quarantine that exact tarball fleet-wide (auto-quarantine is
+      opt-in)</li>
     <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
       CLI whose exit codes make <code>sentinel audit</code> a CI gate;
       <code>sentinel explain</code> turns a verdict into per-finding
