@@ -6,12 +6,12 @@ const repo = 'https://github.com/git-agentic/src-control';
 ---
 <Base
   title="src-control — version control built for fleets of agents"
-  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, signed commits, sealed agent-session transcripts, sc-native network transports, full Git interop."
+  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, signed commits, sealed agent-session transcripts, private branches with atomic publish, sc-native network transports, full Git interop."
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Phases 1–33 built</span>
+    <span class="badge"><span class="pulse"></span>Phases 1–34 built</span>
     <span class="badge">Rust</span>
     <span class="badge">Builds on Git, not against it</span>
   </div>
@@ -21,8 +21,9 @@ const repo = 'https://github.com/git-agentic/src-control';
   <p class="lead">
     A next-generation version control system built around a
     snapshot-and-tag model (Jujutsu-inspired), with in-memory virtual
-    worktrees, native committed secrets, and recipient-encrypted paths —
-    full path-level permissions are the long-term thesis.
+    worktrees, native committed secrets, recipient-encrypted paths, and
+    private branches — the path- and branch-level permission thesis,
+    now built end to end.
   </p>
 
   <p class="mute">
@@ -55,6 +56,12 @@ $ sc work --agents 4 -- cargo test
 <span class="comment"># seal an agent-session transcript and attach it to a commit, signed</span>
 $ sc transcript attach HEAD session.json --sign
 
+<span class="comment"># stage an embargoed fix on a private branch — content, paths, messages
+# all sealed to the recipient set — then make it public in one atomic move</span>
+$ sc branch hotfix --private --to alice
+$ sc branch grant hotfix --to bob
+$ sc branch publish hotfix
+
 <span class="comment"># interoperate with Git: import a repo's HEAD, export history back,
 # or use a Git repo (local or GitHub over https/ssh) as a remote</span>
 $ sc import --repo /path/to/git/repo
@@ -81,6 +88,14 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
       ergonomics (<code>sc conflicts</code>/<code>sc resolve</code>), history
       editing (cherry-pick, rebase, amend, undo), sparse checkouts,
       accidental-secret scanning, per-path encryption, packfiles/GC</li>
+    <li>Per-branch access control: a private branch seals <em>every</em>
+      object it introduces — snapshots, trees, blobs — with randomized
+      per-object encryption, so non-recipients see no content, no file
+      paths, no messages, no DAG shape. Grants are O(1) key wraps;
+      revocation rewraps keys without ever writing plaintext to the
+      object store; <code>sc branch publish</code> replays the sealed
+      history into public space in one atomic, <code>sc undo</code>-able
+      ref move, re-running the secret scanner at the boundary</li>
     <li>Provenance built in: Ed25519-signed commits with
       <code>sc verify --require</code> as a history-rewrite tripwire, and
       sealed agent-session transcripts attached to commits — plaintext
@@ -98,7 +113,7 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
 
   <h2>Status</h2>
   <p class="mute">
-    Phases 1–33 are built and tested. The arc so far: in-RAM virtual
+    Phases 1–34 are built and tested. The arc so far: in-RAM virtual
     worktrees and committed secrets (P1–2); persistent repos, merge,
     secret scanning, remotes, encrypted paths, packfiles/GC, Git
     export (P3–9); bidirectional Git sync, secret/permission lifecycle
@@ -109,11 +124,15 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
     control, partial clone, security hardening, sealed agent-session
     transcripts, and listener resource limits (P22–31); in-binary TLS
     for the HTTP transport and randomized protected-path encryption
-    (P32–33). Feature phases ship with runnable proof scripts — see
+    (P32–33); per-branch access control — private branches sealed to a
+    recipient set, with O(1) grant, plaintext-free revocation, and
+    atomic publish (P34). Feature phases ship with runnable proof scripts — see
     <code>demo/</code> in the repo. Pre-1.0 and design-partner alpha:
-    the cryptography has not had an independent audit, and
-    <code>sc+https://</code> trust is first-connection (TOFU) pinning —
-    the near-term promise is parallel agent workspaces and provenance,
+    the cryptography has not had an independent audit,
+    <code>sc+https://</code> trust is first-connection (TOFU) pinning,
+    and revoking a private-branch recipient protects what is sealed
+    afterwards — it cannot erase what they already fetched. The
+    near-term promise is parallel agent workspaces and provenance,
     not production secret management.
   </p>
 
