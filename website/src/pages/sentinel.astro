@@ -6,12 +6,12 @@ const repo = 'https://github.com/git-agentic/pkg-registry';
 ---
 <Base
   title="Sentinel — an agent-auditable security layer for npm"
-  description="A transparent auditing proxy in front of registry.npmjs.org: every tarball is scored by a deterministic engine and carries a verdict before install-time code runs."
+  description="An auditing proxy that grew into a first-class registry: every tarball is scored by a deterministic engine before install-time code runs, with verified namespace claims and time-locked retraction."
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Security layer built · pre-1.0 · packages not yet published</span>
+    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · packages not yet published</span>
     <span class="badge">Apache 2.0</span>
     <span class="badge">TypeScript</span>
   </div>
@@ -23,7 +23,9 @@ const repo = 'https://github.com/git-agentic/pkg-registry';
     registry.npmjs.org: it serves real packages unchanged, but intercepts
     every tarball, scores it with a deterministic audit engine, and attaches
     a verdict — so an agent or a human sees the risk <em>before</em>
-    install-time code runs.
+    install-time code runs. It has since grown into a first-class registry:
+    audit-gated publishes, verified namespace ownership, and time-locked
+    retraction — the capabilities a proxy structurally cannot offer.
   </p>
 
   <p class="mute">
@@ -82,7 +84,28 @@ $ sentinel audit is-odd 3.0.1
       <code>$HOME</code> reads, and no executing binaries outside an
       approved floor — each denial lifted only by an approved capability;
       detected violations can quarantine that exact tarball fleet-wide
-      (auto-quarantine is opt-in and auth-gated)</li>
+      (auto-quarantine is opt-in and auth-gated). The same sandbox is
+      reusable directly: <code>sentinel exec</code> runs any command under
+      it — no shell, argument boundaries preserved</li>
+    <li>A real write path: an npm-compatible, audit-gated publish route —
+      every version is scored before it is accepted and commits atomically
+      — with a deterministic native-vs-mirror resolution rule, so a claimed
+      name is served only from Sentinel's own store and can never be
+      shadowed by public npm (dependency confusion closed by construction)</li>
+    <li>Verified namespace claims: ownership is proven by a DNS TXT
+      challenge on the organization's apex domain and shipped as a signed,
+      offline claim corpus verified at boot; claims renew yearly and freeze
+      on failure — a lapsed name never falls through to public npm and
+      never auto-transfers to a domain's new owner</li>
+    <li>Time-locked retraction: a publisher can pull a bad release only
+      while it is younger than 72 hours <em>and</em> under 1,000 cumulative
+      downloads — past either bound, immutability is absolute. Retracted
+      versions leave a 410 tombstone, the identifier is permanently spent,
+      and a retraction advisory flags any lockfile still pinning it</li>
+    <li>Release-cooldown overlay: policy can hold freshly published
+      versions for a wall-clock window before installers see them — the
+      counter to burst attacks that ship trojaned releases within hours —
+      and last-known-good suggestions respect the hold</li>
     <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
       CLI whose exit codes make <code>sentinel audit</code> a CI gate;
       <code>sentinel explain</code> turns a verdict into per-finding
@@ -95,8 +118,14 @@ $ sentinel audit is-odd 3.0.1
       as a deploy-time gate, plus known-malicious advisory and CVE-range
       (SCA) detection</li>
     <li>Identity and history signals: typosquat and dependency-confusion
-      detection, and release-anomaly findings — maintainer takeover,
-      dormancy resurrection, new capabilities in a patch release</li>
+      detection, release-anomaly findings — maintainer takeover, dormancy
+      resurrection, new capabilities in a patch release — and native-payload
+      loader detection: raw-byte magic classification plus loader-chain
+      analysis catch binaries smuggled in as source files</li>
+    <li>Drop-in for real installers: npm, pnpm, Yarn (1 and Berry), and bun
+      work unmodified against the registry surface; leaving registry mode
+      requires an explicit acknowledgement and emits a revert manifest, so
+      claimed names cannot silently flip back to public npm</li>
     <li>Durable history and observability (opt-in, zero-dependency
       SQLite): verdict trends, top-flagged packages, and a violation
       timeline on the dashboard, the CLI, and <code>/-/metrics</code></li>
@@ -114,12 +143,16 @@ $ sentinel audit is-odd 3.0.1
     detection, supply-chain identity and release-anomaly heuristics,
     whole-tree lockfile auditing with SBOMs and signed attestations, a
     CI-native GitHub Action, an agent-native MCP server, durable
-    observability, and a hardened network trust boundary. Sentinel is
-    pre-1.0 and not yet production-hardened: no packages are published
-    yet, and the next milestone is a published, installable release plus
-    design-partner evidence — blocked incidents, false-positive rate,
-    audit latency. The long arc is policy and install-time permissions
-    for the whole ecosystem.
+    observability, and a hardened network trust boundary. The registry
+    evolution (Phases 30–33, ADRs 0045–0048) is implemented as of
+    2026-07-13: audit-gated publishes, verified namespace claims,
+    time-locked retraction, and an npm/pnpm/Yarn/bun-compatible surface
+    with a safe exit path. Sentinel is pre-1.0 and not yet
+    production-hardened: no packages are published yet, and the next
+    milestone is a published, installable release plus design-partner
+    evidence — blocked incidents, false-positive rate, audit latency. The
+    long arc is policy and install-time permissions for the whole
+    ecosystem.
   </p>
 
   <p class="mute">
