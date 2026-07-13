@@ -74,11 +74,12 @@ $ sc work --agents 4 -- cargo test</code></pre>
     <p class="tagline">An agent-auditable security layer for npm.</p>
     <p class="mute">
       Agents run <code>npm install</code> and execute code nobody read.
-      Sentinel is a transparent auditing proxy in front of
-      registry.npmjs.org: every tarball is scored by a deterministic engine
-      and carries a verdict <em>before</em> install-time code runs, and a
-      deny-by-default sandbox contains what does run. The agent can
-      request; only a human grants.
+      Sentinel is an auditing proxy in front of registry.npmjs.org that
+      grew into a first-class registry: every tarball is scored by a
+      deterministic engine and carries a verdict <em>before</em>
+      install-time code runs, a deny-by-default sandbox contains what does
+      run, and claimed names get verified ownership and time-locked
+      retraction. The agent can request; only a human grants.
     </p>
     <pre><code>  color-stream@1.4.1
   ────────────────────────────────────────
@@ -89,7 +90,7 @@ $ sc work --agents 4 -- cargo test</code></pre>
   <span class="bad">critical</span> [secret-exfil]     reads ~/.npmrc, AWS credentials…
 
   HTTP 403  x-sentinel-verdict: block</code></pre>
-    <p class="meta">TypeScript · security layer built · pre-1.0, packages not yet published</p>
+    <p class="meta">TypeScript · security layer + registry built · pre-1.0, packages not yet published</p>
     <p><a href="/sentinel">Full page →</a> &nbsp; <a href={pkgRegistry}>GitHub →</a></p>
   </section>
 
