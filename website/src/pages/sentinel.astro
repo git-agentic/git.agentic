@@ -5,7 +5,7 @@ import Footer from '../components/Footer.astro';
 const repo = 'https://github.com/git-agentic/pkg-registry';
 ---
 <Base
-  title="Sentinel — an agent-auditable security layer for npm"
+  title="Sentinel — an agent-auditable security layer and registry for npm"
   description="An auditing proxy that grew into a first-class registry: every tarball is scored by a deterministic engine before install-time code runs, with verified namespace claims and time-locked retraction."
 >
   <Header />
@@ -86,7 +86,7 @@ $ sentinel audit is-odd 3.0.1
       detected violations can quarantine that exact tarball fleet-wide
       (auto-quarantine is opt-in and auth-gated). The same sandbox is
       reusable directly: <code>sentinel exec</code> runs any command under
-      it — no shell, argument boundaries preserved</li>
+      it — no shell; argument boundaries preserved</li>
     <li>A real write path: an npm-compatible, audit-gated publish route —
       every version is scored before it is accepted and commits atomically
       — with a deterministic native-vs-mirror resolution rule, so a claimed
