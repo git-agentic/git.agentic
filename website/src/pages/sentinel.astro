@@ -11,7 +11,7 @@ const repo = 'https://github.com/git-agentic/pkg-registry';
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · packages not yet published</span>
+    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · v0.1.0-alpha.1 on npm</span>
     <span class="badge">Apache 2.0</span>
     <span class="badge">TypeScript</span>
   </div>
@@ -148,12 +148,16 @@ $ sentinel audit is-odd 3.0.1
     2026-07-13: audit-gated publishes, verified namespace claims,
     time-locked retraction, and an npm/pnpm/Yarn/bun-compatible surface
     with a safe exit path. Sentinel is pre-1.0 and not yet
-    production-hardened: no packages are published yet, and the next
-    milestone is a published, installable release plus design-partner
+    production-hardened, but it is now installable: the first alpha,
+    v0.1.0-alpha.1, is published to npm — all seven
+    <code>@git-agentic/sentinel-*</code> packages, under the
+    <code>alpha</code> dist-tag. The next milestone is design-partner
     evidence — blocked incidents, false-positive rate, audit latency. The
     long arc is policy and install-time permissions for the whole
     ecosystem.
   </p>
+
+  <pre><code>$ npm install -g @git-agentic/sentinel-cli@alpha @git-agentic/sentinel-proxy@alpha</code></pre>
 
   <p class="mute">
     Docs: <a href={`${repo}#readme`}>README</a> ·
