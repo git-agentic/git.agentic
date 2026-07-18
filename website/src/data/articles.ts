@@ -3,7 +3,6 @@ export interface Article {
   slug: string;
   title: string;
   description: string;
-  audience: string;
   published: string;
   modified: string;
 }
@@ -15,7 +14,6 @@ export const articles: Article[] = [
     title: 'Why git revert Does Not Fix AI Agent Regressions',
     description:
       'Git only restores code. Learn why AI agent rollback must also restore prompts, tools, models, memory, and schema as one coherent version.',
-    audience: 'For AI engineers operating stateful agents in production.',
     published: '2026-05-21',
     modified: '2026-07-18',
   },
@@ -25,7 +23,6 @@ export const articles: Article[] = [
     title: 'Version Control for AI Agents: A New Commit Primitive',
     description:
       'AI agents change more than code. A practical look at versioning prompts, tools, models, memory, and schema in one content-addressed commit.',
-    audience: 'For technical founders and developer-tool builders.',
     published: '2026-05-21',
     modified: '2026-07-18',
   },
@@ -35,7 +32,6 @@ export const articles: Article[] = [
     title: 'The Six Dimensions That Determine AI Agent Behavior',
     description:
       'Code, prompts, tools, model, memory, and schema jointly determine an AI agent’s behavior. Here is why production teams must version all six.',
-    audience: 'For backend and infrastructure engineers new to agent operations.',
     published: '2026-05-21',
     modified: '2026-07-18',
   },
@@ -45,7 +41,6 @@ export const articles: Article[] = [
     title: 'The Version Control Layer for Agentic Software',
     description:
       'Why software built and operated by AI agents needs a version-control substrate for behavior—not only a faster workflow around Git.',
-    audience: 'For investors, platform teams, and strategic readers.',
     published: '2026-05-21',
     modified: '2026-07-18',
   },

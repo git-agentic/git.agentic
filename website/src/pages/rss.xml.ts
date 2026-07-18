@@ -1,16 +1,7 @@
 import { articles, articleUrl } from '../data/articles';
+import { escapeXml } from '../utils/xml';
 
 const site = 'https://git-agentic.com';
-
-function escapeXml(value: string): string {
-  return value.replace(/[<>&'\"]/g, (character) => ({
-    '<': '&lt;',
-    '>': '&gt;',
-    '&': '&amp;',
-    "'": '&apos;',
-    '"': '&quot;',
-  })[character] ?? character);
-}
 
 export const GET = () => {
   const items = [...articles].reverse().map((article) => {

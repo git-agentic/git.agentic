@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const dist = new URL('../dist/', import.meta.url);
+const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 const site = 'https://git-agentic.com';
 
 function filesUnder(directory, extension) {
@@ -21,14 +22,14 @@ function matchOne(html, expression, label, file) {
 
 function outputPathFor(url) {
   const path = new URL(url, site).pathname;
-  if (path === '/') return join(dist.pathname, 'index.html');
+  if (path === '/') return join(dist, 'index.html');
   const withoutLeadingSlash = path.slice(1);
-  return join(dist.pathname, path.endsWith('/')
+  return join(dist, path.endsWith('/')
     ? `${withoutLeadingSlash}index.html`
     : `${withoutLeadingSlash}.html`);
 }
 
-const htmlFiles = filesUnder(dist.pathname, '.html');
+const htmlFiles = filesUnder(dist, '.html');
 assert.ok(htmlFiles.length > 0, 'No built HTML files found; run npm run build first');
 
 const titles = new Set();
@@ -36,7 +37,7 @@ const canonicals = new Set();
 
 for (const file of htmlFiles) {
   const html = readFileSync(file, 'utf8');
-  const name = relative(dist.pathname, file);
+  const name = relative(dist, file);
   const title = matchOne(html, /<title>(.*?)<\/title>/s, 'title', name);
   const description = matchOne(html, /<meta name="description" content="([^"]+)"/, 'meta description', name);
   const canonical = matchOne(html, /<link rel="canonical" href="([^"]+)"/, 'canonical URL', name);
@@ -59,6 +60,7 @@ for (const file of htmlFiles) {
   ]) {
     assert.ok(html.includes(required), `${name}: missing ${required}`);
   }
+  assert.ok(html.includes('name="twitter:card" content="summary"'), `${name}: square social image requires a summary card`);
 
   const jsonLdBlocks = [...html.matchAll(/<script type="application\/ld\+json">(.*?)<\/script>/gs)];
   assert.ok(jsonLdBlocks.length >= 3, `${name}: expected base structured data`);
@@ -72,12 +74,12 @@ for (const file of htmlFiles) {
   }
 }
 
-const sitemap = readFileSync(join(dist.pathname, 'sitemap.xml'), 'utf8');
+const sitemap = readFileSync(join(dist, 'sitemap.xml'), 'utf8');
 const sitemapUrls = new Set([...sitemap.matchAll(/<loc>(.*?)<\/loc>/g)].map(([, url]) => url));
 assert.deepEqual(sitemapUrls, canonicals, 'Sitemap URLs must exactly match page canonicals');
 
-const robots = readFileSync(join(dist.pathname, 'robots.txt'), 'utf8');
+const robots = readFileSync(join(dist, 'robots.txt'), 'utf8');
 assert.ok(robots.includes('Sitemap: https://git-agentic.com/sitemap.xml'), 'robots.txt must advertise the sitemap');
-assert.ok(statSync(join(dist.pathname, 'llms.txt')).size > 500, 'llms.txt is missing or unexpectedly small');
+assert.ok(statSync(join(dist, 'llms.txt')).size > 500, 'llms.txt is missing or unexpectedly small');
 
 console.log(`SEO checks passed for ${htmlFiles.length} pages and ${sitemapUrls.size} sitemap URLs.`);

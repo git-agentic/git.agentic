@@ -1,4 +1,5 @@
 import { articles, articleUrl } from '../data/articles';
+import { escapeXml } from '../utils/xml';
 
 const site = 'https://git-agentic.com';
 const staticPages = [
@@ -8,16 +9,6 @@ const staticPages = [
   { path: '/sentinel', lastmod: '2026-07-18', priority: '0.8' },
   { path: '/learn', lastmod: '2026-07-18', priority: '0.8' },
 ];
-
-function escapeXml(value: string): string {
-  return value.replace(/[<>&'\"]/g, (character) => ({
-    '<': '&lt;',
-    '>': '&gt;',
-    '&': '&amp;',
-    "'": '&apos;',
-    '"': '&quot;',
-  })[character] ?? character);
-}
 
 export const GET = () => {
   const pages = [
