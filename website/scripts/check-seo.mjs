@@ -24,6 +24,9 @@ function outputPathFor(url) {
   const path = new URL(url, site).pathname;
   if (path === '/') return join(dist, 'index.html');
   const withoutLeadingSlash = path.slice(1);
+  // Static assets from public/ (e.g. /.well-known/security.txt) exist verbatim in dist.
+  const verbatim = join(dist, withoutLeadingSlash);
+  if (!path.endsWith('/') && existsSync(verbatim) && statSync(verbatim).isFile()) return verbatim;
   return join(dist, path.endsWith('/')
     ? `${withoutLeadingSlash}index.html`
     : `${withoutLeadingSlash}.html`);
