@@ -13,6 +13,26 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  website:
+    name: website build and SEO checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: install
+        run: npm ci
+      - name: build
+        run: npm run build
+      - name: validate SEO output
+        run: npm run check:seo
+
   rust:
     name: cargo test (${{ matrix.os }})
     strategy:

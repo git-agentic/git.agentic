@@ -20,4 +20,4 @@ Two non-obvious commitments follow from this framing. The first is that destruct
 
 If you're building developer tools right now, the interesting strategic question isn't *can you build features on top of Git for agent developers?* You can; many people are. The more interesting question is whether the commit primitive itself has run out of room and what should replace it underneath. git.agentic is a bet that the answer is yes, and that the replacement is a content-addressed object whose schema is wide enough to capture everything that determines agent behavior — and narrow enough to remain a contract platforms can integrate against for years.
 
-The repo goes public in May 2026 alongside the 1.0 release. The interesting part of the bet isn't the technology. It's the API surface.
+The repo has been public since May 22, 2026. The interesting part of the bet isn't the technology. It's the API surface.

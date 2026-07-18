@@ -1,0 +1,58 @@
+---
+import Base from '../../layouts/Base.astro';
+import Header from '../../components/Header.astro';
+import Footer from '../../components/Footer.astro';
+import { articles, articleUrl } from '../../data/articles';
+
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@type': 'CollectionPage',
+  name: 'AI agent infrastructure guides',
+  description: 'Technical guides to version control, rollback, and infrastructure for AI agents.',
+  url: 'https://git-agentic.com/learn',
+  mainEntity: {
+    '@type': 'ItemList',
+    itemListElement: articles.map((article, index) => ({
+      '@type': 'ListItem',
+      position: index + 1,
+      name: article.title,
+      url: `https://git-agentic.com${articleUrl(article)}`,
+    })),
+  },
+};
+---
+<Base
+  title="AI Agent Version Control & Infrastructure Guides | git.agentic"
+  description="Technical guides to version control, atomic rollback, memory snapshots, and infrastructure for production AI agents."
+  modifiedTime="2026-07-18"
+  structuredData={structuredData}
+>
+  <Header />
+
+  <p class="eyebrow">Learn</p>
+  <h1>Version control and infrastructure for AI agents.</h1>
+  <p class="lead">
+    Direct, technical explanations of why agent behavior is wider than code,
+    what a coherent rollback must restore, and how the underlying commit
+    primitive changes when agents write and operate software.
+  </p>
+
+  <ul class="article-list">
+    {articles.map((article) => (
+      <li>
+        <a href={articleUrl(article)}>{article.title}</a>
+        <p>{article.description}</p>
+      </li>
+    ))}
+  </ul>
+
+  <Footer />
+</Base>
+
+<style>
+  .article-list { list-style: none; padding: 0; margin: 3rem 0 0; }
+  .article-list li { border-top: 1px solid var(--rule); padding: 1.4rem 0 0.5rem; }
+  .article-list a { font-family: var(--sans); font-size: 1.1rem; color: var(--fg); }
+  .article-list a:hover { color: var(--accent); }
+  .article-list p { color: var(--fg-mute); margin-top: 0.45rem; }
+</style>

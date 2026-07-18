@@ -2,28 +2,87 @@
 import Base from '../layouts/Base.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import FAQ from '../components/FAQ.astro';
 const repo = 'https://github.com/git-agentic/src-control';
+const desktop = `${repo}/tree/main/apps/desktop`;
+const faqs = [
+  {
+    question: 'What is src-control?',
+    answer: 'src-control is open-source version control built for fleets of AI agents. It combines copy-on-write virtual worktrees, a persistent collaborative VCS, encrypted paths and branches, signed provenance, Git interoperability, and a native desktop repository browser.',
+  },
+  {
+    question: 'Does src-control write agent worktrees to disk?',
+    answer: 'Virtual worktrees stay in memory. A tool that requires real files can receive an explicitly materialized temporary checkout, which src-control cleans up automatically.',
+  },
+  {
+    question: 'Does src-control replace Git?',
+    answer: 'No. src-control supports bidirectional Git interoperability, including import, export, and synchronization with local or hosted Git remotes.',
+  },
+  {
+    question: 'Does src-control have a desktop application?',
+    answer: 'Yes. Phase 35 adds a native Tauri v2 desktop browser for .sc repositories. It reads the object model directly and shows refs, snapshot history and provenance, public trees, and first-parent diffs. This first slice is deliberately read-only and keyless.',
+  },
+  {
+    question: 'Is src-control ready for production secret management?',
+    answer: 'No. It is a pre-1.0 design-partner alpha. The project explicitly states that its cryptography has not yet received an independent audit.',
+  },
+];
+const structuredData = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    '@id': 'https://git-agentic.com/src-control#software',
+    name: 'src-control',
+    description: 'Open-source version control for parallel AI agent worktrees, encrypted collaboration, signed provenance, Git interoperability, and native desktop repository browsing.',
+    url: 'https://git-agentic.com/src-control',
+    codeRepository: repo,
+    programmingLanguage: 'Rust',
+    license: 'https://www.apache.org/licenses/LICENSE-2.0',
+    isAccessibleForFree: true,
+    author: { '@id': 'https://git-agentic.com/#organization' },
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: [
+      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
+      { '@type': 'ListItem', position: 2, name: 'src-control', item: 'https://git-agentic.com/src-control' },
+    ],
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faqs.map((item) => ({
+      '@type': 'Question',
+      name: item.question,
+      acceptedAnswer: { '@type': 'Answer', text: item.answer },
+    })),
+  },
+];
 ---
 <Base
-  title="src-control — version control built for fleets of agents"
-  description="In-memory virtual worktrees: fork N parallel agent worktrees of a repo entirely in RAM and tear them down with zero residual files. Native committed secrets, signed commits, sealed agent-session transcripts, private branches with atomic publish, sc-native network transports, full Git interop."
+  title="In-Memory Git Worktrees for Parallel AI Agents | src-control"
+  description="Fork in-memory worktrees for parallel AI agents, collaborate through encrypted branches, sync with Git, and inspect native history in a read-only desktop app."
+  modifiedTime="2026-07-18"
+  structuredData={structuredData}
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Phases 1–34 built</span>
-    <span class="badge">Rust</span>
+    <span class="badge"><span class="pulse"></span>Phases 1–35 built</span>
+    <span class="badge">Rust · Tauri v2 · TypeScript</span>
     <span class="badge">Builds on Git, not against it</span>
   </div>
 
-  <h1>Fork N agent worktrees entirely in RAM.</h1>
+  <h1>In-memory worktrees for parallel AI agents.</h1>
 
   <p class="lead">
     A next-generation version control system built around a
     snapshot-and-tag model (Jujutsu-inspired), with in-memory virtual
     worktrees, native committed secrets, recipient-encrypted paths, and
-    private branches — the path- and branch-level permission thesis,
-    now built end to end.
+    private branches — plus a native desktop browser for refs, snapshot DAGs,
+    provenance, public trees, and diffs. The path- and branch-level permission
+    thesis is built end to end.
   </p>
 
   <p class="mute">
@@ -66,7 +125,11 @@ $ sc branch publish hotfix
 # or use a Git repo (local or GitHub over https/ssh) as a remote</span>
 $ sc import --repo /path/to/git/repo
 $ sc export --to /path/to/git/repo
-$ sc clone https://github.com/org/repo.git ./mirror</code></pre>
+$ sc clone https://github.com/org/repo.git ./mirror
+
+<span class="comment"># open a native .sc repository browser (read-only and keyless)</span>
+$ cd apps/desktop
+$ npm ci &amp;&amp; npm run tauri dev</code></pre>
 
   <h2>How it works</h2>
   <ul class="plain">
@@ -109,11 +172,20 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
       repo's HEAD in-process, export history back to Git commits, or sync
       bidirectionally with a Git remote, local or hosted (GitHub over
       https/ssh)</li>
+    <li>A native Tauri v2 desktop app reads <code>.sc</code> repositories
+      directly through the Rust crates — not through CLI output or a Git
+      export — and browses local and remote-tracking refs, the all-parent
+      snapshot DAG, signature and transcript provenance, public trees, and
+      first-parent diffs</li>
+    <li>The Phase 35 desktop read model is deliberately read-only and keyless:
+      protected files cross IPC only as locked states, private branches remain
+      opaque at their public manifests, and the WebView has no general
+      filesystem, shell, URL, process, or object-store command</li>
   </ul>
 
   <h2>Status</h2>
   <p class="mute">
-    Phases 1–34 are built and tested. The arc so far: in-RAM virtual
+    Phases 1–35 are built and tested. The arc so far: in-RAM virtual
     worktrees and committed secrets (P1–2); persistent repos, merge,
     secret scanning, remotes, encrypted paths, packfiles/GC, Git
     export (P3–9); bidirectional Git sync, secret/permission lifecycle
@@ -126,8 +198,11 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
     for the HTTP transport and randomized protected-path encryption
     (P32–33); per-branch access control — private branches sealed to a
     recipient set, with O(1) grant, plaintext-free revocation, and
-    atomic publish (P34). Feature phases ship with runnable proof scripts — see
-    <code>demo/</code> in the repo. Pre-1.0 and design-partner alpha:
+    atomic publish (P34); and a native Tauri v2 browser over the <code>.sc</code>
+    object model, with refs, all-parent history, provenance, public trees, and
+    first-parent diffs while protected and private states stay safe (P35).
+    Feature phases ship with runnable proofs and tests — see <code>demo/</code>
+    and <code>apps/desktop/</code> in the repo. Pre-1.0 and design-partner alpha:
     the cryptography has not had an independent audit,
     <code>sc+https://</code> trust is first-connection (TOFU) pinning,
     and revoking a private-branch recipient protects what is sealed
@@ -139,8 +214,11 @@ $ sc clone https://github.com/org/repo.git ./mirror</code></pre>
   <p class="mute">
     Docs: <a href={`${repo}#readme`}>README</a> ·
     <a href={`${repo}/blob/main/ARCHITECTURE.md`}>Architecture</a> ·
+    <a href={desktop}>Desktop app</a> ·
     <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
   </p>
+
+  <FAQ items={faqs} />
 
   <Footer />
 </Base>
