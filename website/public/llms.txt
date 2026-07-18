@@ -1,0 +1,33 @@
+# git.agentic
+
+> Open-source infrastructure for software built and operated by AI agents.
+
+git.agentic is an open-source suite led by Toni Bergholm. The flagship
+project versions the six dimensions that determine AI agent behavior—code,
+prompts, tools, model, memory, and schema—and can roll them back coherently.
+The suite also includes src-control for parallel in-memory agent worktrees and
+Sentinel for agent-auditable npm supply-chain security.
+
+## Products
+
+- [git.agentic](https://git-agentic.com/git-agentic): Version control and atomic rollback for AI agent behavior.
+- [src-control](https://git-agentic.com/src-control): In-memory, copy-on-write worktrees for parallel AI agents.
+- [Sentinel](https://git-agentic.com/sentinel): An auditing security layer and registry for npm used by agents.
+
+## Technical guides
+
+- [Why git revert does not fix AI agent regressions](https://git-agentic.com/learn/why-git-revert-does-not-fix-ai-agent-regressions)
+- [Version control for AI agents](https://git-agentic.com/learn/version-control-for-ai-agents)
+- [The six dimensions of AI agent behavior](https://git-agentic.com/learn/six-dimensions-of-ai-agent-behavior)
+- [The version control layer for agentic software](https://git-agentic.com/learn/version-control-layer-for-agentic-software)
+
+## Primary sources
+
+- [GitHub organization](https://github.com/git-agentic)
+- [git.agentic repository](https://github.com/git-agentic/git.agentic)
+- [Architecture](https://github.com/git-agentic/git.agentic/blob/main/docs/architecture/overview.md)
+- [Snapshot model](https://github.com/git-agentic/git.agentic/blob/main/docs/architecture/snapshot-model.md)
+- [Accepted architecture decisions](https://github.com/git-agentic/git.agentic/tree/main/docs/adr)
+
+All three projects are open source under Apache 2.0. Product status and
+limitations are stated on each product page. Contact: toni@git-agentic.com.

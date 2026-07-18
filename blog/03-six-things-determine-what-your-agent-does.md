@@ -28,7 +28,7 @@ The reason this matters is operational, not academic. When the agent regresses, 
 
 The path forward is treating the six as one versioned unit. A commit, in that model, is a snapshot of the full tuple — code, prompts, tool fingerprints, model identifiers, memory segments, schema version — at a single moment, with a single content-addressed identifier. Diffing two commits shows the changes across all six dimensions, not just code. Rolling back means restoring all six together, including running reverse schema migrations, so there's no in-between state where the code is at the old commit and the memory is still at the new one.
 
-That's what git.agentic is. The substrate is Git plus a content-addressed object store; the coordinator is a daemon that stages writes in a strict order so the word *atomic* means what it says. MVP targets are commit under two seconds, rollback under five, diff under one, on a workload that exercises all six dimensions changing at once.
+That's what git.agentic is. The substrate is Git plus a content-addressed object store; the coordinator is a daemon that stages writes in a strict order so the word *atomic* means what it says. The v1.0 targets are commit under two seconds, rollback under five, and diff under one. Demo-scale measurements are green; the rollback target at the committed one-million-row benchmark shape remains under verification.
 
 The demo driving the whole project is deliberately narrow. Clean `git clone`. `docker-compose up`. A scripted change that breaks the agent across multiple dimensions in a way `git revert` cannot fix. Then a single command that puts everything back. Five seconds, end-to-end.
 

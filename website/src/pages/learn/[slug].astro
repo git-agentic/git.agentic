@@ -1,0 +1,84 @@
+---
+import type { MarkdownInstance } from 'astro';
+import Base from '../../layouts/Base.astro';
+import Header from '../../components/Header.astro';
+import Footer from '../../components/Footer.astro';
+import { articles, articleUrl, type Article } from '../../data/articles';
+
+type MarkdownModule = MarkdownInstance<Record<string, unknown>>;
+
+export function getStaticPaths() {
+  const modules = import.meta.glob<MarkdownModule>('../../../../blog/*.md', { eager: true });
+
+  return articles.map((article) => {
+    const moduleEntry = Object.entries(modules).find(([path]) => path.endsWith(`/${article.source}`));
+    if (!moduleEntry) {
+      throw new Error(`Missing article source: ${article.source}`);
+    }
+
+    return {
+      params: { slug: article.slug },
+      props: { article, Content: moduleEntry[1].Content },
+    };
+  });
+}
+
+interface Props {
+  article: Article;
+  Content: MarkdownModule['Content'];
+}
+
+const { article, Content } = Astro.props;
+const articlePosition = articles.findIndex((item) => item.slug === article.slug);
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@type': 'BreadcrumbList',
+  itemListElement: [
+    { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
+    { '@type': 'ListItem', position: 2, name: 'Learn', item: 'https://git-agentic.com/learn' },
+    {
+      '@type': 'ListItem',
+      position: 3,
+      name: article.title,
+      item: `https://git-agentic.com${articleUrl(article)}`,
+    },
+  ],
+};
+---
+<Base
+  title={`${article.title} | git.agentic`}
+  description={article.description}
+  type="article"
+  publishedTime={article.published}
+  modifiedTime={article.modified}
+  structuredData={structuredData}
+>
+  <Header />
+
+  <article class="guide">
+    <p class="eyebrow"><a href="/learn">Learn</a> · Article {articlePosition + 1} of {articles.length}</p>
+    <Content />
+    <p class="article-meta">
+      Published <time datetime={article.published}>{article.published}</time> ·
+      Updated <time datetime={article.modified}>{article.modified}</time> ·
+      Toni Bergholm
+    </p>
+  </article>
+
+  <p class="next-step">
+    See the implementation and runnable broken-prompt demo on
+    <a href="https://github.com/git-agentic/git.agentic">GitHub</a>.
+  </p>
+
+  <Footer />
+</Base>
+
+<style>
+  .next-step {
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 1rem;
+    margin-top: 3rem;
+    color: var(--fg-mute);
+  }
+</style>

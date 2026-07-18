@@ -2,11 +2,64 @@
 import Base from '../layouts/Base.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import FAQ from '../components/FAQ.astro';
 const repo = 'https://github.com/git-agentic/pkg-registry';
+const faqs = [
+  {
+    question: 'What is Sentinel?',
+    answer: 'Sentinel is an open-source security layer and registry for npm. It audits package tarballs before install-time code runs and returns a deterministic allow, warn, or block verdict.',
+  },
+  {
+    question: 'How does Sentinel protect AI agents that install npm packages?',
+    answer: 'Sentinel places policy and human approval between an agent request and package execution. The agent can request an exception, but only a human can grant one.',
+  },
+  {
+    question: 'Does Sentinel modify packages from npm?',
+    answer: 'Its transparent proxy serves upstream packages unchanged while attaching audit findings and a verdict. The registry layer separately supports audit-gated publishing and verified namespace claims.',
+  },
+  {
+    question: 'Is Sentinel production ready?',
+    answer: 'Sentinel is pre-1.0 and published as an alpha. Its product page documents current capabilities and limitations; production adoption should follow that status.',
+  },
+];
+const structuredData = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    '@id': 'https://git-agentic.com/sentinel#software',
+    name: 'Sentinel',
+    description: 'Open-source npm supply-chain security and registry infrastructure for AI agents.',
+    url: 'https://git-agentic.com/sentinel',
+    codeRepository: repo,
+    programmingLanguage: 'TypeScript',
+    license: 'https://www.apache.org/licenses/LICENSE-2.0',
+    isAccessibleForFree: true,
+    author: { '@id': 'https://git-agentic.com/#organization' },
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: [
+      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
+      { '@type': 'ListItem', position: 2, name: 'Sentinel', item: 'https://git-agentic.com/sentinel' },
+    ],
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faqs.map((item) => ({
+      '@type': 'Question',
+      name: item.question,
+      acceptedAnswer: { '@type': 'Answer', text: item.answer },
+    })),
+  },
+];
 ---
 <Base
-  title="Sentinel — an agent-auditable security layer and registry for npm"
-  description="An auditing proxy that grew into a first-class registry: every tarball is scored by a deterministic engine before install-time code runs, with verified namespace claims and time-locked retraction."
+  title="npm Supply-Chain Security for AI Agents | Sentinel"
+  description="Audit npm packages before install-time code runs. Sentinel gives AI agents deterministic risk verdicts, sandbox enforcement, and human approval gates."
+  modifiedTime="2026-07-18"
+  structuredData={structuredData}
 >
   <Header />
 
@@ -16,7 +69,7 @@ const repo = 'https://github.com/git-agentic/pkg-registry';
     <span class="badge">TypeScript</span>
   </div>
 
-  <h1>Agents run <code class="h1code">npm install</code> and execute code nobody read.</h1>
+  <h1>npm supply-chain security for AI agents.</h1>
 
   <p class="lead">
     Sentinel is a transparent auditing proxy in front of
@@ -164,6 +217,8 @@ $ sentinel audit is-odd 3.0.1
     <a href={`${repo}/blob/main/ARCHITECTURE.md`}>Architecture</a> ·
     <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
   </p>
+
+  <FAQ items={faqs} />
 
   <Footer />
 </Base>

@@ -2,11 +2,64 @@
 import Base from '../layouts/Base.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import FAQ from '../components/FAQ.astro';
 const repo = 'https://github.com/git-agentic/git.agentic';
+const faqs = [
+  {
+    question: 'What is git.agentic?',
+    answer: 'git.agentic is open-source version control for AI agent behavior. It snapshots code, prompts, tools, model configuration, memory, and schema as one coherent version.',
+  },
+  {
+    question: 'Why is Git alone not enough to roll back an AI agent?',
+    answer: 'Git restores code, but an agent can remain broken because its prompts, model, tool interfaces, database memory, or schema moved independently. git.agentic restores all six dimensions together.',
+  },
+  {
+    question: 'Which AI agent frameworks does git.agentic support?',
+    answer: 'The public Python SDK includes a drop-in LangGraph checkpointer. The architecture also defines a framework-neutral sidecar integration for the Claude Agent SDK.',
+  },
+  {
+    question: 'Is git.agentic open source?',
+    answer: 'Yes. The Rust core, CLI, daemon, Python SDK, and runnable broken-prompt demo are available on GitHub under the Apache 2.0 license.',
+  },
+];
+const structuredData = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    '@id': 'https://git-agentic.com/git-agentic#software',
+    name: 'git.agentic',
+    description: 'Open-source version control and atomic rollback for AI agent behavior.',
+    url: 'https://git-agentic.com/git-agentic',
+    codeRepository: repo,
+    programmingLanguage: ['Rust', 'Python'],
+    license: 'https://www.apache.org/licenses/LICENSE-2.0',
+    isAccessibleForFree: true,
+    author: { '@id': 'https://git-agentic.com/#organization' },
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: [
+      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
+      { '@type': 'ListItem', position: 2, name: 'git.agentic', item: 'https://git-agentic.com/git-agentic' },
+    ],
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faqs.map((item) => ({
+      '@type': 'Question',
+      name: item.question,
+      acceptedAnswer: { '@type': 'Answer', text: item.answer },
+    })),
+  },
+];
 ---
 <Base
-  title="git.agentic — Git for agent behavior"
-  description="Atomic, reversible snapshots of the full system state — code, prompts, tools, model, memory, schema — that determines how an AI agent acts."
+  title="AI Agent Version Control & Atomic Rollback | git.agentic"
+  description="Version and roll back AI agent code, prompts, tools, models, memory, and schema atomically. Open-source Rust core, Python SDK, and LangGraph support."
+  modifiedTime="2026-07-18"
+  structuredData={structuredData}
 >
   <Header />
 
@@ -16,7 +69,7 @@ const repo = 'https://github.com/git-agentic/git.agentic';
     <span class="badge">Rust core · Python SDK</span>
   </div>
 
-  <h1>Git for agent behavior.</h1>
+  <h1>Version control and atomic rollback for AI agent behavior.</h1>
 
   <p class="lead">
     Atomic, reversible snapshots of the full system state — code, prompts,
@@ -141,6 +194,8 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
     <a href={`${repo}/blob/main/docs/architecture/snapshot-model.md`}>Snapshot model</a> ·
     <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
   </p>
+
+  <FAQ items={faqs} />
 
   <Footer />
 </Base>

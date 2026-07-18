@@ -5,10 +5,22 @@ import Footer from '../components/Footer.astro';
 const repo = 'https://github.com/git-agentic/git.agentic';
 const srcControl = 'https://github.com/git-agentic/src-control';
 const pkgRegistry = 'https://github.com/git-agentic/pkg-registry';
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@type': 'ItemList',
+  name: 'Open-source infrastructure for AI agents',
+  itemListElement: [
+    { '@type': 'ListItem', position: 1, name: 'git.agentic', url: 'https://git-agentic.com/git-agentic' },
+    { '@type': 'ListItem', position: 2, name: 'src-control', url: 'https://git-agentic.com/src-control' },
+    { '@type': 'ListItem', position: 3, name: 'Sentinel', url: 'https://git-agentic.com/sentinel' },
+  ],
+};
 ---
 <Base
-  title="git.agentic — infrastructure for the agentic age"
-  description="Version control, source control, and supply-chain security, rebuilt for when most commits are written by agents. Three open-source projects: git.agentic, src-control, Sentinel."
+  title="Open-Source Infrastructure for AI Agents | git.agentic"
+  description="Version control, parallel source control, and software supply-chain security for AI agents. Explore three open-source projects from git.agentic."
+  modifiedTime="2026-07-18"
+  structuredData={structuredData}
 >
   <Header />
 
@@ -21,9 +33,9 @@ const pkgRegistry = 'https://github.com/git-agentic/pkg-registry';
   <h1>The tooling under software assumes a human in the loop.</h1>
 
   <p class="lead">
-    Agents broke that assumption. git.agentic is three projects rebuilding
-    the base layer — version control, source control, and supply-chain
-    security — for the agentic age.
+    AI agents broke that assumption. git.agentic builds open-source version
+    control, source control, and software supply-chain security for software
+    written and operated by agents.
   </p>
 
   <pre class="thesis"><code><span class="bad">git revert</span>     assumes code is the only thing that changed   <span class="accent">→ git.agentic</span>
@@ -92,6 +104,17 @@ $ sc work --agents 4 -- cargo test</code></pre>
   HTTP 403  x-sentinel-verdict: block</code></pre>
     <p class="meta">TypeScript · security layer + registry built · pre-1.0 · v0.1.0-alpha.1 on npm</p>
     <p><a href="/sentinel">Full page →</a> &nbsp; <a href={pkgRegistry}>GitHub →</a></p>
+  </section>
+
+  <section class="pillar">
+    <h2 id="learn">Technical guides</h2>
+    <p class="tagline">Clear answers about versioning and rolling back AI agents.</p>
+    <ul class="plain">
+      <li><a href="/learn/why-git-revert-does-not-fix-ai-agent-regressions">Why <code>git revert</code> does not fix AI agent regressions</a></li>
+      <li><a href="/learn/version-control-for-ai-agents">Version control for AI agents: a new commit primitive</a></li>
+      <li><a href="/learn/six-dimensions-of-ai-agent-behavior">The six dimensions that determine AI agent behavior</a></li>
+    </ul>
+    <p><a href="/learn">Read all guides →</a></p>
   </section>
 
   <Footer />
