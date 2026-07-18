@@ -49,7 +49,7 @@ The revised page architecture assigns one clear intent to each canonical URL:
 |---|---|
 | `/` | What open-source infrastructure exists for software built by AI agents? |
 | `/git-agentic` | How do I version and atomically roll back AI agent behavior? |
-| `/src-control` | How can parallel AI agents use isolated in-memory worktrees? |
+| `/src-control` | How can parallel AI agents use isolated in-memory worktrees, encrypted collaboration, Git interoperability, and native history browsing? |
 | `/sentinel` | How can an AI agent inspect npm package risk before installation? |
 | `/learn/why-git-revert-does-not-fix-ai-agent-regressions` | Why does `git revert` leave a production AI agent broken? |
 | `/learn/version-control-for-ai-agents` | What should version control for AI agents capture? |

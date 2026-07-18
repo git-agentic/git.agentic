@@ -70,14 +70,16 @@ const structuredData = {
       src-control forks copy-on-write worktrees entirely in RAM — checkout
       to disk only when you ask — with native committed secrets, signed
       commits, sealed agent-session transcripts, private branches with
-      atomic publish, and bidirectional Git sync (local or GitHub).
+      atomic publish, bidirectional Git sync (local or GitHub), and a native
+      read-only desktop browser for refs, snapshot DAGs, provenance, public
+      trees, and diffs.
     </p>
     <pre><code><span class="comment"># fork 4 parallel in-RAM worktrees off one snapshot</span>
 $ sc demo --agents 4
 
 <span class="comment"># agent workspaces: run a command across N forks, harvest results</span>
 $ sc work --agents 4 -- cargo test</code></pre>
-    <p class="meta">Rust · Phases 1–34 built</p>
+    <p class="meta">Rust · Tauri v2 · TypeScript · Phases 1–35 built</p>
     <p><a href="/src-control">Full page →</a> &nbsp; <a href={srcControl}>GitHub →</a></p>
   </section>
 
