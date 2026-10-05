@@ -88,7 +88,7 @@ If a feature isn't in the demo path, it doesn't ship in MVP.
   The 1M-row criteria are not yet verified at the committed shape:
   snapshot measures green so far (18.81 ms @ 1M rows, laptop, approximated shape),
   but rollback measures 10.34 s @ 1M rows on laptop-class hardware —
-  a **target under verification** per [`CONTEXT.md`](../../CONTEXT.md),
+  a **target under verification** per [`GLOSSARY.md`](../../GLOSSARY.md),
   with the cloud-class run tracked in [issue #132](https://github.com/git-agentic/git.agentic/issues/132).
   See [`benchmarks.md`](../architecture/benchmarks.md) for the measurements.
 - **Narrative:** A blog post / video showing the broken-prompt demo that explains the wedge clearly enough that a hostile-but-fair YC partner gets it in under 90 seconds.
