@@ -264,7 +264,7 @@ The PII story will need refinement with a real security review. Documented now s
 | Write overhead | < 5ms per row | p99 latency added to agent writes by segment streaming |
 | Snapshot storage | < 2× changed data | Amortized over many snapshots |
 
-These are the binding v1.0 numbers — see [`CONTEXT.md`](../../CONTEXT.md) for the commitment vs target-under-verification vocabulary.
+These are the binding v1.0 numbers — see [`GLOSSARY.md`](../../GLOSSARY.md) for the commitment vs target-under-verification vocabulary.
 The point of committing to numbers publicly is so we don't ship a fast demo and a slow product.
 As of 2026-07-11, `rollback` < 5s is a **target under verification** at the committed shape
 (only measurement: 10.34 s on laptop-class hardware; cloud-class run tracked in
