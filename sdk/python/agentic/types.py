@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from pydantic import BaseModel
 
@@ -11,7 +10,7 @@ from pydantic import BaseModel
 class Commit(BaseModel):
     hash: str
     branch: str
-    parent: Optional[str] = None
+    parent: str | None = None
     message: str
     author: str
     timestamp: datetime
@@ -37,4 +36,4 @@ class Diff(BaseModel):
 class RollbackPlan(BaseModel):
     planned_steps: list[str]
     executed: bool
-    new_head_hash: Optional[str] = None
+    new_head_hash: str | None = None

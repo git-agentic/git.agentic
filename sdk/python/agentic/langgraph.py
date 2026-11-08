@@ -46,8 +46,9 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Optional, Sequence, cast
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
@@ -136,7 +137,7 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
 
     # ------------------------------------------------------------ get_tuple
 
-    def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         thread_id = _require_thread_id(config)
         requested_id = config.get("configurable", {}).get("checkpoint_id")
         branch = _branch_for_thread(thread_id)
@@ -194,11 +195,11 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
 
     def list(
         self,
-        config: Optional[RunnableConfig],
+        config: RunnableConfig | None,
         *,
-        filter: Optional[dict[str, Any]] = None,
-        before: Optional[RunnableConfig] = None,
-        limit: Optional[int] = None,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
         """Iterate historical checkpoints for the thread.
 
@@ -228,7 +229,7 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
         the end of each super-step, so the resume cycle stays correct.
         Durable replay of intra-step writes lands with ``ReadBlob``.
         """
-        return None
+        return
 
     # ------------------------------------------------- async pass-through
 
@@ -241,16 +242,16 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
     ) -> RunnableConfig:
         return self.put(config, checkpoint, metadata, new_versions)
 
-    async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         return self.get_tuple(config)
 
     async def alist(
         self,
-        config: Optional[RunnableConfig],
+        config: RunnableConfig | None,
         *,
-        filter: Optional[dict[str, Any]] = None,
-        before: Optional[RunnableConfig] = None,
-        limit: Optional[int] = None,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
     ) -> AsyncIterator[CheckpointTuple]:
         for tup in self.list(config, filter=filter, before=before, limit=limit):
             yield tup

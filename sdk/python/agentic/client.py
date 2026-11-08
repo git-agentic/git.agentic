@@ -18,7 +18,7 @@ import socket
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from ._framing import FrameError, read_frame, write_frame
 from .types import Commit, Diff, LogEntry, RollbackPlan
@@ -167,7 +167,7 @@ class AgenticClient:
     this is the right default.
     """
 
-    _default: "AgenticClient | None" = None
+    _default: AgenticClient | None = None
     _correlation_counter = itertools.count(1)
     _lock = threading.Lock()
 
@@ -183,7 +183,7 @@ class AgenticClient:
         self.request_timeout = request_timeout
 
     @classmethod
-    def default(cls) -> "AgenticClient":
+    def default(cls) -> AgenticClient:
         # Double-checked locking on the singleton. The outer fast path
         # avoids lock contention once initialised; the inner check
         # re-validates after acquiring so concurrent first callers don't
@@ -210,7 +210,7 @@ class AgenticClient:
             return {"head": None}
         return {"head": reply.get("hash")}
 
-    def resolve(self, name: str) -> Optional[str]:
+    def resolve(self, name: str) -> str | None:
         """Resolve a ref name to a commit hash, or ``None`` if not found.
 
         A daemon-side ``not_found`` class error is collapsed to ``None``;
@@ -229,11 +229,11 @@ class AgenticClient:
         message: str,
         prompts: dict[str, str | bytes] | None = None,
         tools: list[str] | None = None,
-        model: Optional[str] = None,
+        model: str | None = None,
         no_memory: bool = False,
-        author: Optional[str] = None,
-        code_sha: Optional[str] = None,
-        branch: Optional[str] = None,
+        author: str | None = None,
+        code_sha: str | None = None,
+        branch: str | None = None,
     ) -> Commit:
         # ADR-0010 Decision 3: prompts cross the wire as base64-encoded
         # bytes. Accept either ``str`` (encoded as UTF-8 first) or

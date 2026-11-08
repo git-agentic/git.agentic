@@ -1,6 +1,6 @@
 # git.agentic website
 
-Static site for git-agentic.com (canonical), with .dev and .org redirecting to .com. Four routes:
+Static site for git-agentic.com (canonical), with .dev and .org redirecting to .com. Routes (including `/learn` and four nested articles; see [DEPLOY.md](DEPLOY.md) for the full inventory):
 
 - `/` — suite landing page
 - `/git-agentic` — git.agentic product page
@@ -23,9 +23,5 @@ npm run build        # writes static HTML/CSS to dist/
 
 ## Deploy
 
-Deployed to bergholm.net via `scripts/deploy.sh` from the repo root, which
-rsyncs `website/dist/` to `/var/www/git-agentic.com/` and reloads nginx if
-the config has changed.
-
-See `scripts/deploy.sh` and `deploy/nginx/git-agentic.conf` for the
-serving setup.
+Cloudflare Workers Static Assets deployment and manual cutover instructions are in
+[DEPLOY.md](DEPLOY.md). The legacy nginx deployment remains available for rollback.
