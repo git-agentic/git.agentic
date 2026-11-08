@@ -26,6 +26,25 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run check:seo
+  deploy:
+    needs: build
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # Configure protection and secrets on these environments before enabling deployments.
+    environment: ${{ github.event_name == 'push' && 'website-production' || 'website-preview' }}
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm run check:seo
       - name: Deploy production
         if: github.event_name == 'push'
         run: npx wrangler deploy
@@ -36,7 +55,7 @@ jobs:
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::warning::Preview not uploaded: configure CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets."
+            echo "::warning::Preview not uploaded: configure CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID environment secrets."
             exit 0
           fi
           npx wrangler versions upload --preview-alias pr-${{ github.event.pull_request.number }}

@@ -9,16 +9,23 @@ Do not run the old rsync deployment during cutover.
 1. Choose the Cloudflare account and enable its workers.dev subdomain.
 2. Create an API token restricted to that account with **Account / Workers Scripts / Edit**.
    No DNS permission is needed for this workflow; attach domains manually with an appropriately privileged dashboard login.
-3. In GitHub repository Settings → Secrets and variables → Actions, add
-   `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (account ID from the Cloudflare dashboard).
-   Do not commit either value.
+3. Create GitHub environments **website-production** and **website-preview** before enabling deployment.
+   Restrict website-production to the `main` branch. Require designated owner approval for
+   website-preview, prevent self-review, and disable administrator bypass where available.
+   Store `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as **environment secrets only**;
+   do not store deployment credentials as repository/organization secrets accessible to PR jobs.
+   Use a separate Cloudflare preview account and token for website-preview, with no production access.
+   Initialize `git-agentic-site` and its workers.dev subdomain in both accounts.
+   A reviewer must inspect the exact PR workflow and package/script changes before approving a preview job:
+   approved PR code executes with the preview credential. Never approve an untrusted revision.
+   Do not commit either value. The build job has no environment or deployment credentials.
 4. From `website/`, run `npm ci`, `npm run build`, then an authorized initial
    `npx wrangler deploy` to create `git-agentic-site` before PR version uploads.
    The initial deployment only exposes workers.dev; this config contains no domain routes.
 5. Enable Version/Preview URLs for the Worker (also declared with `preview_urls: true`).
    Main pushes affecting website files, root-level `blog/**` article sources, or the deployment workflow run `wrangler deploy`.
-   Same-repository PRs run `wrangler versions upload --preview-alias pr-N`;
-   the URL is printed in the Actions log and does not change the active deployment.
+   After environment approval, same-repository PRs run `wrangler versions upload --preview-alias pr-N`;
+   the URL is printed in the Actions log and does not change the active deployment. Preview URLs use the separate preview account.
    When either secret is missing, PR preview upload skips with an Actions warning; production deploy still fails.
    Fork PRs build and check without secrets or preview uploads. Never use `pull_request_target` to execute PR code with credentials.
 
