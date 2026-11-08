@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
+import { devNull } from 'node:os';
 
 const dist = new URL('../dist/', import.meta.url);
 const base = process.argv[2] ?? 'http://localhost:8787';
@@ -16,7 +17,7 @@ for (const path of ['/sitemap.xml', '/rss.xml', '/robots.txt', '/llms.txt']) che
 check('/missing-page-check', 404);
 check('/learn/missing-page-check', 404);
 function check(path, expected) {
-  const result = execFileSync('curl', ['--silent', '--show-error', '--max-time', '15', '--location', '--output', '/dev/null', '--write-out', '%{http_code} redirects=%{num_redirects}', `${base}${path}`], { encoding: 'utf8' });
+  const result = execFileSync('curl', ['--silent', '--show-error', '--max-time', '15', '--location', '--output', devNull, '--write-out', '%{http_code} redirects=%{num_redirects}', `${base}${path}`], { encoding: 'utf8' });
   assert.equal(result, `${expected} redirects=0`, path);
   console.log(`${path} ${result}`);
 }
