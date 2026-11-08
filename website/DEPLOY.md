@@ -19,6 +19,7 @@ Do not run the old rsync deployment during cutover.
    Main pushes affecting website files or the deployment workflow run `wrangler deploy`.
    Same-repository PRs run `wrangler versions upload --preview-alias pr-N`;
    the URL is printed in the Actions log and does not change the active deployment.
+   When either secret is missing, PR preview upload skips with an Actions warning; production deploy still fails.
    Fork PRs build and check without secrets or preview uploads. Never use `pull_request_target` to execute PR code with credentials.
 
 ## Routes and local proof
