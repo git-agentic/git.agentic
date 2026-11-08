@@ -16,7 +16,7 @@ Do not run the old rsync deployment during cutover.
    `npx wrangler deploy` to create `git-agentic-site` before PR version uploads.
    The initial deployment only exposes workers.dev; this config contains no domain routes.
 5. Enable Version/Preview URLs for the Worker (also declared with `preview_urls: true`).
-   Main pushes affecting website files or the deployment workflow run `wrangler deploy`.
+   Main pushes affecting website files, root-level `blog/**` article sources, or the deployment workflow run `wrangler deploy`.
    Same-repository PRs run `wrangler versions upload --preview-alias pr-N`;
    the URL is printed in the Actions log and does not change the active deployment.
    When either secret is missing, PR preview upload skips with an Actions warning; production deploy still fails.
