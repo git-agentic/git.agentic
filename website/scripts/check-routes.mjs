@@ -4,7 +4,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 
 const dist = new URL('../dist/', import.meta.url);
 const base = process.argv[2] ?? 'http://localhost:8787';
-for (const file of readdirSync(dist, { recursive: true }).filter((file) => file.endsWith('.html'))) {
+for (const file of readdirSync(dist, { recursive: true }).map((path) => path.replaceAll('\\', '/')).filter((file) => file.endsWith('.html'))) {
   const route = file === 'index.html' ? '/' : `/${file.slice(0, -5)}`;
   for (const path of new Set([route, route === '/' ? route : `${route}/`, `/${file}`])) {
     const body = execFileSync('curl', ['--silent', '--show-error', '--max-time', '15', `${base}${path}`], { encoding: 'utf8' });
