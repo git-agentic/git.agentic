@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 import pytest
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from agentic import AgenticClient
 from agentic.langgraph import (
@@ -30,8 +31,6 @@ from agentic.langgraph import (
     _deserialise_envelope,
     _serialise_envelope,
 )
-
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 
 @pytest.fixture

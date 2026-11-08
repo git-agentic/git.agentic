@@ -18,7 +18,8 @@ constructing :class:`AgenticClient` directly.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from .client import (
     DEFAULT_SOCKET_PATH,
@@ -38,22 +39,22 @@ from .types import Commit, Diff, LogEntry, RollbackPlan
 __version__ = "0.1.0"
 
 __all__ = [
-    "__version__",
+    "DEFAULT_SOCKET_PATH",
     "PROTOCOL_VERSION",
     "AgenticClient",
-    "AgenticError",
-    "AgenticProtocolError",
-    "AgenticValidationError",
-    "AgenticNotFoundError",
-    "AgenticStorageError",
-    "AgenticMemoryError",
     "AgenticConcurrencyError",
+    "AgenticError",
     "AgenticInternalError",
-    "DEFAULT_SOCKET_PATH",
+    "AgenticMemoryError",
+    "AgenticNotFoundError",
+    "AgenticProtocolError",
+    "AgenticStorageError",
+    "AgenticValidationError",
     "Commit",
     "Diff",
     "LogEntry",
     "RollbackPlan",
+    "__version__",
     "commit",
     "diff",
     "log",
