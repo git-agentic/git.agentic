@@ -15,7 +15,7 @@ export const articles: Article[] = [
     description:
       'Git only restores code. Learn why AI agent rollback must also restore prompts, tools, models, memory, and schema as one coherent version.',
     published: '2026-05-21',
-    modified: '2026-07-18',
+    modified: '2026-11-20',
   },
   {
     source: '02-git-for-the-agent-era.md',
@@ -24,7 +24,7 @@ export const articles: Article[] = [
     description:
       'AI agents change more than code. A practical look at versioning prompts, tools, models, memory, and schema in one content-addressed commit.',
     published: '2026-05-21',
-    modified: '2026-07-18',
+    modified: '2026-11-20',
   },
   {
     source: '03-six-things-determine-what-your-agent-does.md',
@@ -33,7 +33,7 @@ export const articles: Article[] = [
     description:
       "Code, prompts, tools, model, memory, and schema jointly determine an AI agent's behavior. Here is why production teams must version all six.",
     published: '2026-05-21',
-    modified: '2026-07-18',
+    modified: '2026-11-20',
   },
   {
     source: '04-version-control-layer-for-agentic-software.md',
@@ -42,7 +42,7 @@ export const articles: Article[] = [
     description:
       'Why software built and operated by AI agents needs a version-control substrate for behavior, not only a faster workflow around Git.',
     published: '2026-05-21',
-    modified: '2026-07-18',
+    modified: '2026-11-20',
   },
 ];
 
