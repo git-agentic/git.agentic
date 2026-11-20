@@ -135,9 +135,11 @@ struct Args {
     #[arg(long = "scanner-exempt-entropy-prefix", default_values_t = vec!["__langgraph__/".to_string()])]
     scanner_exempt_entropy_prefixes: Vec<String>,
 
-    /// Path to the 32-byte operator approval key for destructive rollback
-    /// (ADR-0014). Without it, every `accept_data_loss = true` rollback is
-    /// rejected fail-closed. If the flag is passed but the file exists and
+    /// Path to the 32-byte operator approval key (ADR-0014, ADR-0019).
+    /// Without a key, every `accept_data_loss = true` rollback and every
+    /// rollback that runs reverse migrations is rejected fail-closed.
+    /// Default: `<repo>/.agentic/approval.key` when that file exists.
+    /// If a key path is configured but the file exists and
     /// is readable yet is not exactly 32 bytes, the daemon aborts startup
     /// (an operator who configured a key but got it wrong should find out
     /// loudly); an absent, unreadable, or empty file leaves the daemon
@@ -175,6 +177,20 @@ struct Args {
     /// connection is closed. Issue #118.
     #[arg(long, default_value_t = 30)]
     write_idle_secs: u64,
+}
+
+/// The approval key path: the explicit flag, else `<agentic_dir>/approval.key`
+/// when that file exists (ADR-0019 Decision 3). `Path::exists` follows
+/// symlinks, so a dangling link counts as absent.
+fn approval_key_path(
+    explicit: Option<&std::path::Path>,
+    agentic_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let default = agentic_dir.join("approval.key");
+    default.exists().then_some(default)
 }
 
 /// Load the ADR-0014 approval key per Decisions 4 and 6.
@@ -463,7 +479,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ADR-0014: load the approval key (or fail-closed None) BEFORE binding
     // the socket, so a malformed key aborts startup before accepting work.
-    let approval_key = load_approval_key(args.approval_key_file.as_deref())?;
+    let approval_key = load_approval_key(
+        approval_key_path(args.approval_key_file.as_deref(), &agentic_dir).as_deref(),
+    )?;
 
     let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
@@ -638,7 +656,30 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_approval_key, validate_exempt_prefixes};
+    use super::{approval_key_path, load_approval_key, validate_exempt_prefixes};
+
+    // ADR-0019 Decision 3: the flag wins; otherwise the default file is used
+    // only when it exists.
+    #[test]
+    fn approval_key_path_discovers_the_default_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(approval_key_path(None, dir.path()), None);
+        let explicit = std::path::Path::new("/elsewhere/k");
+        assert_eq!(
+            approval_key_path(Some(explicit), dir.path()),
+            Some(explicit.to_path_buf())
+        );
+        std::fs::write(dir.path().join("approval.key"), [7u8; 32]).unwrap();
+        assert_eq!(
+            approval_key_path(None, dir.path()),
+            Some(dir.path().join("approval.key"))
+        );
+        // The flag still wins over an existing default.
+        assert_eq!(
+            approval_key_path(Some(explicit), dir.path()),
+            Some(explicit.to_path_buf())
+        );
+    }
 
     #[cfg(unix)]
     #[test]

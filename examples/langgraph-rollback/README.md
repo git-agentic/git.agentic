@@ -43,7 +43,8 @@ The script:
 1. brings up Postgres + pgvector via `podman compose` or `docker compose`
    (auto-detected; override with `CONTAINER_RUNTIME=docker|podman`),
 2. seeds 5 baseline `episodes` rows,
-3. builds `agenticd` and `agentic`, starts the daemon bound to this
+3. builds `agenticd` and `agentic`, creates `.agentic/approval.key` (the
+   operator approval key, see below), starts the daemon bound to this
    directory with `--postgres … --tables episodes:id`,
 4. asks the agent *"I'm thinking about cancelling my subscription."* —
    gets an empathetic answer,
@@ -93,7 +94,11 @@ history reflects the rollback action rather than rewriting it.
   NULL` column added in v0.8 and reverse-migrated on rollback; that
   requires the reverse SQL migration runner which is the next planned
   ADR-0002 §5 follow-up. Today the demo exercises prompts + memory
-  rollback only.
+  rollback only. A rollback that does run reverse migrations needs an
+  operator approval token ([ADR-0019](../../docs/adr/0019-approval-for-reverse-migration-rollback.md)).
+  The daemon reads `.agentic/approval.key` and the `agentic` CLI mints
+  the token from the same file, so `agentic rollback` is typed the same
+  way; a socket client without the key cannot run reverse migrations.
 - **Compose covers the database only.** `docker-compose.yml` starts
   Postgres + pgvector. `agenticd` and the Python agent are built and
   run locally by `scripts/run-demo.sh` — they are not containerised.
@@ -136,7 +141,8 @@ cd ../.. && cargo build --release -p agenticd -p agentic-cli && cd examples/lang
 # 3. Seed baseline + start daemon
 psql 'postgres://agentic:agentic@localhost:54322/agentic' -f seed.sql
 ../../target/release/agentic --repo . init
-../../target/release/agenticd --repo . \
+( umask 077 && head -c 32 /dev/urandom > .agentic/approval.key )
+../../target/release/agenticd --repo . --allowed-uid "$(id -u)" \
     --postgres 'postgres://agentic:agentic@localhost:54322/agentic' \
     --tables episodes:id &
 
