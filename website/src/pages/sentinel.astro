@@ -1,9 +1,11 @@
 ---
-import Base from '../layouts/Base.astro';
-import Header from '../components/Header.astro';
-import Footer from '../components/Footer.astro';
-import FAQ from '../components/FAQ.astro';
-const repo = 'https://github.com/git-agentic/pkg-registry';
+import Project from '../layouts/Project.astro';
+import Section from '../components/Section.astro';
+import Panel from '../components/Panel.astro';
+import Badge from '../components/Badge.astro';
+import { project } from '../data/projects';
+const p = project('Sentinel');
+const repo = p.repo;
 const faqs = [
   {
     question: 'What is Sentinel?',
@@ -19,84 +21,124 @@ const faqs = [
   },
   {
     question: 'Is Sentinel production ready?',
-    answer: 'Sentinel is pre-1.0 and published as an alpha (currently 0.1.0-alpha.2). Its product page documents current capabilities and limitations; production adoption should follow that status.',
+    answer: 'Sentinel is a pre-1.0 alpha (currently 0.1.0-alpha.2), it is not production hardened, and its APIs may change. Codento Engine runs it in production as an auditing npm proxy in observe mode, where it scores every tarball and blocks none. Enforcement (block) mode is not yet proven in production.',
   },
 ];
-const structuredData = [
-  {
-    '@context': 'https://schema.org',
-    '@type': 'SoftwareSourceCode',
-    '@id': 'https://git-agentic.com/sentinel#software',
-    name: 'Sentinel',
-    description: 'Open-source npm supply-chain security and registry infrastructure for AI agents.',
-    url: 'https://git-agentic.com/sentinel',
-    codeRepository: repo,
-    programmingLanguage: 'TypeScript',
-    license: 'https://www.apache.org/licenses/LICENSE-2.0',
-    isAccessibleForFree: true,
-    author: { '@id': 'https://git-agentic.com/#organization' },
-  },
-  {
-    '@context': 'https://schema.org',
-    '@type': 'BreadcrumbList',
-    itemListElement: [
-      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
-      { '@type': 'ListItem', position: 2, name: 'Sentinel', item: 'https://git-agentic.com/sentinel' },
-    ],
-  },
-  {
-    '@context': 'https://schema.org',
-    '@type': 'FAQPage',
-    mainEntity: faqs.map((item) => ({
-      '@type': 'Question',
-      name: item.question,
-      acceptedAnswer: { '@type': 'Answer', text: item.answer },
-    })),
-  },
+const docs = [
+  { label: 'README', href: `${repo}#readme` },
+  { label: 'Architecture', href: `${repo}/blob/main/ARCHITECTURE.md` },
+  { label: 'ADRs', href: `${repo}/tree/main/docs/adr` },
+  { label: 'Threat model', href: `${repo}/blob/main/sentinel-threat-model.md` },
+  { label: 'Security policy', href: `${repo}/blob/main/SECURITY.md` },
+  { label: 'Contributing', href: `${repo}/blob/main/CONTRIBUTING.md` },
+  { label: 'License', href: `${repo}/blob/main/LICENSE` },
 ];
 ---
-<Base
+<Project
+  project={p}
   title="npm Supply-Chain Security for AI Agents | Sentinel"
   description="Audit npm packages before install-time code runs. Sentinel gives AI agents deterministic risk verdicts, sandbox enforcement, and human approval gates."
-  modifiedTime="2026-11-20"
-  structuredData={structuredData}
+  heading="npm supply-chain security for AI agents."
+  softwareDescription="Open-source npm supply-chain security and registry infrastructure for AI agents."
+  programmingLanguage="TypeScript"
+  faqs={faqs}
+  docs={docs}
 >
-  <Header />
+  <Fragment slot="lead">
+    Sentinel is an auditing proxy in front of registry.npmjs.org. It serves
+    real packages unchanged, scores every tarball with a deterministic audit
+    engine and attaches a verdict, so an agent or a human sees the risk
+    before install-time code runs. It also works as a registry, with
+    audit-gated publishes and verified namespace ownership.
+  </Fragment>
 
-  <div class="badges">
-    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · v0.1.0-alpha.2 on npm</span>
-    <span class="badge">Apache 2.0</span>
-    <span class="badge">TypeScript</span>
-  </div>
+  <Fragment slot="status">
+    <div><dt>Maturity</dt><dd>Pre-1.0 alpha. Not production hardened. APIs may change.</dd></div>
+    <div><dt>Latest release</dt><dd>0.1.0-alpha.2 on npm, released 14 July 2026.</dd></div>
+    <div><dt>Production use</dt><dd>The auditing npm proxy in Codento Engine's build stack, in observe mode. There are no other production users.</dd></div>
+    <div><dt>Not yet done</dt><dd>Enforcement (block) mode is not yet proven in production. The November 2026 fixes are on <code>main</code> and not in a release yet.</dd></div>
+    <div><dt>Language</dt><dd>TypeScript</dd></div>
+    <div><dt>License</dt><dd>Apache 2.0</dd></div>
+  </Fragment>
 
-  <h1>npm supply-chain security for AI agents.</h1>
+  <Section id="quickstart" title="Quickstart" note="Needs Node.js and npm.">
+    <p>
+      The current alpha is 0.1.0-alpha.2. All seven
+      <code>@git-agentic/sentinel-*</code> packages are published under the
+      <code>alpha</code> dist-tag, and the <code>latest</code> tag points to
+      the same version.
+    </p>
+    <Panel title="shell" copy>
+<pre><code>$ npm install -g @git-agentic/sentinel-cli@alpha @git-agentic/sentinel-proxy@alpha
 
-  <p class="lead">
-    Sentinel is a transparent auditing proxy in front of
-    registry.npmjs.org: it serves real packages unchanged, but intercepts
-    every tarball, scores it with a deterministic audit engine, and attaches
-    a verdict — so an agent or a human sees the risk <em>before</em>
-    install-time code runs. It has since grown into a first-class registry:
-    audit-gated publishes, verified namespace ownership, and time-locked
-    retraction — the capabilities a proxy structurally cannot offer.
-  </p>
+<span class="comment"># audit a package version before anything installs it</span>
+$ sentinel audit is-odd 3.0.1</code></pre>
+    </Panel>
+  </Section>
 
-  <p class="mute">
-    npm can't retract bad releases, has no install-time permissions, and
-    lets attackers squat names. The event-stream pattern — a clean package
-    ships a trojaned patch release — still works today, and agents install
-    with zero risk signaling.
-  </p>
+  <Section id="features" title="Features" note="npm cannot retract bad releases, has no install-time permissions and lets attackers squat names. Agents install with no risk signal.">
+    <div class="grid-2">
+      <div class="card feature feature--wide">
+        <div class="badges"><Badge kind="prod" /></div>
+        <h3>Auditing proxy</h3>
+        <p>
+          The proxy resolves and serves real npm packages unchanged. It
+          intercepts every tarball, scores it and returns the verdict in
+          response headers. Under a <code>block</code> policy a bad tarball
+          becomes a 403 at install time.
+        </p>
+        <p>
+          Codento Engine runs this proxy in its build stack in observe mode.
+          It scores every tarball and blocks none yet. Block mode is not yet
+          proven in production.
+        </p>
+      </div>
+      <div class="card feature">
+        <h3>Deterministic scoring</h3>
+        <p>A score starts at 100 and loses a weighted penalty per finding. Any critical finding forces a block. The result is reproducible in CI.</p>
+      </div>
+      <div class="card feature">
+        <h3>Policy and human approval</h3>
+        <p>Policy is signed per enterprise. An agent can request an approval, and only a human can grant it.</p>
+      </div>
+      <div class="card feature">
+        <h3>Deny-by-default sandbox</h3>
+        <p>Lifecycle scripts run with no network, no credential environment variables and no writes outside a fixed floor, on macOS Seatbelt or Linux bubblewrap and Landlock.</p>
+      </div>
+      <div class="card feature">
+        <h3>Audit-gated publish</h3>
+        <p>An npm-compatible publish route scores every version before it is accepted and commits atomically.</p>
+      </div>
+      <div class="card feature">
+        <h3>Verified namespace claims</h3>
+        <p>An organization proves ownership of a name with a DNS TXT challenge on its apex domain. A claimed name is served only from Sentinel's own store.</p>
+      </div>
+      <div class="card feature">
+        <h3>Time-locked retraction</h3>
+        <p>A publisher can pull a bad release only while it is younger than 72 hours and under 1,000 cumulative downloads.</p>
+      </div>
+      <div class="card feature">
+        <h3>Whole-tree audits</h3>
+        <p>Audit every package in an npm, yarn or pnpm lockfile, write a CycloneDX SBOM, and produce signed attestations that verify offline.</p>
+      </div>
+      <div class="card feature">
+        <h3>Agent and CI interfaces</h3>
+        <p>A stdio MCP server for agent hosts, a CLI whose exit codes make <code>sentinel audit</code> a CI gate, and a GitHub Action that posts the verdict to the pull request.</p>
+      </div>
+    </div>
+  </Section>
 
-  <h2>The demo</h2>
-
-  <p class="mute">
-    A previously-clean package ships a patch release with a
-    <code>postinstall</code> that harvests secrets. Sentinel's verdict, and
-    what <code>npm install</code> sees when it fetches the bad tarball:
-  </p>
-
-  <pre><code>$ sentinel audit color-stream 1.4.1
+  <Section id="how-it-works" title="How it works">
+    <h3>The demo</h3>
+    <p>
+      A previously clean package ships a patch release with a
+      <code>postinstall</code> script that harvests secrets. This is the
+      event-stream pattern, and it still works against plain npm. Below is
+      Sentinel's verdict, and what <code>npm install</code> sees when it
+      fetches the bad tarball under a block policy.
+    </p>
+    <Panel title="sentinel audit">
+<pre><code>$ sentinel audit color-stream 1.4.1
 
   color-stream@1.4.1
   ────────────────────────────────────────────────────────
@@ -117,121 +159,189 @@ $ npm install --registry http://localhost:4873 color-stream
 <span class="comment"># and a clean package passes untouched</span>
 $ sentinel audit is-odd 3.0.1
 <span class="ok">  is-odd@3.0.1  → score 100/100  ALLOW  (signed, no install scripts)</span></code></pre>
+    </Panel>
+    <p class="note">
+      This transcript shows a block policy. The production deployment at
+      Codento Engine runs in observe mode and blocks nothing yet.
+    </p>
 
-  <h2>How it works</h2>
-  <ul class="plain">
-    <li>Transparent proxy: resolves and serves real npm packages unchanged;
-      the verdict rides response headers, and <code>block</code> policy
-      turns a bad tarball into a 403 at install time</li>
-    <li>Deterministic scoring — start at 100, weighted penalties per
-      finding, any critical forces block — fully reproducible in CI; an
-      LLM adapter only adds context, never the score</li>
-    <li>Policy and approval gate: signed per-enterprise policy — with a
-      lint and a dry-run impact preview against real audit history before
-      signing — capability manifests, and a hard privilege boundary: the
-      agent can request an approval, only a human can grant it, enforced
-      by signed Ed25519 role tokens on the control plane</li>
-    <li>Deny-by-default sandbox (macOS Seatbelt, Linux
-      bubblewrap&nbsp;+&nbsp;Landlock): lifecycle scripts get no network,
-      no credential env vars, no writes outside a fixed floor, no
-      <code>$HOME</code> reads, and no executing binaries outside an
-      approved floor — each denial lifted only by an approved capability;
-      detected violations can quarantine that exact tarball fleet-wide
-      (auto-quarantine is opt-in and auth-gated). The same sandbox is
-      reusable directly: <code>sentinel exec</code> runs any command under
-      it — no shell; argument boundaries preserved</li>
-    <li>A real write path: an npm-compatible, audit-gated publish route —
-      every version is scored before it is accepted and commits atomically
-      — with a deterministic native-vs-mirror resolution rule, so a claimed
-      name is served only from Sentinel's own store and can never be
-      shadowed by public npm (dependency confusion closed by construction)</li>
-    <li>Verified namespace claims: ownership is proven by a DNS TXT
-      challenge on the organization's apex domain and shipped as a signed,
-      offline claim corpus verified at boot; claims renew yearly and freeze
-      on failure — a lapsed name never falls through to public npm and
-      never auto-transfers to a domain's new owner</li>
-    <li>Time-locked retraction: a publisher can pull a bad release only
-      while it is younger than 72 hours <em>and</em> under 1,000 cumulative
-      downloads — past either bound, immutability is absolute. Retracted
-      versions leave a 410 tombstone, the identifier is permanently spent,
-      and a retraction advisory flags any lockfile still pinning it</li>
-    <li>Release-cooldown overlay: policy can hold freshly published
-      versions for a wall-clock window before installers see them — the
-      counter to burst attacks that ship trojaned releases within hours —
-      and last-known-good suggestions respect the hold</li>
-    <li>Agent-native surfaces: a stdio MCP server for agent hosts and a
-      CLI whose exit codes make <code>sentinel audit</code> a CI gate;
-      <code>sentinel explain</code> turns a verdict into per-finding
-      remediation and a suggested last-known-good version — advisory
-      only, it never rewrites a lockfile</li>
-    <li>Whole-tree gates: audit every package in an npm/yarn/pnpm lockfile,
-      write a CycloneDX SBOM, post the verdict to the PR via a GitHub
-      Action</li>
-    <li>Signed audit attestations (DSSE/in-toto, Ed25519) verified offline
-      as a deploy-time gate, plus known-malicious advisory and CVE-range
-      (SCA) detection</li>
-    <li>Identity and history signals: typosquat and dependency-confusion
-      detection, release-anomaly findings — maintainer takeover, dormancy
-      resurrection, new capabilities in a patch release — and native-payload
-      loader detection: raw-byte magic classification plus loader-chain
-      analysis catch binaries smuggled in as source files</li>
-    <li>Drop-in for real installers: npm, pnpm, Yarn (1 and Berry), and bun
-      work unmodified against the registry surface; leaving registry mode
-      requires an explicit acknowledgement and emits a revert manifest, so
-      claimed names cannot silently flip back to public npm</li>
-    <li>Durable history and observability (opt-in, zero-dependency
-      SQLite): verdict trends, top-flagged packages, and a violation
-      timeline on the dashboard, the CLI, and <code>/-/metrics</code></li>
-    <li>Hardened trust boundary: tarball fetches pinned to allowlisted
-      origins (no SSRF), Host-header spoofing refused, byte caps and
-      opt-in rate limits on expensive routes</li>
-  </ul>
+    <h3>The parts</h3>
+    <dl class="rows">
+      <div>
+        <dt>Scoring</dt>
+        <dd>
+          The audit engine starts at 100, subtracts a weighted penalty per
+          finding and forces a block on any critical finding. An LLM adapter
+          can add context to a verdict. It never changes the score.
+        </dd>
+      </div>
+      <div>
+        <dt>Policy and approval</dt>
+        <dd>
+          Per-enterprise policy is signed, with a lint and a dry-run impact
+          preview against real audit history before signing. Capability
+          manifests declare what a package may do at install time. The agent
+          can request an approval and only a human can grant it, enforced by
+          signed Ed25519 role tokens on the control plane.
+        </dd>
+      </div>
+      <div>
+        <dt>Sandbox</dt>
+        <dd>
+          Lifecycle scripts get no network, no credential environment
+          variables, no writes outside a fixed floor, no <code>$HOME</code>
+          reads, and cannot execute binaries outside an approved floor. Each
+          denial is lifted only by an approved capability. A detected
+          violation can quarantine that exact tarball fleet-wide.
+          <code>sentinel exec</code> runs any command under the same sandbox,
+          without a shell and with argument boundaries preserved.
+        </dd>
+      </div>
+      <div>
+        <dt>Publishing and resolution</dt>
+        <dd>
+          The publish route is npm-compatible. Every version is scored before
+          it is accepted and commits atomically. A deterministic
+          native-versus-mirror rule serves a claimed name only from
+          Sentinel's own store, so public npm cannot shadow it. That closes
+          dependency confusion for claimed names.
+        </dd>
+      </div>
+      <div>
+        <dt>Namespace claims</dt>
+        <dd>
+          Ownership is proven by a DNS TXT challenge on the organization's
+          apex domain and shipped as a signed, offline claim corpus verified
+          at boot. Claims renew yearly and freeze on failure. A lapsed name
+          never falls through to public npm and never transfers
+          automatically to a domain's new owner.
+        </dd>
+      </div>
+      <div>
+        <dt>Retraction</dt>
+        <dd>
+          Past 72 hours or 1,000 cumulative downloads, a release is
+          immutable. A retracted version leaves a 410 tombstone, its
+          identifier is permanently spent, and a retraction advisory flags
+          any lockfile that still pins it.
+        </dd>
+      </div>
+      <div>
+        <dt>Release cooldown</dt>
+        <dd>
+          Policy can hold freshly published versions for a wall-clock window
+          before installers see them. This counters attacks that ship a
+          trojaned release and rely on installs within hours. Last-known-good
+          suggestions respect the hold.
+        </dd>
+      </div>
+      <div>
+        <dt>Detection</dt>
+        <dd>
+          Offline signature and Sigstore provenance verification,
+          known-malicious (GHSA) advisories and CVE-range detection, typosquat
+          and dependency-confusion detection, and release-anomaly findings:
+          maintainer takeover, dormancy resurrection and new capabilities in
+          a patch release. Raw-byte magic classification and loader-chain
+          analysis catch binaries shipped as source files.
+        </dd>
+      </div>
+      <div>
+        <dt>Remediation</dt>
+        <dd>
+          <code>sentinel explain</code> turns a verdict into per-finding
+          remediation and a suggested last-known-good version. It is
+          advisory and never rewrites a lockfile.
+        </dd>
+      </div>
+      <div>
+        <dt>Installers</dt>
+        <dd>
+          npm, pnpm, Yarn (1 and Berry) and bun work unmodified against the
+          registry. Leaving registry mode requires an explicit
+          acknowledgement and emits a revert manifest, so claimed names
+          cannot silently flip back to public npm.
+        </dd>
+      </div>
+      <div>
+        <dt>History and metrics</dt>
+        <dd>
+          Durable history is opt-in and stored in SQLite with no extra
+          dependency. It gives verdict trends, top-flagged packages and a
+          violation timeline on the dashboard, the CLI and
+          <code>/-/metrics</code>.
+        </dd>
+      </div>
+    </dl>
+  </Section>
 
-  <h2>Status</h2>
-  <p class="mute">
-    What started as the audit-proxy wedge has grown into the full layer
-    (July 2026): signed per-enterprise policy and install-time permission
-    manifests, a deny-by-default capability sandbox, offline signature and
-    Sigstore-provenance verification, known-malicious (GHSA) and CVE-range
-    detection, supply-chain identity and release-anomaly heuristics,
-    whole-tree lockfile auditing with SBOMs and signed attestations, a
-    CI-native GitHub Action, an agent-native MCP server, durable
-    observability, and a hardened network trust boundary. The registry
-    evolution (Phases 30–33, ADRs 0045–0048) is implemented as of
-    2026-07-13: audit-gated publishes, verified namespace claims,
-    time-locked retraction, and an npm/pnpm/Yarn/bun-compatible surface
-    with a safe exit path. Sentinel is pre-1.0 and not yet
-    production-hardened and its APIs may change, but it is installable: the
-    current alpha, v0.1.0-alpha.2 (released 14 July 2026), is on npm: all
-    seven <code>@git-agentic/sentinel-*</code> packages, under the
-    <code>alpha</code> dist-tag, and the <code>latest</code> tag points to it
-    as well. Since July: obfuscation false-positive fixes, approval identity
-    coverage and dependency updates. On 20 November 2026 a security-audit
-    fix round (#84) merged to <code>main</code>, and the audit now follows
-    install hooks that run npm, pnpm, yarn or bun scripts (#89). Both came
-    after 0.1.0-alpha.2 and are not in that release yet. The next milestone is design-partner
-    evidence — blocked incidents, false-positive rate, audit latency. The
-    long arc is policy and install-time permissions for the whole
-    ecosystem.
-  </p>
+  <Section id="security" title="Security and limits" note="Sentinel is a pre-1.0 alpha. Read this before you rely on it.">
+    <dl class="rows">
+      <div>
+        <dt>Alpha</dt>
+        <dd>Sentinel is pre-1.0 and not production hardened. Its APIs may change.</dd>
+      </div>
+      <div>
+        <dt>Observe mode in production</dt>
+        <dd>
+          Codento Engine runs Sentinel in observe mode. It scores every
+          tarball and blocks none yet, so enforcement (block) mode is not
+          yet proven in production. In that deployment installs fail closed
+          if the proxy is down, unless someone explicitly bypasses it. No
+          one outside Codento Engine runs Sentinel in production.
+        </dd>
+      </div>
+      <div>
+        <dt>Unreleased fixes</dt>
+        <dd>
+          The November 2026 security-audit fix round (#84) and install-hook
+          script following (#89) are on <code>main</code>. Both came after
+          0.1.0-alpha.2 and are not in a release yet.
+        </dd>
+      </div>
+      <div>
+        <dt>Evidence still to collect</dt>
+        <dd>The next milestone is design-partner evidence: blocked incidents, false-positive rate and audit latency.</dd>
+      </div>
+      <div>
+        <dt>Opt-in behavior</dt>
+        <dd>Auto-quarantine is opt-in and auth-gated. Rate limits on expensive routes are opt-in.</dd>
+      </div>
+      <div>
+        <dt>Network trust boundary</dt>
+        <dd>Tarball fetches are pinned to allowlisted origins to prevent SSRF, Host-header spoofing is refused, and expensive routes have byte caps.</dd>
+      </div>
+    </dl>
+    <p class="note">
+      The <a href={`${repo}/blob/main/sentinel-threat-model.md`}>threat model</a>
+      and the <a href={`${repo}/blob/main/SECURITY.md`}>security policy</a>
+      have the details.
+    </p>
+  </Section>
 
-  <pre><code>$ npm install -g @git-agentic/sentinel-cli@alpha @git-agentic/sentinel-proxy@alpha</code></pre>
-
-  <p class="mute">
-    Docs: <a href={`${repo}#readme`}>README</a> ·
-    <a href={`${repo}/blob/main/ARCHITECTURE.md`}>Architecture</a> ·
-    <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
-  </p>
-
-  <FAQ items={faqs} />
-
-  <Footer />
-</Base>
-
-<style>
-  .h1code {
-    font-size: 0.85em;
-    background: var(--bg-soft);
-    color: var(--accent-soft);
-  }
-</style>
+  <Section id="changes" title="Recent changes" note="November 2026">
+    <div class="changes">
+      <h3>November 2026</h3>
+      <ul>
+        <li>Sentinel runs in production at Codento Engine as the auditing npm proxy in the build stack, in observe mode.</li>
+        <li>On 20 November a security-audit fix round (#84) merged to <code>main</code>.</li>
+        <li>The audit now follows install hooks that run npm, pnpm, yarn or bun scripts (#89).</li>
+        <li>#84 and #89 came after 0.1.0-alpha.2 and are not in that release yet.</li>
+      </ul>
+      <h3>Since July 2026</h3>
+      <ul>
+        <li>Obfuscation false-positive fixes, approval identity coverage and dependency updates.</li>
+      </ul>
+      <h3>July 2026</h3>
+      <ul>
+        <li>0.1.0-alpha.2 was released on 14 July 2026.</li>
+        <li>
+          The registry work (Phases 30 to 33, ADRs 0045 to 0048) was
+          implemented as of 13 July 2026: audit-gated publishes, verified
+          namespace claims, time-locked retraction, and a registry that npm,
+          pnpm, Yarn and bun can use, with a safe exit path.
+        </li>
+      </ul>
+    </div>
+  </Section>
+</Project>

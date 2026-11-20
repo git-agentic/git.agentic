@@ -1,0 +1,121 @@
+---
+// Shared template for the three project pages: hero with a status panel,
+// section nav, the page's own sections, FAQ, and doc links.
+import Base from './Base.astro';
+import Badge from '../components/Badge.astro';
+import FAQ from '../components/FAQ.astro';
+import Section from '../components/Section.astro';
+import type { Project } from '../data/projects';
+
+interface Props {
+  project: Project;
+  title: string;
+  description: string;
+  heading: string;
+  softwareDescription: string;
+  programmingLanguage: string | string[];
+  faqs: { question: string; answer: string }[];
+  docs: { label: string; href: string }[];
+}
+const { project, title, description, heading, softwareDescription, programmingLanguage, faqs, docs } = Astro.props;
+const url = `https://git-agentic.com${project.href}`;
+const structuredData = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareSourceCode',
+    '@id': `${url}#software`,
+    name: project.name,
+    description: softwareDescription,
+    url,
+    codeRepository: project.repo,
+    programmingLanguage,
+    license: 'https://www.apache.org/licenses/LICENSE-2.0',
+    isAccessibleForFree: true,
+    author: { '@id': 'https://git-agentic.com/#organization' },
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'BreadcrumbList',
+    itemListElement: [
+      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
+      { '@type': 'ListItem', position: 2, name: project.name, item: url },
+    ],
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: faqs.map((item) => ({
+      '@type': 'Question',
+      name: item.question,
+      acceptedAnswer: { '@type': 'Answer', text: item.answer },
+    })),
+  },
+];
+const sections = [
+  ['status', 'Status'],
+  ['quickstart', 'Quickstart'],
+  ['features', 'Features'],
+  ['how-it-works', 'How it works'],
+  ['security', 'Security and limits'],
+  ['changes', 'Recent changes'],
+  ['faq', 'FAQ'],
+  ['docs', 'Docs'],
+];
+---
+<Base title={title} description={description} modifiedTime="2026-11-20" structuredData={structuredData}>
+  <div class="hero">
+    <div class="wrap project-hero">
+      <div class="project-hero__text">
+        <p class="eyebrow">{project.name}</p>
+        <h1>{heading}</h1>
+        <p class="lead"><slot name="lead" /></p>
+        <div class="actions">
+          <a class="btn" href={project.repo}>View on GitHub</a>
+          <a class="btn btn--ghost" href={`${project.repo}#readme`}>README</a>
+          <a class="btn btn--ghost" href="#quickstart">Quickstart</a>
+        </div>
+      </div>
+      <section class="card status-card" id="status" aria-labelledby="status-title">
+        <h2 id="status-title">Status</h2>
+        <div class="badges">
+          {project.badges.map((kind) => <Badge kind={kind} />)}
+        </div>
+        <p class="scope">{project.scope}</p>
+        <dl class="status"><slot name="status" /></dl>
+      </section>
+    </div>
+  </div>
+
+  <nav class="subnav" aria-label="On this page">
+    <div class="wrap">
+      <ul>
+        {sections.map(([id, label]) => <li><a href={`#${id}`}>{label}</a></li>)}
+      </ul>
+    </div>
+  </nav>
+
+  <slot />
+
+  <FAQ items={faqs} />
+
+  <Section id="docs" title="Docs and source" note="Everything links to the repository on GitHub.">
+    <ul class="doc-links">
+      {docs.map((item) => <li><a href={item.href}>{item.label}</a></li>)}
+    </ul>
+  </Section>
+</Base>
+
+<style is:global>
+  .project-hero { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr); gap: var(--s-7); align-items: center; }
+  .status-card h2 { margin-bottom: var(--s-3); font-size: var(--text-md); letter-spacing: 0; }
+  .status-card .scope { margin: var(--s-3) 0 var(--s-4); padding-bottom: var(--s-4); border-bottom: 1px solid var(--border); }
+  .subnav { position: sticky; top: 0; z-index: 5; border-block: 1px solid var(--border); background: var(--bg); }
+  .subnav ul { display: flex; gap: var(--s-1); list-style: none; margin: 0 -0.7rem; padding: 0; overflow-x: auto; }
+  .subnav li { margin: 0; }
+  .subnav a { display: block; padding: 0.75rem 0.7rem; color: var(--text-2); font-size: var(--text-sm); font-weight: 500; text-decoration: none; white-space: nowrap; }
+  .subnav a:hover { color: var(--text); }
+  .subnav + .section { border-top: 0; }
+  @media (max-width: 54rem) {
+    .project-hero { grid-template-columns: minmax(0, 1fr); gap: var(--s-6); }
+  }
+</style>

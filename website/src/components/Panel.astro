@@ -1,0 +1,13 @@
+---
+// Code panel. The page keeps its own <pre><code> so whitespace survives;
+// this only wraps it. `copy` lets the inline script in Base add a copy button.
+interface Props {
+  title: string;
+  copy?: boolean;
+}
+const { title, copy = false } = Astro.props;
+---
+<div class="panel" data-copy={copy ? '' : undefined}>
+  <div class="panel__bar"><span class="panel__title">{title}</span></div>
+  <slot />
+</div>

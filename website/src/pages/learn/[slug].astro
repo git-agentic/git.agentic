@@ -1,9 +1,7 @@
 ---
 import type { MarkdownInstance } from 'astro';
 import Base from '../../layouts/Base.astro';
-import Header from '../../components/Header.astro';
-import Footer from '../../components/Footer.astro';
-import { articles, articleUrl, type Article } from '../../data/articles';
+import { articles, articleUrl, formatDate, type Article } from '../../data/articles';
 
 type MarkdownModule = MarkdownInstance<Record<string, unknown>>;
 
@@ -29,7 +27,6 @@ interface Props {
 }
 
 const { article, Content } = Astro.props;
-const articlePosition = articles.findIndex((item) => item.slug === article.slug);
 const structuredData = {
   '@context': 'https://schema.org',
   '@type': 'BreadcrumbList',
@@ -53,32 +50,30 @@ const structuredData = {
   modifiedTime={article.modified}
   structuredData={structuredData}
 >
-  <Header />
+  <div class="wrap article-wrap">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <ol>
+        <li><a href="/">Home</a></li>
+        <li><a href="/learn">Learn</a></li>
+        <li aria-current="page">{article.title}</li>
+      </ol>
+    </nav>
 
-  <article class="guide">
-    <p class="eyebrow"><a href="/learn">Learn</a> · Article {articlePosition + 1} of {articles.length}</p>
-    <Content />
-    <p class="article-meta">
-      Published <time datetime={article.published}>{article.published}</time> ·
-      Updated <time datetime={article.modified}>{article.modified}</time> ·
-      Toni Bergholm
-    </p>
-  </article>
+    <article class="article">
+      <p class="article__meta">
+        Published <time datetime={article.published}>{formatDate(article.published)}</time>.
+        Updated <time datetime={article.modified}>{formatDate(article.modified)}</time>.
+        By Toni Bergholm.
+      </p>
+      <Content />
+    </article>
 
-  <p class="next-step">
-    See the implementation and runnable broken-prompt demo on
-    <a href="https://github.com/git-agentic/git.agentic">GitHub</a>.
-  </p>
-
-  <Footer />
+    <aside class="card article__next" aria-label="Next steps">
+      <p>
+        The implementation and the runnable broken-prompt demo are on
+        <a href="https://github.com/git-agentic/git.agentic">GitHub</a>.
+      </p>
+      <p><a href="/learn">All guides</a></p>
+    </aside>
+  </div>
 </Base>
-
-<style>
-  .next-step {
-    border: 1px solid var(--rule);
-    border-radius: 6px;
-    padding: 1rem;
-    margin-top: 3rem;
-    color: var(--fg-mute);
-  }
-</style>

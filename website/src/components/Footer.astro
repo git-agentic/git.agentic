@@ -1,15 +1,42 @@
 ---
+import { projects } from '../data/projects';
 const gh = 'https://github.com/git-agentic';
 ---
-<hr class="rule" />
-<footer class="site">
-  <span>git.agentic · Apache 2.0 · Toni Bergholm</span>
-  <span>
-    <a href={`${gh}/git.agentic`}>git.agentic</a> ·
-    <a href={`${gh}/src-control`}>src-control</a> ·
-    <a href={`${gh}/pkg-registry`}>Sentinel</a> ·
-    <a href="/learn">Learn</a> ·
-    <a href="/.well-known/security.txt">Security</a> ·
-    <a href="mailto:toni@git-agentic.com">toni@git-agentic.com</a>
-  </span>
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="site-footer__grid">
+      <div class="site-footer__about">
+        <a class="brand" href="/" aria-label="git.agentic home">git<span>.</span>agentic</a>
+        <p>Open source infrastructure for software written and run by AI agents.</p>
+      </div>
+      <nav aria-labelledby="footer-projects">
+        <h2 id="footer-projects">Projects</h2>
+        <ul>
+          {projects.map((item) => <li><a href={item.href}>{item.name}</a></li>)}
+        </ul>
+      </nav>
+      <nav aria-labelledby="footer-resources">
+        <h2 id="footer-resources">Resources</h2>
+        <ul>
+          <li><a href="/learn">Learn</a></li>
+          <li><a href="/rss.xml">RSS</a></li>
+          <li><a href="/.well-known/security.txt">security.txt</a></li>
+        </ul>
+      </nav>
+      <nav aria-labelledby="footer-source">
+        <h2 id="footer-source">Source</h2>
+        <ul>
+          {projects.map((item) => <li><a href={item.repo}>{item.repo.replace('https://github.com/', '')}</a></li>)}
+        </ul>
+      </nav>
+      <div>
+        <h2>Contact</h2>
+        <ul>
+          <li><a href="mailto:toni@git-agentic.com">toni@git-agentic.com</a></li>
+          <li><a href={gh}>GitHub organization</a></li>
+        </ul>
+      </div>
+    </div>
+    <p class="site-footer__legal">All three projects are licensed under Apache 2.0. Written by Toni Bergholm.</p>
+  </div>
 </footer>
