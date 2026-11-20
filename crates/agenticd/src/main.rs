@@ -91,6 +91,14 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     mcp: Vec<String>,
 
+    /// Canonical directory the operator asserts only agenticd can write
+    /// (for example a state volume root that only the daemon mounts). It is
+    /// exempt from the ancestor write check; the repo itself never is.
+    /// Without it, a world-writable volume root makes the daemon refuse
+    /// to start.
+    #[arg(long)]
+    trusted_volume_root: Option<PathBuf>,
+
     /// Object-store backend. `fs` (default) uses `<repo>/.agentic/objects`;
     /// `fs:///abs/path` uses an explicit on-disk root; `gcs://bucket[/prefix]`
     /// pushes every object through to Google Cloud Storage with a
@@ -353,7 +361,8 @@ async fn main() -> anyhow::Result<()> {
     // so no state is created under a directory we then refuse.
     // The canonical path is used from here on so the checked path cannot
     // be redirected through a symlink afterwards.
-    let repo = agenticd::state_dir::secure_state_dir(&args.repo)?;
+    let repo =
+        agenticd::state_dir::secure_state_dir(&args.repo, args.trusted_volume_root.as_deref())?;
 
     let postgres_url = agenticd::secrets::resolve_postgres_url(
         args.postgres.as_deref(),
@@ -406,12 +415,16 @@ async fn main() -> anyhow::Result<()> {
     let socket_path = args
         .socket
         .clone()
-        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
+        // Built from the repo as given, not the canonical path, so a deep
+        // checkout is not pushed past the Unix socket path limit.
+        .unwrap_or_else(|| args.repo.join(".agentic").join("agenticd.sock"));
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket parent directory {}", parent.display()))?;
     }
-    if socket_path.exists() {
+    // symlink_metadata so a dangling symlink is removed too; remove_file
+    // unlinks the link, never its target.
+    if std::fs::symlink_metadata(&socket_path).is_ok() {
         std::fs::remove_file(&socket_path)
             .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }

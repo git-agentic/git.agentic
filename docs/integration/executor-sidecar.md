@@ -22,11 +22,19 @@ The worker runs model-driven code and is treated as adversarial. The layout belo
 - The worker image sets a `USER` with a uid other than the sidecar's 65532 (Cloud Run runs each container as its image `USER`). The examples use 10001.
 - The daemon starts with `--allowed-uid 10001` and refuses to start without an allowlist (ADR-0012). It admits only that uid on the socket and records it on each commit. When the allowlist names a uid other than the daemon's own, the daemon creates the socket mode 0666, since connecting needs write permission on the file. The `SO_PEERCRED` check is what gates access.
 - `--repo` lives on its own emptyDir (`state`) that only the `agenticd` container mounts. The shared volume (`ipc`) carries the socket and nothing else. A worker that can write to a directory above the repo can rename the repo and plant its own `.agentic`, so the state volume must not be writable by the worker.
-- At startup the daemon resolves `--repo` to its canonical path and refuses to start, naming the path, if the repo or any ancestor up to `/` can be modified by another principal. That means owned by neither the daemon nor root, world-writable without the sticky bit, or group-writable with a group other than the daemon's. It also refuses if the repo is owned by another uid, or if `.agentic` is a symlink, owned by another uid, or already group- or world-writable. Otherwise it creates `.agentic` at mode 0700 or tightens an existing one to 0700.
+- At startup the daemon resolves `--repo` to its canonical path and refuses to start, naming the path, if:
+  - the repo is owned by another uid, or has any group or other write bit (the sticky bit and gid do not matter for the repo itself);
+  - any ancestor up to `/` is owned by neither the daemon nor root, or is world-writable without the sticky bit, or is group-writable with a group other than the daemon's. A sticky ancestor such as a root-owned `/tmp` passes when its child on the path is owned by the daemon or root;
+  - `.agentic` is a symlink, is owned by another uid, or is already group- or world-writable.
+
+  Otherwise it creates `.agentic` at mode 0700 or tightens an existing one to 0700.
+- Group-write with the daemon's own gid is allowed on ancestors, so user-private-group checkouts under umask 002 keep working. The residual is that the worker must not share the daemon's primary group (the sidecar image uses gid 65532).
+- `--trusted-volume-root <dir>` exempts one ancestor, matched by canonical path, from the ancestor check. Use it when only agenticd mounts that directory. Kubernetes-style emptyDir roots are often world-writable, and without the flag the daemon refuses to start. It never exempts the repo itself.
+- The socket path lives on the shared volume, so the worker can replace or remove the socket file. Nothing other than the worker's own client should trust that path.
 - Refs, objects, the GCS cache and `schema/*.down.sql` live in `.agentic`, so the worker cannot edit them. If the worker must read the prompts that rollback restores, mount the `state` volume into the worker read-only. Do not mount it writable.
 - Credentials arrive as files from Secret Manager volumes mounted into the `agenticd` container only. This removes the argv and environment exposure. It does not isolate the secrets from the worker: all containers in one Cloud Run instance share the service identity, so the worker can fetch the same secrets or call the bucket directly. Real isolation needs a separate identity for the sidecar (ADR-0015, Proposed).
 
-**Not verified on Cloud Run.** We have not confirmed the owner and mode of an emptyDir volume root, or whether it can be mounted read-only into one container. If the volume root is world-writable, the daemon refuses to start by design, and the layout needs a volume whose root is owned by the daemon or root and is not writable by other uids. Test the exact deployment before relying on it.
+**Not verified on Cloud Run.** We have not confirmed the owner and mode of an emptyDir volume root, or whether it can be mounted read-only into one container. If the root is world-writable, the daemon refuses to start unless you pass `--trusted-volume-root /state`. Pass it only because the `state` volume is mounted into the `agenticd` container alone. Test the exact deployment before relying on it.
 
 ## Cloud Run service definition (excerpt)
 
@@ -50,6 +58,8 @@ spec:
           args:
             - --repo
             - /state/work
+            - --trusted-volume-root
+            - /state
             - --socket
             - /ipc/agenticd.sock
             - --allowed-uid
@@ -91,6 +101,7 @@ Both emptyDirs are tmpfs; durability lives in GCS. Because `<repo>/.agentic/sche
 | Input | Meaning | Default |
 |---|---|---|
 | `--allowed-uid <uid>` | Uid allowed on the socket; repeatable. Required unless `--insecure-allow-any-uid` is passed (ADR-0012). | _none_; startup fails |
+| `--trusted-volume-root <dir>` | Ancestor of `--repo` that the operator asserts only agenticd can write; exempt from the ancestor write check. Never exempts the repo. | _none_ |
 | `--postgres-url-file <path>` | File holding the Postgres URL; surrounding whitespace is trimmed and an empty file is an error. Conflicts with `--postgres`. | _none_ |
 | `AGENTIC_GCS_TOKEN_FILE` | Path to a file holding the GCS bearer token, trimmed the same way. Setting it together with `AGENTIC_GCS_TOKEN` is an error. | _none_ |
 | `AGENTIC_GCS_ENDPOINT` | Override GCS host (for `tests/fixtures/fake-gcs.yml`) | public GCS |

@@ -213,6 +213,40 @@ mod state_dir {
     }
 
     #[test]
+    fn startup_removes_dangling_symlink_at_socket_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock = sock_dir.path().join("d.sock");
+        let target = sock_dir.path().join("does-not-exist");
+        std::os::unix::fs::symlink(&target, &sock).unwrap();
+        let mut child = Command::new(agenticd_bin())
+            .arg("--repo")
+            .arg(repo.path())
+            .arg("--socket")
+            .arg(&sock)
+            .arg("--insecure-allow-any-uid")
+            .spawn()
+            .expect("run agenticd");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let is_socket = |p: &std::path::Path| {
+            use std::os::unix::fs::FileTypeExt;
+            std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_socket())
+        };
+        while !is_socket(&sock) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let bound = is_socket(&sock);
+        let target_created = target.exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            bound,
+            "daemon should replace the dangling symlink with its socket"
+        );
+        assert!(!target_created, "the link target must never be created");
+    }
+
+    #[test]
     fn socket_is_0666_only_when_allowlist_names_another_uid() {
         // SAFETY: geteuid cannot fail.
         let euid = unsafe { libc::geteuid() };
