@@ -88,15 +88,19 @@ fn fixture() -> Fixture {
     }
 }
 
-fn run_rollback(f: &Fixture, extra: &[&str]) {
-    let out = Command::new(env!("CARGO_BIN_EXE_agentic"))
+fn rollback_cmd(f: &Fixture, extra: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_agentic"))
         .arg("--repo")
         .arg(f.repo.path())
         .args(["rollback", "main", "--yes"])
         .args(extra)
         .env("AGENTIC_SOCKET", f.sock_dir.path().join("d.sock"))
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn run_rollback(f: &Fixture, extra: &[&str]) {
+    let out = rollback_cmd(f, extra);
     assert!(
         out.status.success(),
         "agentic rollback failed: {}",
@@ -155,4 +159,21 @@ fn explicit_token_is_not_replaced() {
         *f.seen.lock().unwrap(),
         vec![Some("1:deadbeef".to_string())]
     );
+}
+
+#[test]
+fn unusable_default_key_sends_no_token_but_a_bad_explicit_key_fails() {
+    let f = fixture();
+    // Wrong length: the daemon would run keyless, so the CLI must not fail.
+    std::fs::write(f.repo.path().join(".agentic/approval.key"), [1u8; 5]).unwrap();
+    run_rollback(&f, &[]);
+    assert_eq!(*f.seen.lock().unwrap(), vec![None]);
+
+    let bad = f.repo.path().join(".agentic/approval.key");
+    let out = rollback_cmd(&f, &["--key-file", bad.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "an explicit bad key must be an error"
+    );
+    assert_eq!(f.seen.lock().unwrap().len(), 1, "no second request sent");
 }

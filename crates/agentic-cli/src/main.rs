@@ -280,6 +280,7 @@ async fn auto_approval_token(
     target: &str,
     key_file: Option<PathBuf>,
 ) -> anyhow::Result<Option<String>> {
+    let explicit = key_file.is_some();
     let Some(key_file) = rollback_key_path(repo, key_file) else {
         return Ok(None);
     };
@@ -300,7 +301,17 @@ async fn auto_approval_token(
         } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
-    mint_token(&key_file, &hash, current_uid()).map(Some)
+    match mint_token(&key_file, &hash, current_uid()) {
+        Ok(token) => Ok(Some(token)),
+        // A key the operator named must work. An unusable default file
+        // (empty, wrong length) leaves the daemon keyless too, so send no
+        // token and let the daemon decide whether one is needed.
+        Err(e) if !explicit => {
+            tracing::warn!("not attaching an approval token: {e:#}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn cmd_rollback(
