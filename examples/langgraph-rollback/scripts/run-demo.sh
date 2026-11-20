@@ -108,10 +108,11 @@ rm -rf "${DEMO_DIR}/.agentic"
 # agenticd refuses a repo or .agentic that is group- or world-writable.
 # A checkout or `init` under umask 002 creates them 0775.
 chmod go-w "${DEMO_DIR}" "${DEMO_DIR}/.agentic"
-# The rollback in step 10 reverses a schema migration, which needs an
-# operator approval token (ADR-0019). The daemon reads this key and the
+# Operator approval key (ADR-0019). A rollback that reverses a schema
+# migration needs an approval token; the daemon reads this key and the
 # `agentic` CLI mints the token from it, so the visible commands stay the
-# same. The key must be 0600 or the daemon refuses to start.
+# same. The demo's step 10 rollback has no schema change today and so
+# consumes no token. The key must be 0600 or the daemon refuses to start.
 APPROVAL_KEY="${DEMO_DIR}/.agentic/approval.key"
 if [[ ! -f "${APPROVAL_KEY}" ]]; then
     ( umask 077 && head -c 32 /dev/urandom > "${APPROVAL_KEY}" )

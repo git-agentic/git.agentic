@@ -39,6 +39,7 @@ If so, and the request is not a dry run, the request passes the same gate as an 
 The token format, the HMAC binding to the target commit and the peer UID, the five-minute window and the single-use ledger are the ADR-0014 ones, unchanged.
 
 The gate runs before any side effect.
+The down-migration files are loaded (read-only) just before it, so a missing or `IRREVERSIBLE` file is refused before a token is consumed or an `accepted` audit event is written.
 The code that builds the plan only reads: it resolves the ref, loads the target, checks the prompts tree and queries the backend for the live schema version and the pending migration names.
 The gate sits right after that, before the reverse migrations run, the memory restore, the prompts write-back and the forward-record.
 A refused request changes nothing.
@@ -91,12 +92,24 @@ An empty or unreadable file leaves the daemon running without a key.
 
 `agentic rollback` looks for a key: the `--key-file` flag if given, else `<repo>/.agentic/approval.key` if that file exists.
 The flag already exists for token issuance (`--approval`), and the rollback command reuses it.
-If it finds a key, it resolves the target ref to a commit hash with a `ResolveRef` request and mints a token for that hash and the CLI process's effective UID, which is the UID the daemon reads from the socket.
-It attaches the token to the rollback request, to the preview request and to the real one, so the operator is not asked for anything.
-A token passed explicitly with `--approval-token` is sent as given.
-If the CLI finds no key, it sends no token, and the daemon decides whether one is needed.
+A key named with `--key-file` must work, or the command fails.
+A default file the CLI cannot use, empty or the wrong length, gets a warning on stderr and no token.
+The warning goes to stderr so `--json` output stays parseable.
+(The daemon runs keyless on an empty file and refuses to start on a wrong-length one.)
 
-The CLI sends the token whenever it has a key, not only when a reverse migration is coming.
+If it has a key and the user supplied no token, the CLI pins the target.
+It resolves the ref with a `ResolveRef` request, refuses a result that is not exactly 64 lowercase hex characters, and sends that hash, not the ref name, in both the preview and the applied request.
+The token, the preview and the applied commit therefore name the same commit, even if a branch moves in between.
+
+Tokens are minted as late as possible.
+The preview, which is a dry run, carries no auto-minted token.
+After the operator confirms, the CLI mints a fresh token for the pinned hash and the CLI process's effective UID, which is the UID the daemon reads from the socket, and attaches it to the applied request only.
+A `--dry-run` request carries none either.
+The one exception is a destructive preview (`--accept-data-loss`): the daemon refuses that without a token before it reaches the dry-run branch, so the preview gets its own freshly minted token, which a dry run does not consume.
+A token passed explicitly with `--approval-token` is sent as given, on both requests, and the target is left as typed.
+If the CLI finds no usable key, it sends no token, and the daemon decides whether one is needed.
+
+The CLI mints whenever it has a key, not only when a reverse migration is coming.
 The daemon ignores a token it does not need.
 A token is consumed only when the gate passes on a non-dry-run request.
 

@@ -198,44 +198,51 @@ async fn main() -> anyhow::Result<()> {
             }
             let target = target
                 .ok_or_else(|| anyhow!("rollback requires a target ref (or use --approval)"))?;
-            // The daemon only demands a token for some rollbacks; sending one
-            // that is not needed is harmless, so attach it whenever the key
-            // is readable.
-            let approval_token = match approval_token {
-                Some(t) => Some(t),
-                None => auto_approval_token(&repo, &target, key_file).await?,
-            };
             cmd_rollback(
                 &repo,
-                target,
-                dry_run,
-                yes,
-                accept_data_loss,
-                approval_token,
-                cli.json,
+                RollbackOpts {
+                    target,
+                    dry_run,
+                    yes,
+                    accept_data_loss,
+                    approval_token,
+                    key_file,
+                    json: cli.json,
+                },
             )
             .await
         }
     }
 }
 
-/// Mint an approval token bound to `(commit_hash, uid, now)` from the
-/// 32-byte key at `key_file`.
-fn mint_token(key_file: &Path, commit_hash: &str, uid: u32) -> anyhow::Result<String> {
+fn read_key(key_file: &Path) -> anyhow::Result<agentic_core::approval::ApprovalKey> {
     let bytes = std::fs::read(key_file)
         .with_context(|| format!("reading approval key {}", key_file.display()))?;
-    let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes)
-        .with_context(|| format!("approval key {} is malformed", key_file.display()))?;
+    agentic_core::approval::ApprovalKey::from_bytes(&bytes)
+        .with_context(|| format!("approval key {} is malformed", key_file.display()))
+}
+
+/// Mint an approval token bound to `(commit_hash, uid, now)`.
+fn mint_with_key(
+    key: &agentic_core::approval::ApprovalKey,
+    commit_hash: &str,
+    uid: u32,
+) -> anyhow::Result<String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| anyhow!("system clock is before the Unix epoch"))?;
     Ok(agentic_core::approval::generate_token(
-        &key,
+        key,
         commit_hash,
         uid,
         now,
     ))
+}
+
+/// Mint a token from the 32-byte key at `key_file`.
+fn mint_token(key_file: &Path, commit_hash: &str, uid: u32) -> anyhow::Result<String> {
+    mint_with_key(&read_key(key_file)?, commit_hash, uid)
 }
 
 /// ADR-0014 operator token issuer. Prints a token to stdout. Does not
@@ -273,17 +280,39 @@ fn current_uid() -> u32 {
     0
 }
 
-/// Resolve `target` to the commit hash the daemon will gate on, then mint
-/// a token for it. `None` when no approval key is available.
-async fn auto_approval_token(
+/// The key a rollback mints its own tokens from, if there is a usable one.
+/// A key the operator named with `--key-file` must work, so a bad one is an
+/// error. A default file the CLI cannot use (empty or the wrong length) gets
+/// a warning on stderr and no token: the daemon runs keyless on an empty
+/// file and refuses to start on a wrong-length one, so there is nothing a
+/// token could do. The warning goes to stderr so `--json` stdout stays
+/// parseable.
+fn load_rollback_key(
     repo: &Path,
-    target: &str,
     key_file: Option<PathBuf>,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<agentic_core::approval::ApprovalKey>> {
     let explicit = key_file.is_some();
-    let Some(key_file) = rollback_key_path(repo, key_file) else {
+    let Some(path) = rollback_key_path(repo, key_file) else {
         return Ok(None);
     };
+    match read_key(&path) {
+        Ok(key) => Ok(Some(key)),
+        Err(e) if !explicit => {
+            eprintln!("warning: not attaching an approval token: {e:#}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A commit hash the CLI is willing to sign: exactly 64 lowercase hex
+/// characters. The CLI signs whatever the daemon returns, so check it.
+fn is_signable_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Resolve `target` to the commit hash the daemon will gate on.
+async fn resolve_pinned_hash(repo: &Path, target: &str) -> anyhow::Result<String> {
     let hash = match round_trip(
         repo,
         Request::ResolveRef {
@@ -301,28 +330,59 @@ async fn auto_approval_token(
         } => return Err(daemon_error(class, &code, &message, retryable)),
         other => return Err(anyhow!("unexpected response: {other:?}")),
     };
-    match mint_token(&key_file, &hash, current_uid()) {
-        Ok(token) => Ok(Some(token)),
-        // A key the operator named must work. An unusable default file
-        // (empty, wrong length) leaves the daemon keyless too, so send no
-        // token and let the daemon decide whether one is needed.
-        Err(e) if !explicit => {
-            tracing::warn!("not attaching an approval token: {e:#}");
-            Ok(None)
-        }
-        Err(e) => Err(e),
+    if !is_signable_hash(&hash) {
+        return Err(anyhow!(
+            "daemon resolved {target:?} to {hash:?}, which is not a 64-character lowercase hex \
+             commit hash; refusing to sign an approval token for it"
+        ));
     }
+    Ok(hash)
 }
 
-async fn cmd_rollback(
-    repo: &Path,
+struct RollbackOpts {
     target: String,
     dry_run: bool,
     yes: bool,
     accept_data_loss: bool,
+    /// Token the user supplied. Passed through unchanged.
     approval_token: Option<String>,
+    key_file: Option<PathBuf>,
     json: bool,
-) -> anyhow::Result<()> {
+}
+
+async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
+    let RollbackOpts {
+        target,
+        dry_run,
+        yes,
+        accept_data_loss,
+        approval_token,
+        key_file,
+        json,
+    } = o;
+    // ADR-0019 Decision 4. With no user-supplied token and a usable key, pin
+    // the target to the resolved commit hash so the token, the preview and
+    // the applied rollback all name the same commit, even if a branch moves.
+    let key = if approval_token.is_none() {
+        load_rollback_key(repo, key_file)?
+    } else {
+        None
+    };
+    let target = if key.is_some() {
+        resolve_pinned_hash(repo, &target).await?
+    } else {
+        target
+    };
+    let mint =
+        |key: &agentic_core::approval::ApprovalKey| mint_with_key(key, &target, current_uid());
+    // A preview is a dry run, which verifies a token without consuming it.
+    // It carries only a token the user supplied, except that a destructive
+    // preview is refused without one, so it gets its own short-lived mint.
+    let preview_token = match (&approval_token, &key) {
+        (Some(t), _) => Some(t.clone()),
+        (None, Some(k)) if accept_data_loss => Some(mint(k)?),
+        _ => None,
+    };
     if !dry_run && !yes {
         // First show the plan, then confirm.
         let plan = match round_trip(
@@ -331,7 +391,7 @@ async fn cmd_rollback(
                 target: target.clone(),
                 dry_run: true,
                 accept_data_loss,
-                approval_token: approval_token.clone(),
+                approval_token: preview_token,
             },
         )
         .await?
@@ -359,6 +419,15 @@ async fn cmd_rollback(
         }
     }
 
+    // An auto-minted token goes only on the confirmed, non-dry-run request,
+    // minted now so the time spent at the prompt does not eat its window.
+    let approval_token = match (approval_token, &key) {
+        (Some(t), _) => Some(t),
+        // With --dry-run there is no later request, so this one is the
+        // preview and follows the preview rule above.
+        (None, Some(k)) if !dry_run || accept_data_loss => Some(mint(k)?),
+        _ => None,
+    };
     let resp = round_trip(
         repo,
         Request::Rollback {

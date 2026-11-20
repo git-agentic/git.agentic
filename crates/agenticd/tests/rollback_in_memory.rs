@@ -1120,3 +1120,51 @@ async fn accept_data_loss_with_reverse_migration_consumes_one_token_once() {
     assert!(out.executed);
     assert_eq!(state.used_approval_tokens.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn refused_down_migration_load_does_not_consume_the_token() {
+    // The down.sql is checked before the gate, so a missing or IRREVERSIBLE
+    // file is refused with the token unspent.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let down = state.refs.agentic_dir().join("schema/002_bump.down.sql");
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let tip = state.refs.read_branch("main").unwrap();
+
+    for (what, contents, expect) in [
+        (
+            "irreversible",
+            Some("-- IRREVERSIBLE\nDROP TABLE t;\n"),
+            "IRREVERSIBLE",
+        ),
+        ("missing", None, "002_bump"),
+    ] {
+        match contents {
+            Some(c) => std::fs::write(&down, c).unwrap(),
+            None => std::fs::remove_file(&down).unwrap(),
+        }
+        let err = rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok.clone()), false),
+            Some(1000),
+        )
+        .await
+        .expect_err("an unloadable down migration must refuse the rollback");
+        assert!(format!("{err:#}").contains(expect), "{what}: {err:#}");
+        assert!(
+            state.used_approval_tokens.lock().unwrap().is_empty(),
+            "{what}: the token must not be consumed"
+        );
+        assert_untouched(&state, &adapter, tip).await;
+    }
+
+    // With the file fixed, the same token still works.
+    std::fs::write(&down, "-- no-op\n").unwrap();
+    rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        Some(1000),
+    )
+    .await
+    .expect("the unspent token authorizes the corrected rollback");
+}

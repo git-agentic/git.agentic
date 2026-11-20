@@ -17,10 +17,20 @@ fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn write_key(repo: &std::path::Path, mode: u32) {
+/// Create the state dir the way an operator would: the daemon refuses a
+/// group-writable repo or state dir, and `create_dir_all` follows the umask
+/// (0775 under umask 002), so pin both to 0700.
+fn state_dir(repo: &std::path::Path) -> std::path::PathBuf {
     let state = repo.join(".agentic");
     std::fs::create_dir_all(&state).unwrap();
-    let key = state.join("approval.key");
+    for dir in [repo, state.as_path()] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    state
+}
+
+fn write_key(repo: &std::path::Path, mode: u32) {
+    let key = state_dir(repo).join("approval.key");
     std::fs::write(&key, [5u8; 32]).unwrap();
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
 }
@@ -110,6 +120,7 @@ async fn default_key_file_is_picked_up() {
 #[tokio::test]
 async fn no_key_file_means_no_key() {
     let repo = tempfile::tempdir().unwrap();
+    state_dir(repo.path());
     assert_eq!(
         rollback_error_code(repo.path()).await,
         "approval_key_not_configured"

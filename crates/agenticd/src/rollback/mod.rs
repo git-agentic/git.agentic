@@ -383,6 +383,20 @@ pub async fn execute(
             plan.push(format!(
                 "reverse schema migrations: {live_schema} → {target_schema}"
             ));
+            // Phase 2: synchronous filesystem I/O — no adapter call in
+            // flight. `accept_data_loss` is forwarded so
+            // `check_irreversible` can honor the operator's opt-in for
+            // IRREVERSIBLE-marked migrations. Read-only, and ahead of the
+            // approval gate so a missing or IRREVERSIBLE `.down.sql` is
+            // refused before a single-use token is consumed and before an
+            // `accepted` audit event.
+            let steps = migrate::load_steps(
+                state.refs.agentic_dir(),
+                &migration_names,
+                args.accept_data_loss,
+            )
+            .context("loading reverse migration files")?;
+
             // ADR-0019: a rollback that runs reverse migrations needs the
             // approval token whether or not accept_data_loss is set. Nothing
             // above this point has a side effect. A dry run without a token
@@ -408,16 +422,6 @@ pub async fn execute(
                     .map_err(anyhow::Error::new)?;
                 }
             }
-            // Phase 2: synchronous filesystem I/O — no adapter call in
-            // flight. `accept_data_loss` is forwarded so
-            // `check_irreversible` can honor the operator's opt-in for
-            // IRREVERSIBLE-marked migrations.
-            let steps = migrate::load_steps(
-                state.refs.agentic_dir(),
-                &migration_names,
-                args.accept_data_loss,
-            )
-            .context("loading reverse migration files")?;
 
             // Phase 3: execute — atomic inside the backend.
             if !args.dry_run {
