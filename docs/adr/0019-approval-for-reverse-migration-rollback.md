@@ -1,0 +1,133 @@
+# ADR-0019: Approval for Reverse-Migration Rollback
+
+**Status:** Accepted
+**Owner:** Toni Bergholm
+**Date:** 2026-11-20
+**Amends:** [ADR-0014](./0014-destructive-rollback-approval-gate.md) (the approval gate now also covers rollbacks that run reverse migrations)
+**Threat model:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-002, plain-rollback residual (TM-001 shares the per-operation authorization question, which stays open)
+**Relates to:** [ADR-0012](./0012-socket-peer-authentication.md) Decision 2 (`peer_uid`), [ADR-0002](./0002-substrate-and-supercommit.md) Decision 5 (bounded rollback for destructive migrations)
+
+## Context
+
+ADR-0014 gates `Request::Rollback { accept_data_loss: true }` behind an operator approval token.
+It leaves a plain rollback (`accept_data_loss: false`) ungated.
+The 2026-11-20 threat-model reconciliation recorded the consequence in TM-002: an allowlisted socket peer, which in the sidecar shape is the adversarial worker, can send a plain `Rollback`.
+The daemon then runs every reverse migration that is not marked `IRREVERSIBLE` and restores memory, with no approval token.
+A reverse migration drops columns, tables and indexes.
+Whether or not it carries the `IRREVERSIBLE` marker, it is a schema change on the per-tenant database that the worker could trigger at will.
+
+ADR-0012 limits who can talk to the daemon.
+It does not limit which of those peers may run a schema change.
+The owner decided that any rollback that runs reverse migrations needs the ADR-0014 approval token, from any peer.
+
+## Decision summary
+
+| # | Decision | One-line rationale |
+|---|---|---|
+| 1 | A non-dry-run rollback whose plan includes at least one reverse migration passes the ADR-0014 gate, whether or not `accept_data_loss` is set. | The schema change is the dangerous operation, not the flag that acknowledges it. |
+| 2 | Without an approval key, such a rollback is refused, and the error names `--approval-key-file`. | Fail closed, as ADR-0014 Decision 4. |
+| 3 | If `--approval-key-file` is not given, the daemon uses `<repo>/.agentic/approval.key` when that file exists. | The operator needs no extra flag, and the CLI and daemon share one default location. |
+| 4 | The `agentic` CLI attaches a token to rollback requests on its own when it can read the key. | The operator's commands stay the same. A socket client without the key cannot run reverse migrations. |
+
+## Decisions
+
+### Decision 1: Reverse migrations pass the ADR-0014 gate
+
+Once the daemon knows the plan, it checks whether the plan includes at least one reverse migration.
+That means the live schema version differs from the target's and the backend reports at least one migration to reverse.
+If so, and the request is not a dry run, the request passes the same gate as an `accept_data_loss` rollback.
+The token format, the HMAC binding to the target commit and the peer UID, the five-minute window and the single-use ledger are the ADR-0014 ones, unchanged.
+
+The gate runs before any side effect.
+The code that builds the plan only reads: it resolves the ref, loads the target, checks the prompts tree and queries the backend for the live schema version and the pending migration names.
+The gate sits right after that, before the reverse migrations run, the memory restore, the prompts write-back and the forward-record.
+A refused request changes nothing.
+
+A request with `accept_data_loss: true` already passed the gate at the start.
+It is not checked a second time, so one token covers both reasons and is consumed once.
+
+Rollbacks with no schema change are unchanged.
+That includes a rollback whose target has no `schema_version`, and one whose target schema equals the live schema.
+
+Audit.
+The gate emits the existing `RollbackForcedDataLoss` event, with the same `decision` values.
+The event gains a `reason` field: `accept_data_loss` for the ADR-0014 trigger and `reverse_migration` for this one.
+Events from before this ADR carry no `reason` and mean `accept_data_loss`.
+An alert on forced data loss should filter on `reason = "accept_data_loss"`, so routine operator rollbacks that run reverse migrations do not trip it.
+An alert on rejected attempts, `decision = "rejected_*"`, should cover both reasons.
+
+Dry runs.
+A dry run reports that approval will be required, as an extra line in the plan output, when the plan includes a reverse migration.
+A dry run without a token is not refused, so an operator can preview.
+A dry run that carries a token still verifies it and does not consume it, as for `accept_data_loss` today.
+
+Wire errors.
+The refusals reuse the ADR-0014 codes: `approval_key_not_configured`, `approval_no_peer_uid`, `approval_required`, `approval_token_malformed`, `approval_token_expired`, `approval_token_invalid_signature` and `approval_token_replayed`.
+All are non-retryable validation errors.
+The messages name both triggers.
+
+### Decision 2: Fail closed without a key
+
+If no approval key is configured, a rollback that runs reverse migrations is refused with `approval_key_not_configured`.
+The message says to start `agenticd` with `--approval-key-file <path>`, or to place a 32-byte key at `<repo>/.agentic/approval.key`.
+There is no override flag.
+
+A daemon running with `--insecure-allow-any-uid` has no attested peer UID, so no token can bind to a peer.
+Such a rollback is refused with `approval_no_peer_uid`, as ADR-0014 already does for `accept_data_loss`.
+A deployment that wants reverse migrations must run with `--allowed-uid`.
+
+### Decision 3: Key discovery
+
+If `--approval-key-file` is not given, the daemon uses `<repo>/.agentic/approval.key` when that file exists.
+When the flag is given, the flag wins and the default file is ignored.
+A missing default file means no key, so Decision 2 applies.
+
+The file is read with the checks ADR-0014 and its 2026-11-20 amendment set.
+A file with any group or other mode bit set aborts startup with an error that names the path and says to `chmod 600` it.
+A key that is not exactly 32 bytes aborts startup.
+An empty or unreadable file leaves the daemon running without a key.
+
+### Decision 4: The CLI attaches a token
+
+`agentic rollback` looks for a key: the `--key-file` flag if given, else `<repo>/.agentic/approval.key` if that file exists.
+The flag already exists for token issuance (`--approval`), and the rollback command reuses it.
+If it finds a key, it resolves the target ref to a commit hash with a `ResolveRef` request and mints a token for that hash and the CLI process's effective UID, which is the UID the daemon reads from the socket.
+It attaches the token to the rollback request, to the preview request and to the real one, so the operator is not asked for anything.
+A token passed explicitly with `--approval-token` is sent as given.
+If the CLI finds no key, it sends no token, and the daemon decides whether one is needed.
+
+The CLI sends the token whenever it has a key, not only when a reverse migration is coming.
+The daemon ignores a token it does not need.
+A token is consumed only when the gate passes on a non-dry-run request.
+
+This also lets an operator who holds the key run `--accept-data-loss` without minting a token by hand.
+The flag is still required.
+
+## Consequences
+
+**Positive:**
+
+- A worker without the key cannot run reverse migrations.
+  The TM-002 plain-rollback residual closes for that case.
+- The operator's CLI keeps working with no new steps, as long as the key sits at the default path or is passed with `--key-file`.
+- No new wire fields, error codes or ledger.
+  The change is one more call site for the ADR-0014 gate.
+
+**Negative:**
+
+- Breaking for deployments that ran token-less rollbacks with reverse migrations.
+  They now need an approval key on the daemon and a token from the caller.
+  The daemon must also run with `--allowed-uid`.
+- The broken-prompt demo creates a key and starts the daemon with `--allowed-uid`.
+  Its current rollback has no schema change, so it consumes no token.
+- Any process under the same UID that can read the key can mint tokens.
+  ADR-0014's amendment says this already.
+  The mode check only excludes other UIDs.
+- The Python SDK sends no token, so an SDK client cannot run reverse migrations.
+  That is intended, because the SDK is what the worker uses.
+
+**Not covered:**
+
+- A rollback with no schema change still restores memory without a token.
+  Per-operation authorization for the other requests, `ReadObject` among them, stays an open decision in TM-001 and TM-002.
+- The ledger is per process, as in ADR-0014.
