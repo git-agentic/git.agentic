@@ -15,7 +15,9 @@ use crate::object::{Blob, Commit, Object, ObjectKind, Tree};
 use crate::scanner::{Allowlist, ScanPolicy, Scanner};
 use crate::{Error, Result};
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Fail if `computed` doesn't match the content address `declared`.
@@ -195,8 +197,10 @@ impl FsObjectStore {
     /// Write `bytes` at `path` unless it is already occupied. `classify`
     /// judges the occupant exactly as the matching read would: the same
     /// content is a dedup hit, a valid object of another kind is refused
-    /// (nothing is written), and a missing, unreadable or corrupt occupant
-    /// is replaced atomically.
+    /// (nothing is written), and a missing or corrupt occupant is replaced
+    /// atomically. "Corrupt" means the bytes were read but do not decode or
+    /// verify; a read that fails for any other reason (for example EACCES)
+    /// is an error, not licence to replace.
     fn write_unless_occupied(
         &self,
         hash: &Hash,
@@ -204,12 +208,20 @@ impl FsObjectStore {
         bytes: &[u8],
         classify: impl FnOnce(Vec<u8>) -> Occupant,
     ) -> Result<()> {
-        if let Ok(stored) = self.read_at(path) {
-            match classify(stored) {
-                Occupant::Same => return Ok(()),
-                Occupant::Different => return Err(Error::AddressOccupied { hash: *hash }),
-                Occupant::Corrupt => {}
+        match std::fs::read(path) {
+            Ok(compressed) => {
+                let occupant = match zstd::stream::decode_all(&compressed[..]) {
+                    Ok(stored) => classify(stored),
+                    Err(_) => Occupant::Corrupt,
+                };
+                match occupant {
+                    Occupant::Same => return Ok(()),
+                    Occupant::Different => return Err(Error::AddressOccupied { hash: *hash }),
+                    Occupant::Corrupt => {}
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         self.write_at(path, bytes)
     }
@@ -218,12 +230,31 @@ impl FsObjectStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write to a temp file in the same directory and atomically rename,
-        // so a crash mid-write never leaves a torn object in the store.
-        let tmp = path.with_extension("tmp");
+        // Write to a uniquely named temp file in the same directory and
+        // atomically rename, so a crash mid-write never leaves a torn object
+        // in the store and no other writer (including a store whose root
+        // nests this one) can share the temp file.
+        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let tmp = path.with_file_name(format!(
+            "{name}.{}.{}.tmp",
+            std::process::id(),
+            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+        ));
         let compressed = zstd::stream::encode_all(bytes, 3)?;
-        std::fs::write(&tmp, &compressed)?;
-        std::fs::rename(&tmp, path)?;
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&compressed)?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -697,5 +728,57 @@ mod tests {
         let inner = FsObjectStore::open(dir.path().join("raw")).unwrap();
         let h = Hash::of(b"x");
         assert_ne!(outer.raw_path_for(&h), inner.path_for(&h));
+    }
+
+    // An occupant that cannot be read (here: no permission) is neither a
+    // dedup hit nor corruption; the put fails and the file is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_occupant_fails_the_put_and_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"some prompt".to_vec();
+        let hash = Hash::of(&b);
+        let path = store.path_for(&hash);
+        store.write_at(&path, b"occupant").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            eprintln!("running as root: permissions not enforced, skipping");
+            return;
+        }
+
+        let result = store.put(&Object::Blob(Blob::new(b)));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(result, Err(Error::Io(_))), "{result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // Writers never share a temp file, so a foreign file at the old shared
+    // temp name survives, and a failed write leaves no temp file behind.
+    #[test]
+    fn write_at_uses_private_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let hash = Hash::of(b"x");
+        let path = store.path_for(&hash);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let foreign = path.with_extension("tmp");
+        std::fs::write(&foreign, b"someone else's temp").unwrap();
+
+        store.write_at(&path, b"payload").unwrap();
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"someone else's temp");
+        assert_eq!(store.read_at(&path).unwrap(), b"payload");
+
+        // Rename onto a non-empty directory fails; the temp file must go.
+        let blocked = store.path_for(&Hash::of(b"y"));
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        assert!(store.write_at(&blocked, b"payload").is_err());
+        let leftovers: Vec<_> = std::fs::read_dir(blocked.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "temp file left behind: {leftovers:?}");
     }
 }
