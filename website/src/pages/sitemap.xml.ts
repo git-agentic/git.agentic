@@ -7,7 +7,7 @@ const staticPages = [
   { path: '/git-agentic', lastmod: '2026-11-20', priority: '0.9' },
   { path: '/src-control', lastmod: '2026-11-20', priority: '0.8' },
   { path: '/sentinel', lastmod: '2026-11-20', priority: '0.8' },
-  { path: '/learn', lastmod: '2026-11-20', priority: '0.8' },
+  { path: '/learn', lastmod: '2026-07-18', priority: '0.8' },
 ];
 
 export const GET = () => {
