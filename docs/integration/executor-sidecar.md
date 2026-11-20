@@ -17,15 +17,16 @@ docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .
 
 ## Trust boundary
 
-The worker runs model-driven code and is treated as adversarial. It shares a volume with the daemon, so the layout below keeps the daemon's state out of its reach:
+The worker runs model-driven code and is treated as adversarial. The layout below keeps the daemon's state out of its reach:
 
 - The worker image sets a `USER` with a uid other than the sidecar's 65532 (Cloud Run runs each container as its image `USER`). The examples use 10001.
-- The daemon starts with `--allowed-uid 10001` and refuses to start without an allowlist (ADR-0012). It admits only that uid on the socket and records it on each commit.
-- The daemon creates and owns `--repo /shared/work`. At startup it creates `/shared/work/.agentic` with mode 0700, tightens an existing one to 0700, and refuses to start if the repo or `.agentic` is owned by another uid, if the repo is group- or world-writable, or if `.agentic` is a symlink. The error names the path.
-- Refs, objects, the GCS cache and `schema/*.down.sql` live in `.agentic`, so the worker cannot edit them. It can still read the prompt files that rollback restores under `/shared/work/prompts`.
-- Credentials arrive as files from Secret Manager volumes mounted into the `agenticd` container only. They never appear in argv or in the worker's environment.
+- The daemon starts with `--allowed-uid 10001` and refuses to start without an allowlist (ADR-0012). It admits only that uid on the socket and records it on each commit. When the allowlist names a uid other than the daemon's own, the daemon creates the socket mode 0666, since connecting needs write permission on the file. The `SO_PEERCRED` check is what gates access.
+- `--repo` lives on its own emptyDir (`state`) that only the `agenticd` container mounts. The shared volume (`ipc`) carries the socket and nothing else. A worker that can write to a directory above the repo can rename the repo and plant its own `.agentic`, so the state volume must not be writable by the worker.
+- At startup the daemon resolves `--repo` to its canonical path and refuses to start, naming the path, if the repo or any ancestor up to `/` can be modified by another principal. That means owned by neither the daemon nor root, world-writable without the sticky bit, or group-writable with a group other than the daemon's. It also refuses if the repo is owned by another uid, or if `.agentic` is a symlink, owned by another uid, or already group- or world-writable. Otherwise it creates `.agentic` at mode 0700 or tightens an existing one to 0700.
+- Refs, objects, the GCS cache and `schema/*.down.sql` live in `.agentic`, so the worker cannot edit them. If the worker must read the prompts that rollback restores, mount the `state` volume into the worker read-only. Do not mount it writable.
+- Credentials arrive as files from Secret Manager volumes mounted into the `agenticd` container only. This removes the argv and environment exposure. It does not isolate the secrets from the worker: all containers in one Cloud Run instance share the service identity, so the worker can fetch the same secrets or call the bucket directly. Real isolation needs a separate identity for the sidecar (ADR-0015, Proposed).
 
-The daemon cannot make the shared volume's root directory private. A worker that can write to `/shared` can rename `/shared/work` while the daemon is stopped or running, so the ownership check is a startup guard and not a substitute for a volume the worker cannot write. Keep the socket as the only thing the worker needs there.
+**Not verified on Cloud Run.** We have not confirmed the owner and mode of an emptyDir volume root, or whether it can be mounted read-only into one container. If the volume root is world-writable, the daemon refuses to start by design, and the layout needs a volume whose root is owned by the daemon or root and is not writable by other uids. Test the exact deployment before relying on it.
 
 ## Cloud Run service definition (excerpt)
 
@@ -39,16 +40,18 @@ spec:
           # The image must set USER 10001 (any uid other than 65532).
           image: gcr.io/<your-registry>/coding-worker:<tag>
           env:
-            - { name: AGENTICD_SOCKET, value: /shared/agenticd.sock }
+            - { name: AGENTICD_SOCKET, value: /ipc/agenticd.sock }
           volumeMounts:
-            - { name: shared, mountPath: /shared }
+            - { name: ipc, mountPath: /ipc }
+            # Only if the worker must read restored prompts, and only read-only:
+            # - { name: state, mountPath: /state, readOnly: true }
         - name: agenticd
           image: gcr.io/<your-registry>/agenticd-sidecar:<tag>
           args:
             - --repo
-            - /shared/work
+            - /state/work
             - --socket
-            - /shared/agenticd.sock
+            - /ipc/agenticd.sock
             - --allowed-uid
             - "10001"
             - --object-store
@@ -60,11 +63,14 @@ spec:
           env:
             - { name: AGENTIC_GCS_TOKEN_FILE, value: /secrets/gcs/token }
           volumeMounts:
-            - { name: shared, mountPath: /shared }
+            - { name: ipc, mountPath: /ipc }
+            - { name: state, mountPath: /state }
             - { name: gcs-token, mountPath: /secrets/gcs, readOnly: true }
             - { name: postgres-url, mountPath: /secrets/postgres, readOnly: true }
       volumes:
-        - name: shared
+        - name: ipc
+          emptyDir: { medium: Memory }
+        - name: state
           emptyDir: { medium: Memory }
         - name: gcs-token
           secret:
@@ -78,16 +84,14 @@ spec:
 
 Drop the `--postgres-url-file` and `--tables` lines if the deployment has no memory backend.
 
-`/shared` is tmpfs; durability lives in GCS. Because `<repo>/.agentic/schema` is empty on tmpfs at boot, reverse migrations need the sidecar image to provide the `.down.sql` files, for example copied into `/shared/work/.agentic/schema` by the sidecar's own entrypoint. The worker must never supply them: a plain rollback executes those files against Postgres.
-
-When an allowlist is enforced, the daemon sets the socket file to mode 0666 after binding, because connecting to a Unix socket needs write permission on the file and the worker is a different uid. The `SO_PEERCRED` check is what gates access.
+Both emptyDirs are tmpfs; durability lives in GCS. Because `<repo>/.agentic/schema` is empty on tmpfs at boot, reverse migrations need the sidecar image to provide the `.down.sql` files, for example copied into `/state/work/.agentic/schema` by the sidecar's own entrypoint. The worker must never supply them: a plain rollback executes those files against Postgres.
 
 ## Flags and env vars `agenticd` reads
 
 | Input | Meaning | Default |
 |---|---|---|
 | `--allowed-uid <uid>` | Uid allowed on the socket; repeatable. Required unless `--insecure-allow-any-uid` is passed (ADR-0012). | _none_; startup fails |
-| `--postgres-url-file <path>` | File holding the Postgres URL; one trailing newline is trimmed and an empty file is an error. Conflicts with `--postgres`. | _none_ |
+| `--postgres-url-file <path>` | File holding the Postgres URL; surrounding whitespace is trimmed and an empty file is an error. Conflicts with `--postgres`. | _none_ |
 | `AGENTIC_GCS_TOKEN_FILE` | Path to a file holding the GCS bearer token, trimmed the same way. Setting it together with `AGENTIC_GCS_TOKEN` is an error. | _none_ |
 | `AGENTIC_GCS_ENDPOINT` | Override GCS host (for `tests/fixtures/fake-gcs.yml`) | public GCS |
 | `AGENTIC_GCS_TOKEN` | Bearer for the GCS JSON API, as a plain env value. Fine for the demo and tests; prefer the file form in the sidecar. | _none_; required for real GCS unless the file form is used |
@@ -95,7 +99,7 @@ When an allowlist is enforced, the daemon sets the socket file to mode 0666 afte
 
 `--postgres <url>` still works for the demo and tests, but puts the password in argv. Use `--postgres-url-file` in the sidecar.
 
-The sidecar does NOT call ADC or the GCE metadata server itself. In v1.0 the only supported wiring is to **mount the token as a Secret Manager volume** into the `agenticd` container, as in the YAML excerpt above. ("Have the worker write it to `/shared`" is intentionally NOT supported: both containers start at the same time, `/shared` is empty on boot, and the sidecar would race the worker's first checkpoint. If token rotation past the Cloud Run instance lifetime becomes a requirement, file a follow-up, since that needs a refresh thread inside `agenticd`.)
+The sidecar does NOT call ADC or the GCE metadata server itself. In v1.0 the only supported wiring is to **mount the token as a Secret Manager volume** into the `agenticd` container, as in the YAML excerpt above. ("Have the worker write it to `/ipc`" is intentionally NOT supported: both containers start at the same time, `/ipc` is empty on boot, and the sidecar would race the worker's first checkpoint. If token rotation past the Cloud Run instance lifetime becomes a requirement, file a follow-up, since that needs a refresh thread inside `agenticd`.)
 
 ## Worker code
 
@@ -118,5 +122,5 @@ Per ADR-0004 Decision 4 there is no degraded mode. If the sidecar is unreachable
 ## Verification
 
 1. `docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .` succeeds.
-2. `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/.shared:/shared" agenticd:sidecar --repo /shared/work --socket /shared/agenticd.sock --insecure-allow-any-uid --object-store fs:///shared/objects` (the container uid must own the mounted directory, and the insecure flag is for this local check only) binds the socket and serves a `Ping`.
+2. `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/.state:/state" -v "$PWD/.ipc:/ipc" agenticd:sidecar --repo /state/work --socket /ipc/agenticd.sock --insecure-allow-any-uid` (the default `fs` object store lives under `/state/work/.agentic`; the container uid must own both mounted directories, and the insecure flag is for this local check only) binds the socket and serves a `Ping`.
 3. Same as (2) but with `--object-store gcs://...` against `tests/fixtures/fake-gcs.yml` completes one commit-and-rollback cycle. Covered by the `gcs` CI job today.

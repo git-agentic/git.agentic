@@ -72,23 +72,50 @@ mod state_dir {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    #[test]
-    fn refuses_group_writable_repo() {
-        let repo = tempfile::tempdir().unwrap();
+    /// Run the daemon expecting it to refuse to start; returns stderr. A
+    /// daemon that starts instead is killed and fails the test, so a
+    /// regression is a failure and not a hang.
+    fn expect_refusal(repo: &std::path::Path) -> String {
+        use std::process::Stdio;
         let sock = tempfile::tempdir().unwrap();
-        set_mode(repo.path(), 0o777);
-        let out = Command::new(agenticd_bin())
+        let mut child = Command::new(agenticd_bin())
             .arg("--repo")
-            .arg(repo.path())
+            .arg(repo)
             .arg("--socket")
             .arg(sock.path().join("d.sock"))
             .arg("--insecure-allow-any-uid")
-            .output()
+            .stderr(Stdio::piped())
+            .spawn()
             .expect("run agenticd");
-        assert!(!out.status.success());
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let out = child.wait_with_output().unwrap();
         assert!(
-            stderr.contains("writable") && stderr.contains(&*repo.path().to_string_lossy()),
+            status.is_some_and(|st| !st.success()),
+            "daemon should have refused to start"
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    #[test]
+    fn refuses_group_writable_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        set_mode(repo.path(), 0o777);
+        let stderr = expect_refusal(repo.path());
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        assert!(
+            stderr.contains("writable") && stderr.contains(&*canonical.to_string_lossy()),
             "stderr should name the repo path; got: {stderr}"
         );
         assert!(
@@ -120,32 +147,92 @@ mod state_dir {
         );
     }
 
-    #[test]
-    fn startup_leaves_state_dir_0700() {
-        let repo = tempfile::tempdir().unwrap();
+    /// Spawn the daemon (umask pinned to 022), wait for the socket, return
+    /// the socket and state-dir modes, then kill it.
+    fn run_and_stat(repo: &std::path::Path, extra: &[&str]) -> (u32, u32) {
+        use std::os::unix::process::CommandExt;
         let sock_dir = tempfile::tempdir().unwrap();
         let sock = sock_dir.path().join("d.sock");
-        let state = repo.path().join(".agentic");
-        std::fs::create_dir(&state).unwrap();
-        set_mode(&state, 0o777);
-        let mut child = Command::new(agenticd_bin())
-            .arg("--repo")
-            .arg(repo.path())
+        let mut cmd = Command::new(agenticd_bin());
+        cmd.arg("--repo")
+            .arg(repo)
             .arg("--socket")
             .arg(&sock)
-            .arg("--insecure-allow-any-uid")
-            .spawn()
-            .expect("run agenticd");
+            .args(extra);
+        // SAFETY: umask is async-signal-safe and runs in the child only.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o022);
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("run agenticd");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !sock.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let bound = sock.exists();
-        let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o7777;
+        let sock_mode =
+            bound.then(|| std::fs::metadata(&sock).unwrap().permissions().mode() & 0o7777);
+        let state_mode = std::fs::metadata(repo.join(".agentic"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
         let _ = child.kill();
         let _ = child.wait();
-        assert!(bound, "daemon did not bind the socket");
-        assert_eq!(mode, 0o700);
+        (
+            sock_mode.expect("daemon did not bind the socket"),
+            state_mode,
+        )
+    }
+
+    #[test]
+    fn startup_tightens_0755_state_dir_to_0700() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = repo.path().join(".agentic");
+        std::fs::create_dir(&state).unwrap();
+        set_mode(&state, 0o755);
+        let (_, state_mode) = run_and_stat(repo.path(), &["--insecure-allow-any-uid"]);
+        assert_eq!(state_mode, 0o700);
+    }
+
+    #[test]
+    fn refuses_existing_writable_state_dir() {
+        for m in [0o775, 0o777] {
+            let repo = tempfile::tempdir().unwrap();
+            let state = repo.path().join(".agentic");
+            std::fs::create_dir(&state).unwrap();
+            set_mode(&state, m);
+            let stderr = expect_refusal(repo.path());
+            assert!(
+                stderr.contains(".agentic") && stderr.contains("writable"),
+                "{m:o}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_is_0666_only_when_allowlist_names_another_uid() {
+        // SAFETY: geteuid cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let other = (euid + 1).to_string();
+        let own = euid.to_string();
+
+        let repo = tempfile::tempdir().unwrap();
+        let (sock_mode, _) = run_and_stat(repo.path(), &["--allowed-uid", &other]);
+        assert_eq!(
+            sock_mode, 0o666,
+            "worker uid listed: socket must be connectable"
+        );
+
+        let repo = tempfile::tempdir().unwrap();
+        let (sock_mode, _) = run_and_stat(repo.path(), &["--allowed-uid", &own]);
+        assert_eq!(sock_mode, 0o755, "own uid only: default umask applies");
+
+        let repo = tempfile::tempdir().unwrap();
+        let (sock_mode, _) = run_and_stat(repo.path(), &["--insecure-allow-any-uid"]);
+        assert_eq!(sock_mode, 0o755);
     }
 }
 

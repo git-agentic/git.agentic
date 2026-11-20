@@ -258,6 +258,32 @@ fn load_approval_key(
     Ok(Some(key))
 }
 
+/// Bind the listener. Connecting to a Unix socket needs write permission
+/// on the file, so when the allowlist names a uid other than the daemon's
+/// (the sidecar worker) the socket is created 0666 by loosening the umask
+/// for the bind call only; the SO_PEERCRED allowlist (ADR-0012) is what
+/// gates access. Otherwise the default umask applies.
+///
+/// The umask is process-wide, but this runs after state is opened and
+/// before the accept loop, when no other thread creates files, and it is
+/// restored immediately.
+fn bind_socket(path: &std::path::Path, policy: &PeerAuthPolicy) -> std::io::Result<UnixListener> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if matches!(policy, PeerAuthPolicy::Allowlist(uids) if uids.iter().any(|u| *u != euid)) {
+            // SAFETY: umask cannot fail; the previous value is restored below.
+            let old = unsafe { libc::umask(0o111) };
+            let bound = UnixListener::bind(path);
+            unsafe { libc::umask(old) };
+            return bound;
+        }
+    }
+    let _ = policy;
+    UnixListener::bind(path)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -325,14 +351,16 @@ async fn main() -> anyhow::Result<()> {
     // Before anything reads or writes state: the daemon must own the repo
     // and `.agentic` (see state_dir.rs). Runs before the object store opens
     // so no state is created under a directory we then refuse.
-    agenticd::state_dir::secure_state_dir(&args.repo)?;
+    // The canonical path is used from here on so the checked path cannot
+    // be redirected through a symlink afterwards.
+    let repo = agenticd::state_dir::secure_state_dir(&args.repo)?;
 
     let postgres_url = agenticd::secrets::resolve_postgres_url(
         args.postgres.as_deref(),
         args.postgres_url_file.as_deref(),
     )?;
 
-    let agentic_dir = args.repo.join(".agentic");
+    let agentic_dir = repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
     let mcp_servers = parse_mcp_spec(&args.mcp)?;
@@ -405,7 +433,7 @@ async fn main() -> anyhow::Result<()> {
     let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
         DaemonState::open(
-            args.repo.clone(),
+            repo.clone(),
             agentic_dir.clone(),
             store,
             postgres_url.as_deref(),
@@ -419,22 +447,12 @@ async fn main() -> anyhow::Result<()> {
         .with_exempt_entropy_prefixes(args.scanner_exempt_entropy_prefixes.clone()),
     );
 
-    let listener = UnixListener::bind(&socket_path)
+    let listener = bind_socket(&socket_path, &peer_auth)
         .with_context(|| format!("binding {}", socket_path.display()))?;
-
-    // Connecting to a Unix socket needs write permission on the file, and
-    // the worker runs as another uid. Access control is the SO_PEERCRED
-    // allowlist (ADR-0012), so open the file mode when one is enforced.
-    #[cfg(unix)]
-    if matches!(*peer_auth, PeerAuthPolicy::Allowlist(_)) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
-            .with_context(|| format!("setting mode on {}", socket_path.display()))?;
-    }
 
     tracing::info!(
         socket = %socket_path.display(),
-        repo = %args.repo.display(),
+        repo = %repo.display(),
         "agenticd listening"
     );
 
