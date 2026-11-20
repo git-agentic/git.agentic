@@ -40,7 +40,7 @@ use std::path::PathBuf;
 use agentic_core::approval::{verify_token, ApprovalRejection};
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
-use agentic_core::{Commit, Hash};
+use agentic_core::{check_blob_unambiguous, Commit, Hash};
 use agentic_memory::adapter::SnapshotHandle;
 use agentic_memory::MemoryAdapter;
 use anyhow::{anyhow, Context};
@@ -263,6 +263,21 @@ pub async fn execute(
         preflight_prompts(&state, &args.repo, &prompts_hash)?;
     }
 
+    // Load everything the forward-record step will re-stage, and refuse
+    // before any side effect (migration, memory restore, prompt write; dry
+    // runs included) if a blob would be rejected as ambiguous. A pre-upgrade
+    // store can hold a prompt or tool blob whose bytes are canonical Tree or
+    // Commit JSON; staging it now fails with `AmbiguousBlob`, which must not
+    // happen after live state has already been rolled back.
+    let prompts_payload = read_text_blobs(&state, target.prompts)?;
+    let tools_payload = read_text_blobs(&state, target.tools)?;
+    let model_text = read_model_text(&state, &target)?;
+    ensure_unambiguous("prompts", &prompts_payload)?;
+    ensure_unambiguous("tools", &tools_payload)?;
+    if let Some(model) = &model_text {
+        check_blob_unambiguous(model.as_bytes()).context("target model blob")?;
+    }
+
     let mut plan: Vec<String> = Vec::new();
 
     let branch = match state.refs.read_head()? {
@@ -427,10 +442,6 @@ pub async fn execute(
     // Build a fresh Commit whose dimensions match the target but whose
     // parent is the current branch tip. History shows C → C' even though
     // C' contains A's state.
-    let prompts_payload = read_text_blobs(&state, target.prompts)?;
-    let tools_payload = read_text_blobs(&state, target.tools)?;
-    let model_text = read_model_text(&state, &target)?;
-
     let inputs = CommitInputs {
         author: "agentic-rollback".to_string(),
         message: format!("Rollback to {}", target_hash.short()),
@@ -462,6 +473,18 @@ pub async fn execute(
         executed: true,
         new_head_hash: Some(out.commit_hash.to_hex()),
     })
+}
+
+/// Refuse a tree of blobs that forward-record would re-stage as ambiguous.
+fn ensure_unambiguous(
+    what: &str,
+    blobs: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<()> {
+    for (name, bytes) in blobs {
+        check_blob_unambiguous(bytes)
+            .with_context(|| format!("target {what} entry {name:?} cannot be re-staged"))?;
+    }
+    Ok(())
 }
 
 /// Reject target Commits whose `(memory_snapshot, schema_version)` pair is

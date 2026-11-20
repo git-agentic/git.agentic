@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use agentic_core::refs::Refs;
-use agentic_core::{FsObjectStore, ObjectStore};
+use agentic_core::{FsObjectStore, Hash, Object, ObjectStore, Tree, TypedRef};
 use agentic_memory::in_memory::InMemoryAdapter;
 use agentic_memory::MemoryAdapter;
 use agentic_proto::CommitInput;
@@ -773,4 +773,106 @@ async fn rollback_refuses_invalid_prompt_name_before_side_effects() {
         "unsafe path component",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-upgrade stores: a prompt blob whose bytes are canonical Tree JSON.
+// ---------------------------------------------------------------------------
+
+/// Store `bytes` the way a pre-upgrade store did: bare bytes at the typed
+/// path (`<objects>/<ab>/<rest>.zst`), which the current code reads as a
+/// blob. `put_raw` already produces that exact compressed file, under
+/// `raw/`, so copy it into the legacy place.
+fn plant_legacy_blob(objects: &std::path::Path, store: &dyn ObjectStore, bytes: &[u8]) -> Hash {
+    let hash = store
+        .put_raw(agentic_core::ObjectKind::Blob, bytes)
+        .unwrap();
+    let (a, b) = hash.shard();
+    let from = objects.join("raw").join(&a).join(format!("{b}.raw"));
+    let to = objects.join(&a).join(format!("{b}.zst"));
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    std::fs::copy(from, to).unwrap();
+    hash
+}
+
+#[tokio::test]
+async fn rollback_refuses_legacy_ambiguous_blob_before_any_side_effect() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(false).await;
+    let agentic_dir = state.repo_root.join(".agentic");
+
+    // A target commit whose prompts tree holds a legacy blob that is
+    // exactly the canonical JSON of a Tree.
+    let tree_json = serde_json::to_vec(&Tree::new()).unwrap();
+    let blob_hash = plant_legacy_blob(
+        &agentic_dir.join("objects"),
+        state.store.as_ref(),
+        &tree_json,
+    );
+    let mut prompts = Tree::new();
+    prompts.insert(
+        "system.md",
+        TypedRef {
+            kind: agentic_core::ObjectKind::Blob,
+            hash: blob_hash,
+        },
+    );
+    let prompts_hash = state.store.put(&Object::Tree(prompts)).unwrap();
+    let baseline_hash = state.refs.resolve(&baseline).unwrap().unwrap();
+    let Object::Commit(mut target) = state.store.get(&baseline_hash).unwrap() else {
+        panic!("baseline is a commit");
+    };
+    target.prompts = Some(prompts_hash);
+    target.message = "legacy ambiguous prompt".into();
+    let target_hash = state.store.put(&Object::Commit(target)).unwrap();
+
+    // Contaminate live state so a rollback that proceeded would be visible.
+    adapter.apply_migration("002_bump").await;
+    adapter
+        .insert_rows(
+            "messages",
+            vec![serde_json::json!({"id": 99, "body": "bad"})],
+        )
+        .await;
+    let schema_dir = agentic_dir.join("schema");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(
+        schema_dir.join("002_bump.down.sql"),
+        "-- no-op for fixture\n",
+    )
+    .unwrap();
+    let tip = state.refs.read_branch("main").unwrap();
+
+    for dry_run in [true, false] {
+        let err = rollback::execute(
+            Arc::clone(&state),
+            RollbackArgs {
+                target: target_hash.to_hex(),
+                dry_run,
+                accept_data_loss: false,
+                approval_token: None,
+                repo: state.repo_root.clone(),
+            },
+            None,
+        )
+        .await
+        .expect_err("a legacy ambiguous blob must be refused");
+        assert!(
+            err.chain().any(|e| matches!(
+                e.downcast_ref::<agentic_core::Error>(),
+                Some(agentic_core::Error::AmbiguousBlob { .. })
+            )),
+            "expected AmbiguousBlob (dry_run={dry_run}), got: {err:#}"
+        );
+
+        assert_eq!(
+            adapter.current_schema_version().await.unwrap(),
+            "002_bump",
+            "schema must not be reversed (dry_run={dry_run})"
+        );
+        let rows = adapter.rows_of("messages").await;
+        assert_eq!(rows.len(), 1, "memory must not be restored");
+        assert_eq!(rows[0]["body"], "bad");
+        assert_eq!(state.refs.read_branch("main").unwrap(), tip);
+        assert!(!state.repo_root.join("prompts").exists());
+    }
 }
