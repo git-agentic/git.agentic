@@ -165,7 +165,7 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
       never enters the object store; a keyless clone gets ciphertext
       only</li>
     <li>sc-native transports over SSH and HTTP(S) — in-binary TLS
-      (<code>sc+https://</code>, first-connection (TOFU) pinning), token-based
+      (<code>sc+https://</code>, first-connection (TOFU) pinning or CA validation), token-based
       access control, connection caps, session timeouts, streaming packs
       that move multi-GiB repos in bounded RAM — plus partial clone</li>
     <li>Git interop via <code>gix</code>, isolated in one crate — import a
@@ -209,7 +209,7 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
     end-to-end demo proofs in <code>demo/</code>, and the desktop app lives in
     <code>apps/desktop/</code>. Pre-1.0 and design-partner alpha:
     the cryptography has not had an independent audit,
-    <code>sc+https://</code> trust is first-connection (TOFU) pinning,
+    <code>sc+https://</code> trust defaults to first-connection (TOFU) pinning, with CA validation as an option,
     and revoking a private-branch recipient protects what is sealed
     afterwards — it cannot erase what they already fetched. The
     near-term promise is parallel agent workspaces and provenance,
