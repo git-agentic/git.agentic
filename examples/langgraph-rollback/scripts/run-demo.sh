@@ -12,12 +12,12 @@
 #   3. build agenticd + start it bound to the demo repo
 #   4. agent baseline ask
 #   5. `agentic commit` baseline
-#   6. deploy-bad-change.sh
+#   6. deploy-bad-change.sh  ← prompt + schema migration + bad rows
 #   7. agent bad ask  ← the hallucinated refund
 #   8. `agentic commit` "bad change"
 #  8.5. simulate git revert  ← still broken (contaminated memory)
 #   9. `agentic diff` baseline → bad   ← multi-dimensional regression
-#  10. `agentic rollback baseline --yes`
+#  10. `agentic rollback baseline --yes`  ← incl. reverse migration
 #  11. agent ask again  ← empathetic answer is back
 #  12. cleanup
 
@@ -111,8 +111,8 @@ chmod go-w "${DEMO_DIR}" "${DEMO_DIR}/.agentic"
 # Operator approval key (ADR-0019). A rollback that reverses a schema
 # migration needs an approval token; the daemon reads this key and the
 # `agentic` CLI mints the token from it, so the visible commands stay the
-# same. The demo's step 10 rollback has no schema change today and so
-# consumes no token. The key must be 0600 or the daemon refuses to start.
+# same. The step 10 rollback reverses the bad change's schema migration,
+# so it consumes one token. The key must be 0600 or the daemon refuses to start.
 APPROVAL_KEY="${DEMO_DIR}/.agentic/approval.key"
 if [[ ! -f "${APPROVAL_KEY}" ]]; then
     ( umask 077 && head -c 32 /dev/urandom > "${APPROVAL_KEY}" )
@@ -155,7 +155,7 @@ step "4. baseline ask"
 step "5. commit baseline"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.7 baseline" \
     --model "anthropic:claude-opus:2026-05-01"
-BASELINE=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" status | sed -n 's/.*→ //p')
+BASELINE=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" resolve HEAD)
 echo "baseline = ${BASELINE}"
 
 step "6. deploy bad change"
@@ -167,6 +167,7 @@ step "7. bad ask  (hallucinated refund + contaminated memory)"
 step "8. commit bad change"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.8 friendlier prompt" \
     --model "anthropic:claude-opus:2026-05-01"
+BAD=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" resolve HEAD)
 
 step "8.5. simulate git revert — shows code-only revert is insufficient"
 # Restore the prompt file to baseline (simulating what a code-only rollback, e.g.
@@ -182,10 +183,27 @@ fi
 # Contaminated memory rows are still in Postgres — the answer is still broken.
 
 step "9. diff baseline → bad"
-"${AGENTIC_BIN}" --repo "${DEMO_DIR}" diff "${BASELINE}" HEAD
+# Diff against the bad commit itself, not HEAD: the step 8.5 ask adds
+# LangGraph checkpoint commits that carry no memory or schema dimension.
+"${AGENTIC_BIN}" --repo "${DEMO_DIR}" diff "${BASELINE}" "${BAD}"
 
 step "10. rollback to baseline"
+# The bad change must really have applied the migration, or the check
+# after rollback would pass without proving anything.
+before=$(psql "${DATABASE_URL}" -Atc "SELECT agentic_schema_version() || '/' || (SELECT count(*) FROM information_schema.columns WHERE table_name = 'episodes' AND column_name = 'sentiment')")
+echo "live schema / sentiment columns before rollback: ${before}"
+if [[ "${before}" != "001_add_sentiment/1" ]]; then
+    echo "error: expected 001_add_sentiment/1 before rollback (migration applied)" >&2
+    exit 1
+fi
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" rollback "${BASELINE}" --yes
+# The rollback must have really reversed the migration, not just said so.
+live=$(psql "${DATABASE_URL}" -Atc "SELECT agentic_schema_version() || '/' || (SELECT count(*) FROM information_schema.columns WHERE table_name = 'episodes' AND column_name = 'sentiment')")
+echo "live schema / sentiment columns after rollback: ${live}"
+if [[ "${live}" != "0.0.0/0" ]]; then
+    echo "error: expected 0.0.0/0 after rollback (schema reversed, sentiment column dropped)" >&2
+    exit 1
+fi
 
 step "11. ask again — empathetic answer + clean memory"
 "${DEMO_DIR}/scripts/ask.sh" "I'm thinking about cancelling my subscription."
