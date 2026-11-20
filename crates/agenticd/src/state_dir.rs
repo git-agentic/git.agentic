@@ -240,6 +240,14 @@ mod tests {
             .find(|g| *g != egid)
     }
 
+    /// A repo dir pinned to 0700: `tempfile::tempdir()` follows the umask
+    /// (0775 under umask 002), which `secure_state_dir` refuses.
+    fn private_tmp() -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        set_mode(t.path(), 0o700);
+        t
+    }
+
     /// `<tmp>/outer/repo`, with `outer` set to `outer_mode` first.
     fn nested(outer_mode: u32) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let t = tempfile::tempdir().unwrap();
@@ -252,7 +260,7 @@ mod tests {
 
     #[test]
     fn creates_state_dir_0700_and_returns_canonical_path() {
-        let t = tempfile::tempdir().unwrap();
+        let t = private_tmp();
         let repo = secure_state_dir(t.path(), None).unwrap();
         assert_eq!(repo, std::fs::canonicalize(t.path()).unwrap());
         assert_eq!(mode(&repo.join(".agentic")), 0o700);
@@ -260,7 +268,7 @@ mod tests {
 
     #[test]
     fn tightens_existing_0755_state_dir() {
-        let t = tempfile::tempdir().unwrap();
+        let t = private_tmp();
         let d = t.path().join(".agentic");
         std::fs::create_dir(&d).unwrap();
         set_mode(&d, 0o755);
@@ -271,7 +279,7 @@ mod tests {
     #[test]
     fn refuses_group_or_world_writable_state_dir() {
         for m in [0o775, 0o777] {
-            let t = tempfile::tempdir().unwrap();
+            let t = private_tmp();
             let d = t.path().join(".agentic");
             std::fs::create_dir(&d).unwrap();
             set_mode(&d, m);
@@ -416,7 +424,7 @@ mod tests {
 
     #[test]
     fn refuses_symlinked_state_dir() {
-        let t = tempfile::tempdir().unwrap();
+        let t = private_tmp();
         let target = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(target.path(), t.path().join(".agentic")).unwrap();
         let err = secure_state_dir(t.path(), None).unwrap_err().to_string();

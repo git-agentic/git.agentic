@@ -64,8 +64,23 @@ fn spawn_daemon_with(
         .expect("spawn agenticd")
 }
 
+/// The socket file appears at bind(), before listen(), so it existing does not
+/// mean connect() succeeds yet. Retry a refused connect for a bounded time.
+async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match UnixStream::connect(sock).await {
+            Ok(conn) => return conn,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => panic!("daemon never accepted a connection: {e}"),
+        }
+    }
+}
+
 async fn send(sock: &std::path::Path, request: Request) -> Response {
-    let conn = UnixStream::connect(sock).await.unwrap();
+    let conn = connect_when_ready(sock).await;
     let (r, w) = conn.into_split();
     let mut r = tokio::io::BufReader::new(r);
     let mut w = tokio::io::BufWriter::new(w);
