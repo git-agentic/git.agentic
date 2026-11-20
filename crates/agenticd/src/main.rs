@@ -416,6 +416,23 @@ async fn main() -> anyhow::Result<()> {
     let socket_path = match args.socket.clone() {
         Some(p) => p,
         None => {
+            // The default socket sits inside the 0700 state directory, which
+            // another uid cannot traverse; an allowlist naming one needs an
+            // explicit socket outside it.
+            #[cfg(unix)]
+            {
+                // SAFETY: geteuid cannot fail.
+                let euid = unsafe { libc::geteuid() };
+                if matches!(&peer_auth, PeerAuthPolicy::Allowlist(uids) if uids.iter().any(|u| *u != euid))
+                {
+                    anyhow::bail!(
+                        "--allowed-uid names a uid other than the daemon's, but the default socket \
+                         lives in the private {} directory that uid cannot reach; pass --socket \
+                         <path outside .agentic>",
+                        agentic_dir.display()
+                    );
+                }
+            }
             let p = agentic_dir.join("agenticd.sock");
             // A deep canonical path can exceed sun_path; say how to fix it
             // instead of failing later in bind.

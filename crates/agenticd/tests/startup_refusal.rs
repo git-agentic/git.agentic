@@ -285,6 +285,24 @@ mod state_dir {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn startup_requires_socket_flag_when_allowlist_names_another_uid() {
+    // SAFETY: geteuid cannot fail.
+    let other = (unsafe { libc::geteuid() } + 1).to_string();
+    let repo = tempfile::tempdir().unwrap();
+    let out = Command::new(agenticd_bin())
+        .arg("--repo")
+        .arg(repo.path())
+        .arg("--allowed-uid")
+        .arg(&other)
+        .output()
+        .expect("run agenticd");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("pass --socket"), "got: {stderr}");
+}
+
 #[test]
 fn startup_refuses_postgres_url_and_file_together() {
     let out = Command::new(agenticd_bin())
