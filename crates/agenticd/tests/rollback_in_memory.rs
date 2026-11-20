@@ -1168,3 +1168,40 @@ async fn refused_down_migration_load_does_not_consume_the_token() {
     .await
     .expect("the unspent token authorizes the corrected rollback");
 }
+
+#[tokio::test]
+async fn plans_report_whether_approval_is_required() {
+    // Reverse migration in the plan: true, on a dry run with no token.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, true),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(out.approval_required);
+
+    // No schema change and no accept_data_loss: false.
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, true),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(!out.approval_required);
+
+    // accept_data_loss: true, even with no schema change.
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let out = rollback::execute(
+        Arc::clone(&state),
+        dry_run_args(&state, &baseline, tok),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(out.approval_required);
+}

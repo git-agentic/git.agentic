@@ -46,10 +46,60 @@ pub fn socket_path(repo: &Path) -> PathBuf {
 
 /// Send one request envelope and return the response payload.
 pub async fn round_trip(repo: &Path, request: Request) -> anyhow::Result<Response> {
+    round_trip_signed(repo, request, None).await
+}
+
+/// An auto-minted approval token and the uid that owns the key it came from.
+pub struct AutoToken {
+    pub token: String,
+    pub key_owner_uid: u32,
+}
+
+/// Decide whether an auto-minted token may be sent to the server on this
+/// connection. The token is a bearer credential for one rollback, so it goes
+/// only to a server whose peer uid is the owner of the key it was minted
+/// from. Otherwise it is withheld, with a warning on stderr (not stdout, so
+/// `--json` stays parseable). `peer` is the connection's peer uid, taken
+/// from the kernel (SO_PEERCRED, or getpeereid on macOS).
+pub fn token_for_peer(
+    peer: std::io::Result<u32>,
+    key_owner_uid: u32,
+    token: String,
+) -> Option<String> {
+    match peer {
+        Ok(uid) if uid == key_owner_uid => Some(token),
+        Ok(uid) => {
+            eprintln!(
+                "warning: not sending the approval token: the daemon socket is served by uid \
+                 {uid}, but the approval key belongs to uid {key_owner_uid}"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: not sending the approval token: could not read the daemon socket's \
+                 peer uid: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Like [`round_trip`]. If `auto` is given and `request` is a rollback, the
+/// token is attached only after the connection's peer uid is checked.
+pub async fn round_trip_signed(
+    repo: &Path,
+    mut request: Request,
+    auto: Option<AutoToken>,
+) -> anyhow::Result<Response> {
     let path = socket_path(repo);
     let mut sock = UnixStream::connect(&path)
         .await
         .with_context(|| format!("connecting to daemon at {}", path.display()))?;
+    if let (Some(auto), Request::Rollback { approval_token, .. }) = (auto, &mut request) {
+        let peer = sock.peer_cred().map(|c| c.uid());
+        *approval_token = token_for_peer(peer, auto.key_owner_uid, auto.token);
+    }
     let envelope = Envelope::new(new_correlation_id(), request);
     let (read_half, write_half) = sock.split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -79,6 +129,16 @@ fn new_correlation_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_is_sent_only_to_a_peer_owned_by_the_key_owner() {
+        let t = || "1:ab".to_string();
+        assert_eq!(token_for_peer(Ok(501), 501, t()), Some(t()));
+        assert_eq!(token_for_peer(Ok(0), 501, t()), None);
+        assert_eq!(token_for_peer(Ok(502), 501, t()), None);
+        let err = std::io::Error::other("no cred");
+        assert_eq!(token_for_peer(Err(err), 501, t()), None);
+    }
 
     // Both assertions live in one test: AGENTIC_SOCKET is process-global
     // state and separate parallel tests would race on it.

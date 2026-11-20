@@ -279,6 +279,9 @@ pub async fn execute(
     // passes through it below, once the plan is known (ADR-0019). `gated`
     // stops the second check from consuming the same single-use token twice.
     let mut gated = false;
+    // Reported to the caller so a client can tell whether a token will be
+    // needed before it asks for one to be minted.
+    let mut approval_required = args.accept_data_loss;
     if args.accept_data_loss {
         approval_gate(
             &state,
@@ -402,6 +405,9 @@ pub async fn execute(
             // above this point has a side effect. A dry run without a token
             // only reports the requirement; a supplied token is still
             // verified (and, being a dry run, not consumed).
+            if !migration_names.is_empty() {
+                approval_required = true;
+            }
             if !migration_names.is_empty() && !gated {
                 if args.dry_run {
                     plan.push(
@@ -503,6 +509,7 @@ pub async fn execute(
             planned_steps: plan,
             executed: false,
             new_head_hash: None,
+            approval_required,
         });
     }
 
@@ -540,6 +547,7 @@ pub async fn execute(
         planned_steps: plan,
         executed: true,
         new_head_hash: Some(out.commit_hash.to_hex()),
+        approval_required,
     })
 }
 

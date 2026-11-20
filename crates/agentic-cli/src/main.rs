@@ -12,7 +12,7 @@ use agentic_proto::{CommitInput, ErrorClass, Request, Response};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 
-use crate::client::{resolve_repo, round_trip};
+use crate::client::{resolve_repo, round_trip, round_trip_signed, AutoToken};
 
 /// Format a structured `Response::Error` as a human-readable error string
 /// suitable for `anyhow!`. The shape is `[class:code] message`, e.g.
@@ -215,11 +215,34 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn read_key(key_file: &Path) -> anyhow::Result<agentic_core::approval::ApprovalKey> {
-    let bytes = std::fs::read(key_file)
-        .with_context(|| format!("reading approval key {}", key_file.display()))?;
-    agentic_core::approval::ApprovalKey::from_bytes(&bytes)
-        .with_context(|| format!("approval key {} is malformed", key_file.display()))
+/// An approval key and the uid that owns its file.
+struct LoadedKey {
+    key: agentic_core::approval::ApprovalKey,
+    /// Owner of the key file. A token minted from this key is sent only to
+    /// a daemon socket served by this uid (see `client::token_for_peer`).
+    owner_uid: u32,
+}
+
+/// Read at most one byte past the key length: enough to reject a
+/// wrong-length file, and a default path that points at an endless or huge
+/// file cannot exhaust memory (the daemon does the same).
+fn read_capped(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    let limit = (agentic_core::approval::APPROVAL_KEY_LEN + 1) as u64;
+    reader.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_key(key_file: &Path) -> anyhow::Result<LoadedKey> {
+    use std::os::unix::fs::MetadataExt;
+    let ctx = || format!("reading approval key {}", key_file.display());
+    let file = std::fs::File::open(key_file).with_context(ctx)?;
+    let owner_uid = file.metadata().with_context(ctx)?.uid();
+    let bytes = read_capped(&file).with_context(ctx)?;
+    let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes)
+        .with_context(|| format!("approval key {} is malformed", key_file.display()))?;
+    Ok(LoadedKey { key, owner_uid })
 }
 
 /// Mint an approval token bound to `(commit_hash, uid, now)`.
@@ -242,7 +265,7 @@ fn mint_with_key(
 
 /// Mint a token from the 32-byte key at `key_file`.
 fn mint_token(key_file: &Path, commit_hash: &str, uid: u32) -> anyhow::Result<String> {
-    mint_with_key(&read_key(key_file)?, commit_hash, uid)
+    mint_with_key(&read_key(key_file)?.key, commit_hash, uid)
 }
 
 /// ADR-0014 operator token issuer. Prints a token to stdout. Does not
@@ -287,10 +310,7 @@ fn current_uid() -> u32 {
 /// file and refuses to start on a wrong-length one, so there is nothing a
 /// token could do. The warning goes to stderr so `--json` stdout stays
 /// parseable.
-fn load_rollback_key(
-    repo: &Path,
-    key_file: Option<PathBuf>,
-) -> anyhow::Result<Option<agentic_core::approval::ApprovalKey>> {
+fn load_rollback_key(repo: &Path, key_file: Option<PathBuf>) -> anyhow::Result<Option<LoadedKey>> {
     let explicit = key_file.is_some();
     let Some(path) = rollback_key_path(repo, key_file) else {
         return Ok(None);
@@ -373,26 +393,36 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
     } else {
         target
     };
-    let mint =
-        |key: &agentic_core::approval::ApprovalKey| mint_with_key(key, &target, current_uid());
+    let auto = |k: &LoadedKey| -> anyhow::Result<AutoToken> {
+        Ok(AutoToken {
+            token: mint_with_key(&k.key, &target, current_uid())?,
+            key_owner_uid: k.owner_uid,
+        })
+    };
     // A preview is a dry run, which verifies a token without consuming it.
     // It carries only a token the user supplied, except that a destructive
     // preview is refused without one, so it gets its own short-lived mint.
-    let preview_token = match (&approval_token, &key) {
-        (Some(t), _) => Some(t.clone()),
-        (None, Some(k)) if accept_data_loss => Some(mint(k)?),
+    let preview_auto = match &key {
+        Some(k) if accept_data_loss => Some(auto(k)?),
         _ => None,
     };
-    if !dry_run && !yes {
-        // First show the plan, then confirm.
-        let plan = match round_trip(
+    // The apply is signed only if the preview reported that this plan needs
+    // approval. Otherwise a forward migration landing after the preview
+    // would be reversed under a token minted for a plan nobody saw; the
+    // daemon's gate refuses it instead and the operator previews again.
+    // `--yes` shows no plan, but the CLI still previews silently (when it
+    // holds a key) to learn the flag.
+    let mut preview_needs_approval = false;
+    if !dry_run && (!yes || key.is_some()) {
+        let plan = match round_trip_signed(
             repo,
             Request::Rollback {
                 target: target.clone(),
                 dry_run: true,
                 accept_data_loss,
-                approval_token: preview_token,
+                approval_token: approval_token.clone(),
             },
+            preview_auto,
         )
         .await?
         {
@@ -405,30 +435,37 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
             } => return Err(daemon_error(class, &code, &message, retryable)),
             other => return Err(anyhow!("unexpected response: {other:?}")),
         };
-        println!("Planned rollback to {target}:");
-        for step in &plan.planned_steps {
-            println!("  - {step}");
-        }
-        eprint!("Proceed? [y/N] ");
-        use std::io::{BufRead, Write};
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
-            return Err(anyhow!("rollback aborted by user"));
+        preview_needs_approval = plan.approval_required;
+        if !yes {
+            // Show the plan, then confirm.
+            println!("Planned rollback to {target}:");
+            for step in &plan.planned_steps {
+                println!("  - {step}");
+            }
+            eprint!("Proceed? [y/N] ");
+            use std::io::{BufRead, Write};
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                return Err(anyhow!("rollback aborted by user"));
+            }
         }
     }
 
-    // An auto-minted token goes only on the confirmed, non-dry-run request,
-    // minted now so the time spent at the prompt does not eat its window.
-    let approval_token = match (approval_token, &key) {
-        (Some(t), _) => Some(t),
-        // With --dry-run there is no later request, so this one is the
-        // preview and follows the preview rule above.
-        (None, Some(k)) if !dry_run || accept_data_loss => Some(mint(k)?),
+    // An auto-minted token goes only on the confirmed, non-dry-run request
+    // whose preview said it needs one, minted now so the time spent at the
+    // prompt does not eat its window. With --dry-run there is no later
+    // request, so that request is the preview and follows the preview rule.
+    let apply_auto = match (&approval_token, &key) {
+        (None, Some(k))
+            if (!dry_run && preview_needs_approval) || (dry_run && accept_data_loss) =>
+        {
+            Some(auto(k)?)
+        }
         _ => None,
     };
-    let resp = round_trip(
+    let resp = round_trip_signed(
         repo,
         Request::Rollback {
             target,
@@ -436,6 +473,7 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
             accept_data_loss,
             approval_token,
         },
+        apply_auto,
     )
     .await?;
     match resp {
@@ -760,6 +798,24 @@ fn read_git_head(repo: &Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader that never ends and counts what it hands out.
+    struct Endless(std::cell::Cell<usize>);
+    impl std::io::Read for &Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.set(self.0.get() + buf.len());
+            buf.fill(1);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn key_read_stops_one_byte_past_the_key_length() {
+        let endless = Endless(Default::default());
+        let bytes = read_capped(&endless).unwrap();
+        assert_eq!(bytes.len(), agentic_core::approval::APPROVAL_KEY_LEN + 1);
+        assert!(endless.0.get() <= 4096, "read {} bytes", endless.0.get());
+    }
 
     #[test]
     fn rollback_key_path_prefers_flag_then_default_file() {

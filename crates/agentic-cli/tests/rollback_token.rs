@@ -29,8 +29,8 @@ struct Seen1 {
 type Seen = Arc<Mutex<Vec<Seen1>>>;
 
 /// Serve forever on `sock` in a background thread, answering `ResolveRef`
-/// with `resolved`; returns every `Rollback` request the CLI sent.
-fn fake_daemon(sock: &Path, resolved: String) -> Seen {
+/// with `resolved` and reporting `approval_required = needs_approval`; returns every `Rollback` request the CLI sent.
+fn fake_daemon(sock: &Path, resolved: String, needs_approval: bool) -> Seen {
     let seen: Seen = Arc::default();
     let recorded = Arc::clone(&seen);
     let sock = sock.to_path_buf();
@@ -68,8 +68,9 @@ fn fake_daemon(sock: &Path, resolved: String) -> Seen {
                         });
                         Response::Rollback(RollbackOutput {
                             planned_steps: Vec::new(),
-                            executed: true,
-                            new_head_hash: Some(target_hash()),
+                            executed: !dry_run,
+                            new_head_hash: (!dry_run).then(target_hash),
+                            approval_required: needs_approval,
                         })
                     }
                     other => panic!("unexpected request {other:?}"),
@@ -95,13 +96,22 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_resolving(resolved: String) -> Fixture {
+    fixture_with(resolved, true)
+}
+
+/// A daemon whose previews report that the plan needs no approval.
+fn fixture_no_approval() -> Fixture {
+    fixture_with(target_hash(), false)
+}
+
+fn fixture_with(resolved: String, needs_approval: bool) -> Fixture {
     let repo = tempfile::tempdir().unwrap();
     std::fs::create_dir(repo.path().join(".agentic")).unwrap();
     let sock_dir = tempfile::Builder::new()
         .prefix("agc")
         .tempdir_in("/tmp")
         .unwrap();
-    let seen = fake_daemon(&sock_dir.path().join("d.sock"), resolved);
+    let seen = fake_daemon(&sock_dir.path().join("d.sock"), resolved, needs_approval);
     Fixture {
         repo,
         sock_dir,
@@ -167,8 +177,10 @@ fn attaches_a_token_from_the_default_key_file() {
     run_rollback(&f, &[]);
 
     let seen = f.seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    let token = seen[0].token.as_deref().expect("token must be attached");
+    // --yes with a key: a silent preview, then the applied request.
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0].dry_run && seen[0].token.is_none());
+    let token = seen[1].token.as_deref().expect("token must be attached");
     let key = ApprovalKey::from_bytes(&KEY).unwrap();
     verify_token(&key, &target_hash(), euid(), token, now())
         .expect("token must verify for the resolved commit and the caller's uid");
@@ -180,7 +192,7 @@ fn attaches_a_token_from_the_key_file_flag() {
     let key_path = f.repo.path().join("custom.key");
     std::fs::write(&key_path, KEY).unwrap();
     run_rollback(&f, &["--key-file", key_path.to_str().unwrap()]);
-    assert!(f.seen.lock().unwrap()[0].token.is_some());
+    assert!(f.seen.lock().unwrap().last().unwrap().token.is_some());
 }
 
 #[test]
@@ -217,6 +229,7 @@ fn unusable_default_key_sends_no_token_but_a_bad_explicit_key_fails() {
     std::fs::write(f.repo.path().join(".agentic/approval.key"), [1u8; 5]).unwrap();
     run_rollback(&f, &[]);
     assert_eq!(f.seen.lock().unwrap()[0].token, None);
+    f.seen.lock().unwrap().clear();
 
     let bad = f.repo.path().join(".agentic/approval.key");
     let out = rollback_cmd(&f, &["--key-file", bad.to_str().unwrap()]);
@@ -224,7 +237,7 @@ fn unusable_default_key_sends_no_token_but_a_bad_explicit_key_fails() {
         !out.status.success(),
         "an explicit bad key must be an error"
     );
-    assert_eq!(f.seen.lock().unwrap().len(), 1, "no second request sent");
+    assert!(f.seen.lock().unwrap().is_empty(), "nothing is sent");
 }
 
 #[test]
@@ -327,4 +340,42 @@ fn key_warning_goes_to_stderr_and_json_stdout_stays_parseable() {
         )
     });
     assert!(String::from_utf8_lossy(&out.stderr).contains("warning"));
+}
+
+#[test]
+fn apply_is_not_signed_when_the_preview_reported_no_approval_needed() {
+    // A forward migration could land between the preview and the apply; a
+    // token minted for a plan that needed none would then authorize a
+    // reverse migration nobody saw. The daemon's gate refuses it instead.
+    for extra in [&[][..], &["--yes"][..]] {
+        let f = fixture_no_approval();
+        std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+        let mut args = vec!["rollback", "main"];
+        args.extend_from_slice(extra);
+        let out = agentic(&f, &args, "y\n");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let seen = f.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{extra:?}: {seen:?}");
+        assert!(seen[0].dry_run && !seen[1].dry_run);
+        assert_eq!(seen[1].token, None, "{extra:?}: apply must not be signed");
+    }
+}
+
+#[test]
+fn oversized_default_key_file_is_rejected_without_a_token() {
+    let f = fixture();
+    // Far longer than a key; only the first 33 bytes may be read.
+    std::fs::write(
+        f.repo.path().join(".agentic/approval.key"),
+        vec![7u8; 1 << 20],
+    )
+    .unwrap();
+    run_rollback(&f, &[]);
+    let seen = f.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "no key, so no pinning preview: {seen:?}");
+    assert_eq!(seen[0].token, None);
 }

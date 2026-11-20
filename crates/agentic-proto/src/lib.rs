@@ -394,6 +394,12 @@ pub struct RollbackOutput {
     pub planned_steps: Vec<String>,
     pub executed: bool,
     pub new_head_hash: Option<String>,
+    /// The plan needs an operator approval token: it runs reverse
+    /// migrations or the request set `accept_data_loss` (ADR-0014,
+    /// ADR-0019). Additive: older daemons omit it and it reads as `false`,
+    /// and older clients ignore it.
+    #[serde(default)]
+    pub approval_required: bool,
 }
 
 #[cfg(test)]
@@ -554,5 +560,14 @@ mod tests {
         let v0 = RequestV0::Ping;
         let v1: Request = v0.into();
         assert!(matches!(v1, Request::Ping));
+    }
+
+    #[test]
+    fn rollback_output_without_approval_required_reads_as_false() {
+        // A daemon from before ADR-0019 omits the field.
+        let out: RollbackOutput =
+            serde_json::from_str(r#"{"planned_steps":[],"executed":false,"new_head_hash":null}"#)
+                .unwrap();
+        assert!(!out.approval_required);
     }
 }

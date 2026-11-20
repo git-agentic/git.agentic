@@ -366,3 +366,163 @@ async fn ac3c_accept_data_loss_reverses_irreversible_migration() {
 
     drop_schema(&admin, &schema).await;
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0019 — a rollback that runs a reverse migration needs an operator
+// approval token, end to end against real Postgres: commit at schema A,
+// migrate forward to B, then roll back through `rollback::execute`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn adr_0019_reverse_migration_rollback_needs_a_token_against_postgres() {
+    use agentic_core::approval::{generate_token, ApprovalKey};
+    use agentic_core::refs::Refs;
+    use agentic_core::ObjectStore;
+    use agentic_proto::CommitInput;
+    use agenticd::rollback::{self, ApprovalError, RollbackArgs};
+    use agenticd::server::DaemonState;
+
+    let Some(url) = database_url() else {
+        eprintln!("DATABASE_URL not set — skipping integration test");
+        return;
+    };
+    let admin = PgPool::connect(&url).await.expect("admin pool");
+    let schema = fresh_schema_name("adr0019");
+    admin
+        .execute(format!("CREATE SCHEMA \"{schema}\"").as_str())
+        .await
+        .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let agentic_dir = dir.path().join(".agentic");
+    std::fs::create_dir_all(agentic_dir.join("objects")).unwrap();
+    let store: Arc<dyn ObjectStore + Send + Sync> =
+        Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+    let refs = Refs::open(&agentic_dir).unwrap();
+
+    let mut adapter = PostgresAdapter::connect(
+        PgConfig::new(schema_scoped_url(&url, &schema), Vec::new()),
+        Arc::clone(&store),
+    )
+    .await
+    .expect("connect adapter");
+    adapter.init().await.expect("install helpers");
+    // Schema A: one applied migration.
+    admin
+        .execute(
+            format!("INSERT INTO \"{schema}\".agentic_migrations (name) VALUES ('001_a')").as_str(),
+        )
+        .await
+        .unwrap();
+
+    let key = ApprovalKey::from_bytes(&[42u8; 32]).unwrap();
+    let state = Arc::new(
+        DaemonState {
+            repo_root: dir.path().to_path_buf(),
+            store: Arc::clone(&store),
+            refs,
+            commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            memory: Some(Arc::new(adapter)),
+            mcp_servers: Vec::new(),
+            http: reqwest::Client::builder()
+                .user_agent("agenticd-test")
+                .build()
+                .unwrap(),
+            peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+            approval_key: None,
+            used_approval_tokens: Default::default(),
+            limits: agenticd::limits::LimitsConfig::default(),
+            rate: agenticd::limits::RateLimiter::new(
+                agenticd::limits::LimitsConfig::default().rate_per_uid,
+            ),
+            commit_slots: Arc::new(tokio::sync::Semaphore::new(
+                agenticd::limits::LimitsConfig::default().commit_queue_depth,
+            )),
+            commit_queue_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            exempt_entropy_prefixes: Vec::new(),
+        }
+        .with_approval_key(Some(key)),
+    );
+
+    let mut prompts = std::collections::BTreeMap::new();
+    prompts.insert("system.md".to_string(), b"you are helpful".to_vec());
+    let baseline = agenticd::commit::execute(
+        Arc::clone(&state),
+        CommitInput {
+            message: "schema A".into(),
+            author: Some("tester".into()),
+            code_sha: None,
+            branch: Some("main".into()),
+            prompts,
+            mcp_servers: Vec::new(),
+            model: None,
+            no_memory: false,
+        },
+        Some(1000),
+    )
+    .await
+    .expect("baseline commit at schema A")
+    .commit_hash;
+
+    // Forward migration to schema B, with its down.sql.
+    admin
+        .execute(format!("CREATE TABLE \"{schema}\".step_b (id int)").as_str())
+        .await
+        .unwrap();
+    admin
+        .execute(
+            format!("INSERT INTO \"{schema}\".agentic_migrations (name) VALUES ('002_b')").as_str(),
+        )
+        .await
+        .unwrap();
+    let schema_dir = agentic_dir.join("schema");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(schema_dir.join("002_b.down.sql"), "DROP TABLE step_b;").unwrap();
+
+    let args = |token: Option<String>| RollbackArgs {
+        target: baseline.clone(),
+        dry_run: false,
+        accept_data_loss: false,
+        approval_token: token,
+        repo: dir.path().to_path_buf(),
+    };
+    let tip = state.refs.read_branch("main").unwrap();
+
+    // (1) No token: refused, and the schema stays at B.
+    let err = rollback::execute(Arc::clone(&state), args(None), Some(1000))
+        .await
+        .expect_err("a reverse-migration rollback without a token must be refused");
+    assert!(
+        err.chain().any(|e| matches!(
+            e.downcast_ref::<ApprovalError>(),
+            Some(ApprovalError::TokenRequired)
+        )),
+        "expected TokenRequired, got: {err:#}"
+    );
+    assert_eq!(migration_row_count(&admin, &schema).await.unwrap(), 2);
+    assert!(table_exists(&admin, &schema, "step_b").await.unwrap());
+    assert_eq!(state.refs.read_branch("main").unwrap(), tip);
+
+    // (2) Valid token: the rollback reverses B to A.
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = generate_token(
+        &ApprovalKey::from_bytes(&[42u8; 32]).unwrap(),
+        &baseline,
+        1000,
+        now,
+    );
+    let out = rollback::execute(Arc::clone(&state), args(Some(token)), Some(1000))
+        .await
+        .expect("a valid token authorizes the reverse migration");
+    assert!(out.executed && out.approval_required);
+    assert_eq!(migration_row_count(&admin, &schema).await.unwrap(), 1);
+    assert!(!table_exists(&admin, &schema, "step_b").await.unwrap());
+    assert_ne!(state.refs.read_branch("main").unwrap(), tip);
+
+    drop_schema(&admin, &schema).await;
+}

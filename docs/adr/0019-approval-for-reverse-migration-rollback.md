@@ -106,6 +106,18 @@ The preview, which is a dry run, carries no auto-minted token.
 After the operator confirms, the CLI mints a fresh token for the pinned hash and the CLI process's effective UID, which is the UID the daemon reads from the socket, and attaches it to the applied request only.
 A `--dry-run` request carries none either.
 The one exception is a destructive preview (`--accept-data-loss`): the daemon refuses that without a token before it reaches the dry-run branch, so the preview gets its own freshly minted token, which a dry run does not consume.
+The CLI signs the applied request only if the preview it just got reported that the plan needs approval.
+The rollback output carries a new field for this, `approval_required: bool`, set when the plan includes a reverse migration or the request set `accept_data_loss`.
+The field is additive: it defaults to `false` when absent, so older daemons and clients are unaffected.
+Without this rule, a forward migration that lands between the preview and the apply would be reversed under a token minted for a plan the operator never saw.
+With the rule, the daemon's gate refuses that apply and the operator previews again.
+With `--yes` no plan is shown, but the CLI still sends the preview request silently, when it holds a key, to read the field.
+
+The CLI also checks who it is talking to before it sends a minted token.
+It reads the connected socket's peer uid from the kernel and sends the token only if that uid owns the key file the token came from.
+Otherwise it sends no token and warns on stderr.
+It reads at most 33 bytes of the key file, as the daemon does.
+
 A token passed explicitly with `--approval-token` is sent as given, on both requests, and the target is left as typed.
 If the CLI finds no usable key, it sends no token, and the daemon decides whether one is needed.
 
