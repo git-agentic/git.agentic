@@ -563,3 +563,14 @@ fn a_group_readable_key_is_skipped_by_default_and_refused_when_named() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("chmod 600"));
     assert!(f.seen.lock().unwrap().is_empty());
 }
+
+#[test]
+fn scope_without_approval_is_rejected() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_agentic"))
+        .args(["rollback", "main", "--scope", "reverse-migration"])
+        .output()
+        .expect("run agentic");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--approval"), "got: {stderr}");
+}
