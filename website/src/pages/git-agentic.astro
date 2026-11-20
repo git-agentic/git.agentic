@@ -1,9 +1,10 @@
 ---
-import Base from '../layouts/Base.astro';
-import Header from '../components/Header.astro';
-import Footer from '../components/Footer.astro';
-import FAQ from '../components/FAQ.astro';
-const repo = 'https://github.com/git-agentic/git.agentic';
+import Project from '../layouts/Project.astro';
+import Section from '../components/Section.astro';
+import Panel from '../components/Panel.astro';
+import { project } from '../data/projects';
+const p = project('git.agentic');
+const repo = p.repo;
 const faqs = [
   {
     question: 'What is git.agentic?',
@@ -11,81 +12,127 @@ const faqs = [
   },
   {
     question: 'Why is Git alone not enough to roll back an AI agent?',
-    answer: 'Git restores code, but an agent can remain broken because its prompts, model, tool interfaces, database memory, or schema moved independently. git.agentic restores all six dimensions together.',
+    answer: 'Git restores code, but an agent can remain broken because its prompts, model, tool interfaces, database memory, or schema moved independently. A git.agentic commit versions all six dimensions. Rollback restores prompts, tracked memory and schema directly, and records the code, tools and model that the operator must redeploy.',
   },
   {
     question: 'Which AI agent frameworks does git.agentic support?',
     answer: 'The public Python SDK includes a drop-in LangGraph checkpointer. The architecture also defines a framework-neutral sidecar integration for the Claude Agent SDK.',
   },
   {
+    question: 'Is git.agentic used in production?',
+    answer: 'Not yet. The open-source MVP is complete and production validation is in progress. Design-partner use in real deployments is the bar for v1.0.',
+  },
+  {
     question: 'Is git.agentic open source?',
     answer: 'Yes. The Rust core, CLI, daemon, Python SDK, and runnable broken-prompt demo are available on GitHub under the Apache 2.0 license.',
   },
 ];
-const structuredData = [
-  {
-    '@context': 'https://schema.org',
-    '@type': 'SoftwareSourceCode',
-    '@id': 'https://git-agentic.com/git-agentic#software',
-    name: 'git.agentic',
-    description: 'Open-source version control and atomic rollback for AI agent behavior.',
-    url: 'https://git-agentic.com/git-agentic',
-    codeRepository: repo,
-    programmingLanguage: ['Rust', 'Python'],
-    license: 'https://www.apache.org/licenses/LICENSE-2.0',
-    isAccessibleForFree: true,
-    author: { '@id': 'https://git-agentic.com/#organization' },
-  },
-  {
-    '@context': 'https://schema.org',
-    '@type': 'BreadcrumbList',
-    itemListElement: [
-      { '@type': 'ListItem', position: 1, name: 'Home', item: 'https://git-agentic.com/' },
-      { '@type': 'ListItem', position: 2, name: 'git.agentic', item: 'https://git-agentic.com/git-agentic' },
-    ],
-  },
-  {
-    '@context': 'https://schema.org',
-    '@type': 'FAQPage',
-    mainEntity: faqs.map((item) => ({
-      '@type': 'Question',
-      name: item.question,
-      acceptedAnswer: { '@type': 'Answer', text: item.answer },
-    })),
-  },
+const docs = [
+  { label: 'README', href: `${repo}#readme` },
+  { label: 'MVP spec', href: `${repo}/blob/main/docs/product/mvp-spec.md` },
+  { label: 'Snapshot model', href: `${repo}/blob/main/docs/architecture/snapshot-model.md` },
+  { label: 'ADRs', href: `${repo}/tree/main/docs/adr` },
+  { label: 'Threat model', href: `${repo}/blob/main/git.agentic-threat-model.md` },
+  { label: 'Security policy', href: `${repo}/blob/main/SECURITY.md` },
+  { label: 'Contributing', href: `${repo}/blob/main/CONTRIBUTING.md` },
+  { label: 'License', href: `${repo}/blob/main/LICENSE` },
 ];
 ---
-<Base
+<Project
+  project={p}
   title="AI Agent Version Control & Atomic Rollback | git.agentic"
-  description="Version and roll back AI agent code, prompts, tools, models, memory, and schema atomically. Open-source Rust core, Python SDK, and LangGraph support."
-  modifiedTime="2026-11-20"
-  structuredData={structuredData}
+  description="Version AI agent code, prompts, tools, model, memory and schema as one commit. Rollback restores prompts, memory and schema and records what to redeploy."
+  heading="Version control and atomic rollback for AI agent behavior."
+  softwareDescription="Open-source version control and atomic rollback for AI agent behavior."
+  programmingLanguage={['Rust', 'Python']}
+  faqs={faqs}
+  docs={docs}
 >
-  <Header />
+  <Fragment slot="lead">
+    Six things determine how an agent acts: code, prompts, tools, model,
+    memory and schema. A git.agentic commit versions all six. Rollback
+    restores prompts, tracked memory and schema directly, and records the
+    code, tools and model that the operator must redeploy.
+  </Fragment>
 
-  <div class="badges">
-    <span class="badge"><span class="pulse"></span>Open-source MVP complete · production validation in progress</span>
-    <span class="badge">Apache 2.0</span>
-    <span class="badge">Rust core · Python SDK</span>
-  </div>
+  <Fragment slot="status">
+    <div><dt>Maturity</dt><dd>The MVP code is complete and has been public on <code>main</code> since 22 May 2026.</dd></div>
+    <div><dt>Phase</dt><dd>Production validation. Design-partner use in real deployments is the bar for v1.0.</dd></div>
+    <div><dt>Production use</dt><dd>None yet. Production validation is in progress.</dd></div>
+    <div><dt>Not yet done</dt><dd>Rollback under 5 seconds at 1M-row pgvector scale is under verification (<a href={`${repo}/issues/132`}>issue #132</a>). Per-operation authorization beyond rollback is open (TM-001).</dd></div>
+    <div><dt>Language</dt><dd>Rust core, CLI and daemon. Python SDK.</dd></div>
+    <div><dt>License</dt><dd>Apache 2.0</dd></div>
+  </Fragment>
 
-  <h1>Version control and atomic rollback for AI agent behavior.</h1>
+  <Section id="quickstart" title="Quickstart" note="Needs Podman or Docker with compose, cargo, Python 3.10 or later, and psql.">
+    <p>
+      One clone and one script. <code>run-demo.sh</code> starts Postgres and
+      pgvector with Podman or Docker compose, builds the daemon and the CLI,
+      runs the agent, deploys the bad change, rolls it back and tears the
+      database down again. CI replays the same demo end to end on every pull
+      request.
+    </p>
+    <Panel title="shell" copy>
+<pre><code>$ git clone https://github.com/git-agentic/git.agentic
+$ cd git.agentic/examples/langgraph-rollback
+$ ./scripts/run-demo.sh             <span class="comment"># starts Postgres, builds, runs, breaks, rolls back</span></code></pre>
+    </Panel>
+  </Section>
 
-  <p class="lead">
-    Atomic, reversible snapshots of the full system state — code, prompts,
-    tools, model, memory, schema — that determines how an AI agent acts.
-  </p>
+  <Section id="features" title="Features" note="What the open source MVP contains.">
+    <div class="grid-2">
+      <div class="card feature">
+        <h3>One version for six dimensions</h3>
+        <p>A commit captures code, prompts, tools, model, memory and schema atomically.</p>
+      </div>
+      <div class="card feature">
+        <h3>Rollback</h3>
+        <p><code>agentic rollback</code> restores prompts, tracked memory and schema, including reverse schema migrations. It records the target's code, tools and model, which the operator redeploys.</p>
+      </div>
+      <div class="card feature">
+        <h3>Six-dimension diff</h3>
+        <p><code>agentic diff</code> shows what changed in each dimension between two versions.</p>
+      </div>
+      <div class="card feature">
+        <h3>Memory snapshots</h3>
+        <p>The state of the tracked Postgres and pgvector tables is captured at commit time and restored on rollback. It is the one memory backend in the MVP.</p>
+      </div>
+      <div class="card feature">
+        <h3>MCP tool fingerprints</h3>
+        <p>The tools dimension records MCP server fingerprints, so a version knows which tools the agent saw. Rollback records them and does not apply them.</p>
+      </div>
+      <div class="card feature">
+        <h3>Python SDK and LangGraph</h3>
+        <p>A typed Python client with a drop-in LangGraph checkpointer. The architecture also defines a sidecar integration for the Claude Agent SDK.</p>
+      </div>
+      <div class="card feature">
+        <h3><code>agentic</code> CLI</h3>
+        <p>Six commands: <code>init</code>, <code>commit</code>, <code>log</code>, <code>diff</code>, <code>rollback</code> and <code>status</code>.</p>
+      </div>
+      <div class="card feature">
+        <h3><code>agenticd</code> daemon</h3>
+        <p>A Rust daemon that owns the object store and the snapshot engine.</p>
+      </div>
+    </div>
+    <p class="note">
+      Not in the MVP: web UI, hosted SaaS, eval and CI pipelines, MCP registry,
+      sandbox execution, A2A routing, additional memory backends and
+      additional frameworks.
+      <a href={`${repo}/blob/main/docs/adr/0001-architecture-foundations.md`}>ADR-0001</a>
+      sections 9 and 10 explain why.
+    </p>
+  </Section>
 
-  <p class="mute">
-    <code>git revert</code> knows about code. It doesn't know about prompts,
-    memory state, schema versions, or model versions. When an agent regresses
-    in production, <code>git revert</code> can't put the system back together.
-    git.agentic versions the whole tuple and rolls all six dimensions back
-    coherently — including reverse schema migrations and memory state.
-  </p>
-
-  <h2>The version</h2>
-  <pre><code><span class="comment"># a commit captures this atomically</span>
+  <Section id="how-it-works" title="How it works">
+    <h3>The version</h3>
+    <p>
+      <code>git revert</code> knows about code. It does not know about prompts,
+      memory state, schema versions or model versions, so it cannot put a
+      regressed agent back together. A git.agentic commit records the whole
+      tuple.
+    </p>
+    <Panel title="AgentVersion">
+<pre><code><span class="comment"># a commit captures this atomically</span>
 AgentVersion = (
     code_sha,
     prompts,
@@ -94,137 +141,176 @@ AgentVersion = (
     memory_snapshot,
     schema_version,
 )</code></pre>
+    </Panel>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="The six dimensions and what rollback does with each">
+      <table>
+        <thead>
+          <tr><th scope="col">Dimension</th><th scope="col">What it is</th><th scope="col">On rollback</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>code_sha</code></td><td>The git commit. The part you already version.</td><td>Recorded, not checked out. The operator redeploys that commit.</td></tr>
+          <tr><td><code>prompts</code></td><td>System prompts, role prompts and few-shot templates, content-hashed.</td><td>Restored. The prompts directory is rewritten from the target.</td></tr>
+          <tr><td><code>tools</code></td><td>MCP server fingerprints. The tools the agent saw.</td><td>Recorded, not applied.</td></tr>
+          <tr><td><code>model</code></td><td>Provider, model id and decoding parameters. Pinned, not floated.</td><td>Recorded. The operator redeploys if it changed.</td></tr>
+          <tr><td><code>memory_snapshot</code></td><td>State of the tracked Postgres and pgvector tables at commit time.</td><td>Restored.</td></tr>
+          <tr><td><code>schema_version</code></td><td>The memory schema, with forward and reverse migrations.</td><td>Restored by running the reverse migrations.</td></tr>
+        </tbody>
+      </table>
+    </div>
 
-  <table class="tuple">
-    <thead>
-      <tr><th>Dimension</th><th>What it is</th></tr>
-    </thead>
-    <tbody>
-      <tr><td>code_sha</td><td>The git commit. The bit you already version.</td></tr>
-      <tr><td>prompts</td><td>System prompts, role prompts, few-shot templates — content-hashed.</td></tr>
-      <tr><td>tools</td><td>MCP server fingerprints. The tool surface the agent saw.</td></tr>
-      <tr><td>model</td><td>Provider, model id, decoding params. Pinned, not floated.</td></tr>
-      <tr><td>memory_snapshot</td><td>Postgres&nbsp;+&nbsp;pgvector state at commit time. Restored on rollback.</td></tr>
-      <tr><td>schema_version</td><td>Memory schema. Forward and <em>reverse</em> migrations.</td></tr>
-    </tbody>
-  </table>
+    <h3>The broken-prompt demo</h3>
+    <p>
+      A prompt change ships together with a schema migration and contaminated
+      memory rows, and breaks the agent. Restoring the prompt file, which is
+      what <code>git revert</code> achieves, does not fix it: the schema is
+      still migrated and the contaminated rows are still in Postgres.
+      <code>agentic rollback</code> runs the reverse migration, restores the
+      tracked memory and rewrites the prompts. The scenario is written up in
+      <a href={`${repo}/blob/main/docs/product/demo-scenario.md`}>the demo scenario</a>.
+    </p>
+    <p>
+      The excerpt below is from the recorded run in
+      <a href={`${repo}/blob/main/examples/langgraph-rollback/demo.cast`}><code>demo.cast</code></a>.
+      Setup, the build, a few progress lines and the final log are left out.
+    </p>
+    <Panel title="./scripts/run-demo.sh, excerpt from demo.cast">
+<pre><code><span class="dim">=== 4. baseline ask ===</span>
+<span class="ok">&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
 
-  <h2>The demo</h2>
+Looking at your account history, I see: Customer thanked support for the quick reply.</span>
 
-  <p class="mute">
-    A "small" prompt tweak plus a memory schema bump breaks the agent in
-    production. <code>git revert</code> alone can't fix it — the schema is
-    still bumped, the memory has accumulated contaminated rows.
-    <code>agentic rollback</code> restores all six dimensions in one move.
-  </p>
+<span class="dim">=== 5. commit baseline ===</span>
+[20eb9cf] committed to langgraph/abbbd1ad6698ea81 as 20eb9cf892835ed7c37574075a51d2a04482ffe36596a9f6ff16c793af3a7bea
+baseline = 20eb9cf892835ed7c37574075a51d2a04482ffe36596a9f6ff16c793af3a7bea
 
-  <pre><code><span class="comment"># baseline: agent works</span>
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="ok">&gt; "I understand. Could you tell me a bit more..."</span>
+<span class="dim">=== 6. deploy bad change ===</span>
+→ swapping prompts/system.txt for the sycophantic variant
+→ applying migration 001_add_sentiment (episodes.sentiment NOT NULL)
+→ INSERTing 5 contaminated rows into episodes
+✓ bad change deployed
 
-<span class="comment"># developer ships a "small" prompt + schema change</span>
-$ ./scripts/deploy-bad-change.sh
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="bad">&gt; "Absolutely! I'll cancel and refund the full amount. Done!"   # hallucinated</span>
+<span class="dim">=== 7. bad ask  (hallucinated refund + contaminated memory) ===</span>
+<span class="bad">&gt; Absolutely! I'll cancel your subscription and refund the full amount you've paid this year. Done!
 
-<span class="comment"># git can't fix this — schema is bumped, memory is contaminated</span>
-$ git revert HEAD &amp;&amp; ./scripts/redeploy.sh
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="bad">&gt; "Looking at your account, I see your refund processed yesterday..."   # still wrong</span>
+Looking at your account history, I see: Refund queue cleared; all open tickets resolved as refunded.</span>
 
-<span class="comment"># the agentic way</span>
-$ agentic rollback v0.7
-<span class="accent">  ✓ Schema reverted          in 0.4s
-  ✓ Memory restored          in 2.1s
-  ✓ Prompts restored         in 0.0s
-  ✓ HEAD now at i7j8k9l (rollback of v0.8 → v0.7)</span>
+<span class="dim">=== 8.5. simulate git revert — shows code-only revert is insufficient ===</span>
+→ prompts/system.txt after git revert:
+   You are a helpful, empathetic customer support agent. Your job is to
+   understand the customer's situation, ask clarifying questions when the
+→ (memory rows in Postgres are untouched by git revert)
+✓ 'redeploy' complete — agent reads the reverted prompt on next ask
+&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
 
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="ok">&gt; "I understand. Could you tell me a bit more..."   # baseline restored</span></code></pre>
+<span class="bad">Looking at your account history, I see: Refund queue cleared; all open tickets resolved as refunded.</span>
 
-  <h2>Try it</h2>
+<span class="dim">=== 9. diff baseline → bad ===</span>
+diff 20eb9cf → 0a15e20
 
-  <p class="mute">
-    One clone, one <code>docker-compose up</code>, one script.
-  </p>
+prompts:
+  ~ __langgraph__/abbbd1ad6698ea81/checkpoint.json
+  ~ system.txt
 
-  <pre><code>$ git clone https://github.com/git-agentic/git.agentic
-$ cd git.agentic/examples/langgraph-rollback
-$ docker-compose up -d              <span class="comment"># Postgres + pgvector</span>
-$ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks, rolls back</span></code></pre>
+memory:   memory snapshot d9f76eb → d97dae0
 
-  <h2>What's in the open-source MVP</h2>
-  <ul class="plain">
-    <li><code>agentic</code> CLI — <code>init</code>, <code>commit</code>, <code>log</code>, <code>diff</code>, <code>rollback</code>, <code>status</code></li>
-    <li><code>agenticd</code> daemon — Rust, owns the object store and snapshot engine</li>
-    <li>Python SDK — typed client, drop-in LangGraph checkpointer</li>
-    <li>One memory backend: Postgres + pgvector, deeply integrated</li>
-    <li>One framework: LangGraph (the first platform-partner integration / Claude Agent SDK lands alongside)</li>
-    <li>One demo: <a href={`${repo}/blob/main/docs/product/demo-scenario.md`}>"the broken prompt"</a></li>
-  </ul>
+schema:   schema_version 0.0.0 → 001_add_sentiment
 
-  <p class="faint">
-    Not in the MVP: web UI, hosted SaaS, eval/CI pipelines, MCP registry,
-    sandbox execution, A2A routing, additional memory backends, additional
-    frameworks. See <a href={`${repo}/blob/main/docs/adr/0001-architecture-foundations.md`}>ADR-0001</a> §9–§10 for why.
-  </p>
+<span class="dim">=== 10. rollback to baseline ===</span>
+live schema / sentiment columns before rollback: 001_add_sentiment/1
+<span class="accent">  - target commit 20eb9cf (v0.7 baseline)
+  - current branch tip c4794d5 → forward-record over it
+  - reverse schema migrations: 001_add_sentiment → 0.0.0
+  - restore memory from manifest d9f76eb
+  - rewrite ~/git.agentic/examples/langgraph-rollback/prompts from target prompts tree 2e6a8d6
+  - model version captured in target — operator must redeploy if it changed
+  - forward-recorded rollback as 2a2893a on langgraph/abbbd1ad6698ea81
+✓ rollback complete; HEAD now at 2a2893a</span>
+live schema / sentiment columns after rollback: 0.0.0/0
 
-  <h2>Status</h2>
-  <p class="mute">
-    The open-source MVP went public May 2026: object store, atomic memory
-    snapshot, rollback with reverse migrations, MCP fingerprinting,
-    six-dimension diff, Python SDK + LangGraph checkpointer, and the
-    broken-prompt demo — CI replays the demo end-to-end on every pull
-    request. Production validation is in progress: design-partner use in
-    real deployments is the bar before we call it v1.0. In-progress
-    workstreams: storage backends beyond the local store, ephemeral
-    branches as an agent-run primitive, and hardening.
-  </p>
+<span class="dim">=== 11. ask again — empathetic answer + clean memory ===</span>
+<span class="ok">&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
 
-  <h3>Security hardening, November 2026</h3>
-  <p class="mute">
-    On 20 November 2026 a security hardening round merged (PRs #145 to #153
-    and #156). The daemon already checks socket peers against a UID
-    allowlist (<a href={`${repo}/blob/main/docs/adr/0012-socket-peer-authentication.md`}>ADR-0012</a>).
-    Now any rollback that runs reverse schema migrations also needs an
-    operator approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>). Tokens are single-use per daemon
-    process and scoped, so a reverse-migration token cannot authorize a
-    data-loss rollback. The <code>agentic</code> CLI can attach the token
-    automatically when its preview shows approval is needed, it can read the
-    key, and the daemon's peer UID owns that key.
-  </p>
-  <ul class="plain">
-    <li>The object store keeps raw and typed objects at separate storage paths, so one can no longer occupy the other's address (<a href={`${repo}/blob/main/docs/adr/0018-separate-raw-object-namespace.md`}>ADR-0018</a>)</li>
-    <li>The sidecar deployment keeps daemon state on a volume only the daemon writes, checks state-directory ownership at startup, reads credentials from files, and redacts the GCS token and the Postgres URL in the store and memory-backend debug output. The Cloud Run layout is not yet verified, and full credential isolation needs separate service identities</li>
-    <li>Rollback validates the prompt tree before any database change and refuses symlinked prompt directories</li>
-    <li>The LangGraph checkpointer only deserializes allow-listed types</li>
-    <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests; the open Rust advisories were fixed and the website's production dependencies report zero npm audit findings</li>
-    <li>The threat model is reconciled (TM-001 to TM-013) and documents the remaining risks</li>
-  </ul>
-  <p class="mute">
-    Still open: the rollback target of under 5 seconds at 1M-row pgvector
-    scale is under verification
-    (<a href={`${repo}/issues/132`}>issue #132</a>); demo-scale rollback takes
-    about 1 second. Per-operation authorization is still open (TM-001):
-    for example, a rollback without a schema change can restore memory
-    without an approval token.
-  </p>
+Looking at your account history, I see: Customer thanked support for the quick reply.</span></code></pre>
+    </Panel>
+  </Section>
 
-  <h2>Design partners</h2>
-  <p class="mute">
-    If you run a stateful LangGraph agent in production and have been
-    burned by a prompt or schema change that you couldn't cleanly revert,
-    let's talk. Email <a href="mailto:toni@git-agentic.com">toni@git-agentic.com</a>.
-  </p>
+  <Section id="security" title="Security and limits" note="What the daemon enforces today, and what is still open.">
+    <dl class="rows">
+      <div>
+        <dt>Socket peer authentication</dt>
+        <dd>The daemon checks socket peers against a UID allowlist (<a href={`${repo}/blob/main/docs/adr/0012-socket-peer-authentication.md`}>ADR-0012</a>).</dd>
+      </div>
+      <div>
+        <dt>Approval for reverse migrations</dt>
+        <dd>
+          Any rollback that runs reverse schema migrations needs an operator
+          approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>).
+          Tokens are single-use per daemon process and scoped, so a
+          reverse-migration token cannot authorize a data-loss rollback. The
+          <code>agentic</code> CLI can attach the token automatically when its
+          preview shows approval is needed, it can read the key, and the
+          daemon's peer UID owns that key.
+        </dd>
+      </div>
+      <div>
+        <dt>Sidecar isolation</dt>
+        <dd>
+          The sidecar deployment keeps daemon state on a volume only the
+          daemon writes, checks state-directory ownership at startup, reads
+          credentials from files, and redacts the GCS token and the Postgres
+          URL in the store and memory-backend debug output. The Cloud Run
+          layout is not yet verified, and full credential isolation needs
+          separate service identities.
+        </dd>
+      </div>
+      <div>
+        <dt>Threat model</dt>
+        <dd>
+          The <a href={`${repo}/blob/main/git.agentic-threat-model.md`}>threat model</a>
+          is reconciled (TM-001 to TM-013) and documents the remaining risks.
+        </dd>
+      </div>
+    </dl>
+    <div class="callout">
+      <h3>Still open</h3>
+      <ul>
+        <li>
+          The rollback target of under 5 seconds at 1M-row pgvector scale is
+          under verification (<a href={`${repo}/issues/132`}>issue #132</a>).
+          Demo-scale rollback takes about 1 second.
+        </li>
+        <li>
+          Per-operation authorization is still open (TM-001). For example, a
+          rollback without a schema change can restore memory without an
+          approval token.
+        </li>
+        <li>git.agentic is not in production use anywhere yet.</li>
+      </ul>
+    </div>
+  </Section>
 
-  <p class="mute">
-    Docs: <a href={`${repo}#readme`}>README</a> ·
-    <a href={`${repo}/blob/main/docs/product/mvp-spec.md`}>MVP spec</a> ·
-    <a href={`${repo}/blob/main/docs/architecture/snapshot-model.md`}>Snapshot model</a> ·
-    <a href={`${repo}/tree/main/docs/adr`}>ADRs</a>
-  </p>
+  <Section id="changes" title="Recent changes" note="November 2026">
+    <div class="changes">
+      <h3>20 November 2026: security hardening round</h3>
+      <p>Merged as PRs #145 to #153 and #156.</p>
+      <ul>
+        <li>Rollbacks that run reverse schema migrations now need an operator approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>).</li>
+        <li>The object store keeps raw and typed objects at separate storage paths, so one can no longer occupy the other's address (<a href={`${repo}/blob/main/docs/adr/0018-separate-raw-object-namespace.md`}>ADR-0018</a>).</li>
+        <li>The sidecar deployment keeps daemon state on a volume only the daemon writes and reads credentials from files. Full credential isolation still needs separate service identities, as the security section above says.</li>
+        <li>Rollback validates the prompt tree before any database change and refuses symlinked prompt directories.</li>
+        <li>The LangGraph checkpointer only deserializes allow-listed types.</li>
+        <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests. The open Rust advisories were fixed.</li>
+        <li>The threat model was reconciled, TM-001 to TM-013.</li>
+      </ul>
+    </div>
+  </Section>
 
-  <FAQ items={faqs} />
-
-  <Footer />
-</Base>
+  <Section id="partners" title="Design partners">
+    <p>
+      If you run a stateful LangGraph agent in production and a prompt or
+      schema change has left you with a regression you could not cleanly
+      revert, get in touch at
+      <a href="mailto:toni@git-agentic.com">toni@git-agentic.com</a>.
+    </p>
+  </Section>
+</Project>

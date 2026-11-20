@@ -1,19 +1,20 @@
 ---
 import Base from '../layouts/Base.astro';
-import Header from '../components/Header.astro';
-import Footer from '../components/Footer.astro';
-const repo = 'https://github.com/git-agentic/git.agentic';
-const srcControl = 'https://github.com/git-agentic/src-control';
-const pkgRegistry = 'https://github.com/git-agentic/pkg-registry';
+import Section from '../components/Section.astro';
+import Panel from '../components/Panel.astro';
+import Badge from '../components/Badge.astro';
+import { projects } from '../data/projects';
+import { articles, articleUrl } from '../data/articles';
 const structuredData = {
   '@context': 'https://schema.org',
   '@type': 'ItemList',
   name: 'Open-source infrastructure for AI agents',
-  itemListElement: [
-    { '@type': 'ListItem', position: 1, name: 'git.agentic', url: 'https://git-agentic.com/git-agentic' },
-    { '@type': 'ListItem', position: 2, name: 'src-control', url: 'https://git-agentic.com/src-control' },
-    { '@type': 'ListItem', position: 3, name: 'Sentinel', url: 'https://git-agentic.com/sentinel' },
-  ],
+  itemListElement: projects.map((item, index) => ({
+    '@type': 'ListItem',
+    position: index + 1,
+    name: item.name,
+    url: `https://git-agentic.com${item.href}`,
+  })),
 };
 ---
 <Base
@@ -22,80 +23,159 @@ const structuredData = {
   modifiedTime="2026-11-20"
   structuredData={structuredData}
 >
-  <Header />
-
-  <div class="badges">
-    <span class="badge"><span class="pulse"></span>Three projects · all open source</span>
-    <span class="badge">Apache 2.0</span>
-    <span class="badge">Rust · TypeScript · Python</span>
+  <div class="hero home-hero">
+    <div class="wrap home-hero__grid">
+      <div>
+      <p class="eyebrow">Three open source projects, Apache 2.0</p>
+      <h1>Open source infrastructure for software written and run by AI agents.</h1>
+      <p class="lead">
+        git.agentic versions agent behavior and rolls back prompts, memory
+        and schema. src-control is
+        version control and a Git forge for agent fleets. Sentinel audits npm
+        packages before install-time code runs.
+      </p>
+      <div class="actions">
+        <a class="btn" href="#projects">See the projects</a>
+        <a class="btn btn--ghost" href="https://github.com/git-agentic">View on GitHub</a>
+      </div>
+      <p class="home-hero__note">
+        Two of the three run in production at Codento Engine.
+        <a href="#production">See exactly what runs there.</a>
+      </p>
+      </div>
+      <div class="panel thesis">
+        <div class="panel__bar"><span class="panel__title">three assumptions agents break</span></div>
+        <ul>
+          <li>
+            <code>git revert</code>
+            <span>assumes code is the only thing that changed.</span>
+            <a href="/git-agentic">git.agentic</a>
+          </li>
+          <li>
+            <code>git checkout</code>
+            <span>assumes one developer, one directory and one disk.</span>
+            <a href="/src-control">src-control</a>
+          </li>
+          <li>
+            <code>npm install</code>
+            <span>assumes a human read what it fetched.</span>
+            <a href="/sentinel">Sentinel</a>
+          </li>
+        </ul>
+      </div>
+    </div>
   </div>
 
-  <h1>The tooling under software assumes a human in the loop.</h1>
-
-  <p class="lead">
-    AI agents broke that assumption. git.agentic builds open-source version
-    control, source control, and software supply-chain security for software
-    written and operated by agents.
-  </p>
-
-  <pre class="thesis"><code><span class="bad">git revert</span>     assumes code is the only thing that changed   <span class="accent">→ git.agentic</span>
-<span class="bad">npm install</span>    assumes a human read what it fetched          <span class="accent">→ Sentinel</span>
-<span class="bad">your checkout</span>  assumes one pair of hands                     <span class="accent">→ src-control</span></code></pre>
-
-  <section class="pillar">
-    <h2 id="git-agentic">git<span class="dot">.</span>agentic</h2>
-    <p class="tagline">Git for agent behavior.</p>
-    <p class="mute">
-      An agent's behavior is determined by six things — code, prompts, tools,
-      model, memory, schema — and <code>git revert</code> only knows about
-      one of them. git.agentic snapshots the whole tuple atomically and
-      rolls all six dimensions back coherently, including reverse schema
-      migrations and memory state.
-    </p>
-    <pre><code>$ agentic rollback v0.7
-<span class="accent">  ✓ Schema reverted          in 0.4s
-  ✓ Memory restored          in 2.1s
-  ✓ Prompts restored         in 0.0s
-  ✓ HEAD now at i7j8k9l (rollback of v0.8 → v0.7)</span></code></pre>
-    <p class="meta">Rust core · Python SDK · open-source MVP complete · production validation in progress</p>
-    <p><a href="/git-agentic">Full page →</a> &nbsp; <a href={repo}>GitHub →</a></p>
+  <section class="section home-projects" id="projects" aria-labelledby="projects-title">
+    <div class="wrap">
+      <h2 id="projects-title">Projects</h2>
+      <ul class="project-cards">
+        {projects.map((item) => (
+          <li class="card project-card" id={item.href.slice(1)}>
+            <h3><a href={item.href}>{item.name}</a></h3>
+            <p class="project-card__purpose">{item.purpose}</p>
+            <div class="badges">
+              {item.badges.map((kind) => <Badge kind={kind} />)}
+            </div>
+            <p class="scope">{item.scope}</p>
+            <dl class="project-card__meta">
+              <div><dt>Language</dt><dd>{item.language}</dd></div>
+              <div><dt>License</dt><dd>{item.license}</dd></div>
+            </dl>
+            <div class="project-card__links">
+              <a href={item.href} aria-label={`${item.name} project page`}>Project page</a>
+              <a href={item.repo} aria-label={`${item.name} on GitHub`}>GitHub</a>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
   </section>
 
-  <section class="pillar">
-    <h2 id="src-control">src-control</h2>
-    <p class="tagline">Version control built for fleets of agents.</p>
-    <p class="mute">
-      A checkout assumes one developer, one directory, one disk. Agents want
-      N parallel worktrees, now, and gone without a trace afterwards.
-      src-control forks copy-on-write worktrees entirely in RAM — checkout
-      to disk only when you ask — with native committed secrets, signed
-      commits, sealed agent-session transcripts, private branches with
-      atomic publish, bidirectional Git sync (local or GitHub), and a native
-      read-only desktop browser for refs, snapshot DAGs, provenance, public
-      trees, and diffs.
+  <Section id="production" title="In production" note="What Codento Engine runs today, and what it does not.">
+    <div class="grid-2">
+      <div class="card feature">
+        <div class="badges"><Badge kind="prod" /></div>
+        <h3>sc-forge, from src-control</h3>
+        <p>
+          Codento Engine uses sc-forge as the Git host for its project
+          repositories. sc-forge is the Gitea-compatible Git forge in
+          src-control, and it replaced Gitea there. Engine builds the sc-forge
+          image from a pinned src-control commit and deploys it by digest.
+        </p>
+      </div>
+      <div class="card feature">
+        <div class="badges"><Badge kind="prod" /></div>
+        <h3>Sentinel, in observe mode</h3>
+        <p>
+          Sentinel runs as the auditing npm proxy in Codento Engine's build
+          stack. In observe mode it scores every tarball and blocks none yet.
+          Installs fail closed if the proxy is down, unless someone explicitly
+          bypasses it.
+        </p>
+      </div>
+    </div>
+    <p class="production-limits">
+      That is the full extent of production use. The in-memory worktrees,
+      committed secrets and encrypted paths in src-control are not in
+      production there, and neither is Sentinel's block mode. git.agentic is
+      not in production anywhere yet. src-control and Sentinel are both
+      pre-1.0 and have no production users outside Codento Engine. Codento
+      Engine is a product of Codento Oy, and Toni Bergholm is the author of
+      all three projects.
     </p>
-    <pre><code><span class="comment"># fork 4 parallel in-RAM worktrees off one snapshot</span>
+  </Section>
+
+  <Section id="why" title="Why this exists" note="Most developer tooling assumes a person is in the loop.">
+    <p>
+      Agents remove that person, and three assumptions stop holding. An
+      agent's behavior depends on its prompts, tools, model, memory and schema
+      as well as its code, so reverting the code does not restore it. A fleet
+      of agents needs many worktrees at once, and a checkout gives one
+      developer one directory on one disk. Agents install npm packages and run their install scripts
+      without anyone reading them.
+    </p>
+    <p>
+      Each project replaces one of those assumptions.
+      <a href="/git-agentic">git.agentic</a> versions all six dimensions
+      together. <a href="/src-control">src-control</a> forks worktrees in
+      memory and hosts the repositories. <a href="/sentinel">Sentinel</a>
+      scores each tarball before its install scripts run.
+    </p>
+  </Section>
+
+  <Section id="examples" title="What it looks like" note="One sample from each project. The project pages have the full walkthroughs.">
+    <h3>git.agentic rolls back prompts, memory and schema</h3>
+    <Panel title="./scripts/run-demo.sh, step 10 from demo.cast">
+<pre><code><span class="dim">=== 10. rollback to baseline ===</span>
+live schema / sentiment columns before rollback: 001_add_sentiment/1
+<span class="accent">  - target commit 20eb9cf (v0.7 baseline)
+  - current branch tip c4794d5 → forward-record over it
+  - reverse schema migrations: 001_add_sentiment → 0.0.0
+  - restore memory from manifest d9f76eb
+  - rewrite ~/git.agentic/examples/langgraph-rollback/prompts from target prompts tree 2e6a8d6
+  - model version captured in target — operator must redeploy if it changed
+  - forward-recorded rollback as 2a2893a on langgraph/abbbd1ad6698ea81
+✓ rollback complete; HEAD now at 2a2893a</span>
+live schema / sentiment columns after rollback: 0.0.0/0</code></pre>
+    </Panel>
+    <p class="note">
+      Rollback records the target's code, tools and model. The operator
+      redeploys those.
+    </p>
+
+    <h3>src-control forks worktrees in memory</h3>
+    <Panel title="sc">
+<pre><code><span class="comment"># fork 4 parallel in-RAM worktrees off one snapshot</span>
 $ sc demo --agents 4
 
 <span class="comment"># agent workspaces: run a command across N forks, harvest results</span>
 $ sc work --agents 4 -- cargo test</code></pre>
-    <p class="meta">Rust · Tauri v2 · TypeScript · Phases 1–36 and 37a–37d built</p>
-    <p><a href="/src-control">Full page →</a> &nbsp; <a href={srcControl}>GitHub →</a></p>
-  </section>
+    </Panel>
 
-  <section class="pillar">
-    <h2 id="sentinel">Sentinel</h2>
-    <p class="tagline">An agent-auditable security layer and registry for npm.</p>
-    <p class="mute">
-      Agents run <code>npm install</code> and execute code nobody read.
-      Sentinel is an auditing proxy in front of registry.npmjs.org that
-      grew into a first-class registry: every tarball is scored by a
-      deterministic engine and carries a verdict <em>before</em>
-      install-time code runs, a deny-by-default sandbox contains what does
-      run, and claimed names get verified ownership and time-locked
-      retraction. The agent can request; only a human grants.
-    </p>
-    <pre><code>  color-stream@1.4.1
+    <h3>Sentinel scores a tarball before it installs</h3>
+    <Panel title="sentinel audit">
+<pre><code>  color-stream@1.4.1
   ────────────────────────────────────────
   install    ⚠ runs lifecycle scripts
   score      ░░░░░░░░░░ 0/100
@@ -104,44 +184,57 @@ $ sc work --agents 4 -- cargo test</code></pre>
   <span class="bad">critical</span> [secret-exfil]     reads ~/.npmrc, AWS credentials…
 
   HTTP 403  x-sentinel-verdict: block</code></pre>
-    <p class="meta">TypeScript · security layer + registry built · pre-1.0 · v0.1.0-alpha.2 on npm</p>
-    <p><a href="/sentinel">Full page →</a> &nbsp; <a href={pkgRegistry}>GitHub →</a></p>
-  </section>
+    </Panel>
+    <p class="note">
+      The 403 is what the proxy returns under the <code>block</code> policy.
+      Under <code>observe</code>, the default, it reports the verdict and
+      still serves the tarball.
+    </p>
+  </Section>
 
-  <section class="pillar">
-    <h2 id="learn">Technical guides</h2>
-    <p class="tagline">Clear answers about versioning and rolling back AI agents.</p>
-    <ul class="plain">
-      <li><a href="/learn/why-git-revert-does-not-fix-ai-agent-regressions">Why <code>git revert</code> does not fix AI agent regressions</a></li>
-      <li><a href="/learn/version-control-for-ai-agents">Version control for AI agents: a new commit primitive</a></li>
-      <li><a href="/learn/six-dimensions-of-ai-agent-behavior">The six dimensions that determine AI agent behavior</a></li>
+  <Section id="learn" title="Guides" note="Technical articles on versioning and rolling back AI agents.">
+    <ul class="article-list">
+      {articles.map((article) => (
+        <li>
+          <a href={articleUrl(article)}>{article.title}</a>
+          <p>{article.description}</p>
+        </li>
+      ))}
     </ul>
-    <p><a href="/learn">Read all guides →</a></p>
-  </section>
-
-  <Footer />
+    <p><a href="/learn">All guides</a></p>
+  </Section>
 </Base>
 
-<style>
-  .thesis { margin-bottom: 3rem; }
-  .pillar { margin-top: 4rem; }
-  .pillar h2 {
-    text-transform: none;
-    letter-spacing: -0.02em;
-    font-size: 1.5rem;
-    color: var(--fg);
-    margin-top: 0;
-    margin-bottom: 0.25rem;
-  }
-  .pillar .dot { color: var(--accent); }
-  .tagline {
-    font-family: var(--sans);
-    color: var(--fg);
-    margin-bottom: 0.75rem;
-  }
-  .meta {
-    font-size: 12px;
-    color: var(--fg-faint);
-    margin: 0 0 0.5rem;
+<style is:global>
+  .home-hero__grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 0.7fr); gap: var(--s-7); align-items: center; }
+  .home-hero h1 { font-size: clamp(2.2rem, 1.2rem + 4vw, 3.6rem); }
+  .thesis { margin: 0; }
+  .thesis ul { list-style: none; margin: 0; padding: 0; }
+  .thesis li { display: grid; gap: var(--s-1); margin: 0; padding: var(--s-4) var(--s-5); border-top: 1px solid var(--code-line); color: var(--code-text); font-size: var(--text-sm); }
+  .thesis li:first-child { border-top: 0; }
+  .thesis code { padding: 0; border: 0; background: none; color: var(--code-bad); font-size: var(--text-sm); }
+  .thesis span { color: var(--code-label); }
+  .thesis a { justify-self: start; color: var(--code-accent); font-weight: 600; }
+  .thesis a:focus-visible { outline-color: var(--code-accent); }
+  .home-hero__note { margin: var(--s-5) 0 0; color: var(--text-2); font-size: var(--text-sm); }
+  .home-projects { border-top: 0; padding-top: 0; }
+  .home-projects h2 { margin-bottom: var(--s-5); }
+  .project-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-4); list-style: none; margin: 0; padding: 0; }
+  .project-card { display: flex; flex-direction: column; margin: 0; }
+  .project-card h3 { font-size: var(--text-xl); }
+  .project-card h3 a { color: var(--text); text-decoration: none; }
+  .project-card h3 a:hover { color: var(--accent); }
+  .project-card__purpose { min-height: 3.2em; margin: var(--s-2) 0 var(--s-4); color: var(--text-2); }
+  .project-card .scope { margin: var(--s-3) 0 var(--s-4); }
+  .project-card__meta { display: flex; gap: var(--s-6); margin: auto 0 0; padding-top: var(--s-4); border-top: 1px solid var(--border); font-size: var(--text-sm); }
+  .project-card__meta dt { color: var(--text-3); font-size: var(--text-xs); font-weight: 600; }
+  .project-card__meta dd { margin: 0; color: var(--text); }
+  .project-card__links { display: flex; gap: var(--s-5); margin-top: var(--s-4); font-size: var(--text-sm); font-weight: 600; }
+  .production-limits { margin-top: var(--s-5); }
+  .feature .badges { margin-bottom: var(--s-3); }
+  @media (max-width: 54rem) {
+    .project-cards, .home-hero__grid { grid-template-columns: minmax(0, 1fr); }
+    .home-hero__grid { gap: var(--s-6); }
+    .project-card__purpose { min-height: 0; }
   }
 </style>

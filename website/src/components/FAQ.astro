@@ -1,4 +1,5 @@
 ---
+import Section from './Section.astro';
 interface Item {
   question: string;
   answer: string;
@@ -10,14 +11,13 @@ interface Props {
 
 const { items } = Astro.props;
 ---
-<section aria-labelledby="frequently-asked-questions">
-  <h2 id="frequently-asked-questions">Frequently asked questions</h2>
-  <dl class="faq-list">
+<Section id="faq" title="Frequently asked questions" headingId="frequently-asked-questions">
+  <dl class="faq">
     {items.map((item) => (
-      <>
+      <div>
         <dt>{item.question}</dt>
         <dd>{item.answer}</dd>
-      </>
+      </div>
     ))}
   </dl>
-</section>
+</Section>

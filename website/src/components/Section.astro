@@ -1,0 +1,21 @@
+---
+interface Props {
+  id: string;
+  title: string;
+  note?: string;
+  // Overrides the heading id, for anchors that older links already use.
+  headingId?: string;
+}
+const { id, title, note, headingId = `${id}-title` } = Astro.props;
+---
+<section class="section" id={id} aria-labelledby={headingId}>
+  <div class="wrap split">
+    <div class="split__head">
+      <h2 id={headingId}>{title}</h2>
+      {note && <p>{note}</p>}
+    </div>
+    <div class="split__body">
+      <slot />
+    </div>
+  </div>
+</section>

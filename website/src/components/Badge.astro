@@ -1,0 +1,8 @@
+---
+import { badgeLabel, type BadgeKind } from '../data/projects';
+interface Props {
+  kind: BadgeKind;
+}
+const { kind } = Astro.props;
+---
+<span class={`badge badge--${kind}`}>{badgeLabel[kind]}</span>
