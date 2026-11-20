@@ -75,9 +75,14 @@ pub fn secure_state_dir(repo: &Path, trusted_root: Option<&Path>) -> anyhow::Res
         let child_m = lstat_no_symlink(child)?;
         let trusted = trusted_root.as_deref() == Some(dir);
         if let Some(why) = ancestor_writable_by_others(&m, &child_m, euid, egid, trusted) {
+            // The flag cannot fix an ownership refusal, so only hint it otherwise.
+            let hint = if m.uid() != euid && m.uid() != 0 {
+                ""
+            } else {
+                " (if only agenticd mounts this directory, pass --trusted-volume-root)"
+            };
             bail!(
-                "{} {why}; another uid could replace the daemon's state, refusing to start \
-                 (if only agenticd mounts this directory, pass --trusted-volume-root)",
+                "{} {why}; another uid could replace the daemon's state, refusing to start{hint}",
                 dir.display()
             );
         }
