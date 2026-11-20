@@ -37,10 +37,27 @@ pub(super) fn preflight_prompts(
 ) -> anyhow::Result<()> {
     let dir = repo.join("prompts");
     reject_symlinked_dirs(repo, &dir)?;
-    for name in load_tree(state, prompts_hash)?.entries.keys() {
+    let tree = load_tree(state, prompts_hash)?;
+    let names: Vec<&String> = tree.entries.keys().collect();
+    reject_file_dir_conflicts(&names)?;
+    for name in names {
         validate_tree_entry_name(name)?;
         if let Some(parent) = dir.join(name).parent() {
             reject_symlinked_dirs(repo, parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reject a tree where one entry is both a file and a directory of another
+/// (`a` and `a/b`): the write would fail halfway, after the database changed.
+fn reject_file_dir_conflicts(names: &[&String]) -> anyhow::Result<()> {
+    for name in names {
+        let prefix = format!("{name}/");
+        if let Some(child) = names.iter().find(|m| m.starts_with(&prefix)) {
+            return Err(anyhow!(
+                "prompt tree entry {name:?} is both a file and the directory of {child:?}"
+            ));
         }
     }
     Ok(())
@@ -137,8 +154,15 @@ fn create_temp(
     path: &Path,
     mut next: impl FnMut() -> u64,
 ) -> anyhow::Result<(PathBuf, std::fs::File)> {
+    let dest = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
     for _ in 0..TMP_ATTEMPTS {
-        let tmp = path.with_file_name(format!(".agentic-tmp-{}-{}", std::process::id(), next()));
+        let name = format!(".agentic-tmp-{}-{}", std::process::id(), next());
+        // A candidate equal to the destination (also case-insensitively, for
+        // case-folding filesystems) would expose a partial write at `path`.
+        if dest.as_deref() == Some(name.to_lowercase().as_str()) {
+            continue;
+        }
+        let tmp = path.with_file_name(name);
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -336,6 +360,29 @@ pub(super) fn read_model_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_dir_conflict_is_rejected() {
+        let (a, ab, c) = ("a".to_string(), "a/b".to_string(), "ab".to_string());
+        assert!(reject_file_dir_conflicts(&[&a, &ab]).is_err());
+        assert!(reject_file_dir_conflicts(&[&a, &c]).is_ok());
+        assert!(reject_file_dir_conflicts(&[&ab, &c]).is_ok());
+    }
+
+    #[test]
+    fn temp_name_never_equals_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir
+            .path()
+            .join(format!(".AGENTIC-TMP-{}-0", std::process::id()));
+        let mut n = 0;
+        let (tmp, _f) = create_temp(&dest, || {
+            n += 1;
+            n - 1
+        })
+        .unwrap();
+        assert!(tmp.file_name().unwrap().to_string_lossy().ends_with("-1"));
+    }
 
     #[test]
     fn validate_accepts_normal_relative_names() {
