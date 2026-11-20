@@ -167,6 +167,13 @@ fn run_rollback(f: &Fixture, extra: &[&str]) {
     );
 }
 
+/// Write a key file with the mode the CLI requires (0600).
+fn write_key(path: impl AsRef<Path>, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path.as_ref(), bytes).unwrap();
+    std::fs::set_permissions(path.as_ref(), std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
@@ -182,7 +189,7 @@ fn now() -> u64 {
 #[test]
 fn attaches_a_token_from_the_default_key_file() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     run_rollback(&f, &[]);
 
     let seen = f.seen.lock().unwrap();
@@ -209,7 +216,7 @@ fn attaches_a_token_from_the_default_key_file() {
 fn attaches_a_token_from_the_key_file_flag() {
     let f = fixture();
     let key_path = f.repo.path().join("custom.key");
-    std::fs::write(&key_path, KEY).unwrap();
+    write_key(&key_path, &KEY);
     run_rollback(&f, &["--key-file", key_path.to_str().unwrap()]);
     assert!(f.seen.lock().unwrap().last().unwrap().token.is_some());
 }
@@ -230,7 +237,7 @@ fn sends_no_token_without_a_key() {
 #[test]
 fn explicit_token_is_not_replaced() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     run_rollback(&f, &["--approval-token", "1:deadbeef"]);
     let seen = f.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
@@ -245,7 +252,7 @@ fn explicit_token_is_not_replaced() {
 fn unusable_default_key_sends_no_token_but_a_bad_explicit_key_fails() {
     let f = fixture();
     // Wrong length: the daemon would run keyless, so the CLI must not fail.
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), [1u8; 5]).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &[1u8; 5]);
     run_rollback(&f, &[]);
     assert_eq!(f.seen.lock().unwrap()[0].token, None);
     f.seen.lock().unwrap().clear();
@@ -262,7 +269,7 @@ fn unusable_default_key_sends_no_token_but_a_bad_explicit_key_fails() {
 #[test]
 fn preview_and_applied_rollback_name_the_pinned_hash_and_only_the_applied_one_is_signed() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     // No --yes: preview, then confirm.
     let out = agentic(&f, &["rollback", "main"], "y\n");
     assert!(
@@ -293,7 +300,7 @@ fn preview_and_applied_rollback_name_the_pinned_hash_and_only_the_applied_one_is
 #[test]
 fn destructive_preview_gets_its_own_token_and_the_apply_is_minted_fresh() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     let out = agentic(&f, &["rollback", "main", "--accept-data-loss"], "y\n");
     assert!(
         out.status.success(),
@@ -314,7 +321,7 @@ fn destructive_preview_gets_its_own_token_and_the_apply_is_minted_fresh() {
 #[test]
 fn declining_the_prompt_sends_no_signed_apply() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     let out = agentic(&f, &["rollback", "main"], "n\n");
     assert!(!out.status.success());
     let seen = f.seen.lock().unwrap();
@@ -325,7 +332,7 @@ fn declining_the_prompt_sends_no_signed_apply() {
 #[test]
 fn dry_run_flag_carries_no_auto_token() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     run_rollback(&f, &["--dry-run"]);
     let seen = f.seen.lock().unwrap();
     assert!(seen[0].dry_run);
@@ -341,7 +348,7 @@ fn refuses_to_sign_a_resolved_hash_that_is_not_64_lowercase_hex() {
         "ab".repeat(32) + "\n",
     ] {
         let f = fixture_resolving(bad.clone());
-        std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+        write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
         let out = rollback_cmd(&f, &[]);
         assert!(!out.status.success(), "{bad:?} must be refused");
         assert!(
@@ -356,7 +363,7 @@ fn refuses_to_sign_a_resolved_hash_that_is_not_64_lowercase_hex() {
 #[test]
 fn key_warning_goes_to_stderr_and_json_stdout_stays_parseable() {
     let f = fixture();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), [1u8; 5]).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &[1u8; 5]);
     let out = agentic(&f, &["--json", "rollback", "main", "--yes"], "");
     assert!(out.status.success());
     serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or_else(|e| {
@@ -375,7 +382,7 @@ fn apply_is_not_signed_when_the_preview_reported_no_approval_needed() {
     // reverse migration nobody saw. The daemon's gate refuses it instead.
     for extra in [&[][..], &["--yes"][..]] {
         let f = fixture_no_approval();
-        std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+        write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
         let mut args = vec!["rollback", "main"];
         args.extend_from_slice(extra);
         let out = agentic(&f, &args, "y\n");
@@ -395,11 +402,10 @@ fn apply_is_not_signed_when_the_preview_reported_no_approval_needed() {
 fn oversized_default_key_file_is_rejected_without_a_token() {
     let f = fixture();
     // Far longer than a key; only the first 33 bytes may be read.
-    std::fs::write(
+    write_key(
         f.repo.path().join(".agentic/approval.key"),
-        vec![7u8; 1 << 20],
-    )
-    .unwrap();
+        &vec![7u8; 1 << 20],
+    );
     run_rollback(&f, &[]);
     let seen = f.seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "no key, so no pinning preview: {seen:?}");
@@ -410,7 +416,7 @@ fn oversized_default_key_file_is_rejected_without_a_token() {
 fn accept_data_loss_apply_is_signed_even_if_the_preview_omits_approval_required() {
     // An older daemon's reply has no approval_required (it reads as false).
     let f = fixture_no_approval();
-    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    write_key(f.repo.path().join(".agentic/approval.key"), &KEY);
     let out = agentic(&f, &["rollback", "main", "--accept-data-loss"], "y\n");
     assert!(
         out.status.success(),
@@ -449,7 +455,7 @@ fn a_fifo_at_the_default_key_path_is_skipped_not_blocked_on() {
 fn a_symlinked_default_key_is_skipped() {
     let f = fixture();
     let real = f.repo.path().join("real.key");
-    std::fs::write(&real, KEY).unwrap();
+    write_key(&real, &KEY);
     std::os::unix::fs::symlink(&real, f.repo.path().join(".agentic/approval.key")).unwrap();
     run_rollback(&f, &[]);
     assert_eq!(f.seen.lock().unwrap()[0].token, None);
@@ -463,5 +469,100 @@ fn an_explicit_key_that_is_not_a_regular_file_is_an_error() {
     let out = rollback_cmd(&f, &["--key-file", fifo.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
+    assert!(f.seen.lock().unwrap().is_empty());
+}
+
+/// `agentic rollback --approval <hash> --uid 1000 --key-file <key> [extra]`
+/// prints a token; returns it.
+fn issue(extra: &[&str]) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("k");
+    write_key(&key, &KEY);
+    let out = Command::new(env!("CARGO_BIN_EXE_agentic"))
+        .arg("--repo")
+        .arg(dir.path())
+        .args(["rollback", "--approval", &target_hash(), "--uid", "1000"])
+        .arg("--key-file")
+        .arg(&key)
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn issuer_scope_flag_selects_the_token_scope_and_defaults_to_data_loss() {
+    let key = ApprovalKey::from_bytes(&KEY).unwrap();
+    let h = target_hash();
+    let rm = issue(&["--scope", "reverse-migration"]);
+    // Verifies for a plain reverse-migration rollback, not for accept_data_loss.
+    verify_token_any(
+        &key,
+        &[ApprovalScope::ReverseMigration],
+        &h,
+        1000,
+        &rm,
+        now(),
+    )
+    .unwrap();
+    assert!(verify_token(&key, &h, 1000, &rm, now()).is_err());
+    // No flag, or data-loss: the data-loss scope, as before.
+    for dl in [issue(&[]), issue(&["--scope", "data-loss"])] {
+        verify_token(&key, &h, 1000, &dl, now()).unwrap();
+        assert!(verify_token_any(
+            &key,
+            &[ApprovalScope::ReverseMigration],
+            &h,
+            1000,
+            &dl,
+            now()
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn a_symlink_at_the_key_path_is_never_followed() {
+    // O_NOFOLLOW: a symlink to a valid key is refused even when the path is
+    // named explicitly, so a swap after any earlier check cannot be followed.
+    let f = fixture();
+    let real = f.repo.path().join("real.key");
+    write_key(&real, &KEY);
+    let link = f.repo.path().join("link.key");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out = rollback_cmd(&f, &["--key-file", link.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "an explicit symlinked key is an error"
+    );
+    assert!(f.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_group_readable_key_is_skipped_by_default_and_refused_when_named() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let default = f.repo.path().join(".agentic/approval.key");
+    write_key(&default, &KEY);
+    std::fs::set_permissions(&default, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Default path: warning on stderr, no token, the rollback still runs.
+    let out = rollback_cmd(&f, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("chmod 600"));
+    assert_eq!(f.seen.lock().unwrap()[0].token, None);
+    f.seen.lock().unwrap().clear();
+    // Named with --key-file: an error, nothing sent.
+    let out = rollback_cmd(&f, &["--key-file", default.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("chmod 600"));
     assert!(f.seen.lock().unwrap().is_empty());
 }

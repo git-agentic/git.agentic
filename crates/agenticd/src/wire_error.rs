@@ -47,7 +47,7 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
         let code = match gate {
             A::KeyNotConfigured => "approval_key_not_configured",
             A::NoPeerUid => "approval_no_peer_uid",
-            A::TokenRequired => "approval_required",
+            A::TokenRequired | A::TokenRequiredForReverseMigration => "approval_required",
             A::Rejected(R::Malformed) => "approval_token_malformed",
             A::Rejected(R::Expired { .. }) => "approval_token_expired",
             A::Rejected(R::InvalidSignature) => "approval_token_invalid_signature",
@@ -302,6 +302,10 @@ mod tests {
             ),
             (
                 anyhow::Error::new(ApprovalError::TokenRequired),
+                "approval_required",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::TokenRequiredForReverseMigration),
                 "approval_required",
             ),
             (

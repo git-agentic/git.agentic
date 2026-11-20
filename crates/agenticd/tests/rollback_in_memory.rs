@@ -942,7 +942,7 @@ async fn reverse_migration_rollback_without_token_is_refused_before_side_effects
     .expect_err("a plain reverse-migration rollback needs a token");
     assert!(matches!(
         downcast_approval(&err),
-        ApprovalError::TokenRequired
+        ApprovalError::TokenRequiredForReverseMigration
     ));
     assert_untouched(&state, &adapter, tip).await;
     assert!(
@@ -1283,4 +1283,107 @@ async fn legacy_format_token_still_authorizes_accept_data_loss() {
     .await
     .expect("a legacy token keeps working for accept_data_loss");
     assert!(out.executed);
+}
+
+#[tokio::test]
+async fn missing_token_diagnostics_name_the_right_scope() {
+    // A plain reverse-migration rollback must point operators at the
+    // reverse-migration scope, never at a data-loss token, which a worker
+    // could replay with accept_data_loss. accept_data_loss points at data-loss.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let plain = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, false),
+        Some(1000),
+    )
+    .await
+    .expect_err("no token");
+    let msg = format!("{plain:#}");
+    assert!(msg.contains("--scope reverse-migration"), "{msg}");
+    assert!(!msg.contains("--scope data-loss"), "{msg}");
+
+    let destructive = rollback::execute(
+        Arc::clone(&state),
+        destructive_args(&baseline, None),
+        Some(1000),
+    )
+    .await
+    .expect_err("no token");
+    let msg = format!("{destructive:#}");
+    assert!(msg.contains("--scope data-loss"), "{msg}");
+    assert!(!msg.contains("--scope reverse-migration"), "{msg}");
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// The process-wide log buffer. A global subscriber, installed once, because
+/// a thread-local default can lose to callsite-interest caching when other
+/// tests in the binary hit the same callsites first.
+fn audit_log() -> &'static LogBuf {
+    static LOG: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let buf = LogBuf::default();
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        buf
+    })
+}
+
+#[tokio::test]
+async fn accepted_audit_event_names_the_scope_the_token_verified_under() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    let buf = audit_log();
+    for (scope, expect) in [
+        (
+            ApprovalScope::ReverseMigration,
+            "scope=\"reverse_migration\"",
+        ),
+        (ApprovalScope::DataLoss, "scope=\"data_loss\""),
+    ] {
+        let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+        contaminate(&state, &adapter).await;
+        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs());
+        // The audited token_prefix is the first 8 hex chars of the tag: unique
+        // to this scope's token, even if another test shares the commit hash.
+        let prefix = tok.split_once(':').unwrap().1[..8].to_string();
+        rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok), false),
+            Some(1000),
+        )
+        .await
+        .unwrap();
+        // Other tests log into the same buffer; find this run's event by it.
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("RollbackForcedDataLoss") && l.contains(&prefix))
+            .unwrap_or_else(|| panic!("no audit event for {prefix} in: {log}"));
+        assert!(line.contains("decision=\"accepted\""), "{line}");
+        assert!(line.contains(expect), "{expect}: {line}");
+        assert!(line.contains("reason=\"reverse_migration\""), "{line}");
+    }
 }

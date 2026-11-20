@@ -497,9 +497,9 @@ async fn adr_0019_reverse_migration_rollback_needs_a_token_against_postgres() {
     assert!(
         err.chain().any(|e| matches!(
             e.downcast_ref::<ApprovalError>(),
-            Some(ApprovalError::TokenRequired)
+            Some(ApprovalError::TokenRequiredForReverseMigration)
         )),
-        "expected TokenRequired, got: {err:#}"
+        "expected TokenRequiredForReverseMigration, got: {err:#}"
     );
     assert_eq!(migration_row_count(&admin, &schema).await.unwrap(), 2);
     assert!(table_exists(&admin, &schema, "step_b").await.unwrap());

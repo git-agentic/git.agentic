@@ -284,7 +284,10 @@ mod tests {
 
     #[tokio::test]
     async fn signed_round_trip_withholds_the_token_from_a_mismatched_peer() {
-        for (owner, expect_token) in [(my_uid() + 1, false), (my_uid(), true)] {
+        for (owner, expect_token, label) in [
+            (my_uid() + 1, false, "other uid"),
+            (my_uid(), true, "key owner"),
+        ] {
             let (_dir, path, server) = one_shot_server();
             exchange_at(
                 &path,
@@ -298,7 +301,7 @@ mod tests {
             let Some(Request::Rollback { approval_token, .. }) = server.await.unwrap() else {
                 panic!("server saw no rollback");
             };
-            assert_eq!(approval_token.is_some(), expect_token, "owner {owner}");
+            assert_eq!(approval_token.is_some(), expect_token, "{label}");
         }
     }
 

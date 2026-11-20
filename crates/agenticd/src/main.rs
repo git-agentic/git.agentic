@@ -236,11 +236,12 @@ fn load_approval_key(
         );
     };
     // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
-    // writer; the regular-file check below then rejects it.
+    // writer; the regular-file check below then rejects it. O_NOFOLLOW so a
+    // symlink swapped in after the default-path check is never followed.
     use std::os::unix::fs::OpenOptionsExt;
     let opened = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path);
     let mut file = match opened {
         Ok(f) => f,

@@ -53,6 +53,24 @@ struct Cli {
     json: bool,
 }
 
+/// What an issued approval token authorizes (ADR-0019 Decision 5).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum IssueScope {
+    /// `--accept-data-loss`. Also covers a plain reverse-migration rollback.
+    DataLoss,
+    /// A rollback that runs reverse migrations, without `--accept-data-loss`.
+    ReverseMigration,
+}
+
+impl From<IssueScope> for agentic_core::approval::ApprovalScope {
+    fn from(s: IssueScope) -> Self {
+        match s {
+            IssueScope::DataLoss => Self::DataLoss,
+            IssueScope::ReverseMigration => Self::ReverseMigration,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Initialise a new agentic repository in the current directory.
@@ -120,9 +138,9 @@ enum Command {
     /// rollback as a new commit so history is preserved.
     ///
     /// Also the operator's approval-token issuer (ADR-0014): pass
-    /// `--approval <commit-hash> --uid <worker-uid> --key-file <path>` to
-    /// mint a destructive-rollback token to stdout without contacting the
-    /// daemon.
+    /// `--approval <commit-hash> --uid <worker-uid> --key-file <path>
+    /// [--scope reverse-migration|data-loss]` to mint a token to stdout
+    /// without contacting the daemon.
     Rollback {
         /// Target ref (commit hash or branch name). Required for an actual
         /// rollback; ignored in `--approval` token-issuance mode.
@@ -152,6 +170,12 @@ enum Command {
         /// Worker UID the minted token is bound to (issuance mode).
         #[arg(long)]
         uid: Option<u32>,
+        /// Scope of the minted token (issuance mode). `reverse-migration`
+        /// authorizes only a rollback that runs reverse migrations;
+        /// `data-loss` (the default, as before) also authorizes
+        /// `--accept-data-loss`. Hand a worker the narrowest scope.
+        #[arg(long, value_enum, default_value_t = IssueScope::DataLoss)]
+        scope: IssueScope,
         /// Path to the 32-byte approval key. Used by the issuance mode and
         /// to attach a token to a rollback automatically (ADR-0019).
         #[arg(long)]
@@ -192,11 +216,12 @@ async fn main() -> anyhow::Result<()> {
             approval_token,
             approval,
             uid,
+            scope,
             key_file,
         } => {
             if let Some(commit_hash) = approval {
                 // Issuance mode: mint a token, no daemon contact.
-                return cmd_mint_approval(&commit_hash, uid, key_file);
+                return cmd_mint_approval(&commit_hash, uid, key_file, scope.into());
             }
             let target = target
                 .ok_or_else(|| anyhow!("rollback requires a target ref (or use --approval)"))?;
@@ -240,16 +265,28 @@ fn read_key(key_file: &Path) -> anyhow::Result<LoadedKey> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let ctx = || format!("reading approval key {}", key_file.display());
     // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
-    // writer; the regular-file check below then refuses it.
+    // writer; the regular-file check below then refuses it. O_NOFOLLOW so a
+    // symlink swapped in after the default-path check is never followed.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(key_file)
         .with_context(ctx)?;
     let meta = file.metadata().with_context(ctx)?;
     if !meta.is_file() {
         return Err(anyhow!(
             "approval key {} is not a regular file",
+            key_file.display()
+        ));
+    }
+    // The same mode check as the daemon: a key that group or other can read
+    // lets them mint tokens.
+    let mode = meta.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(anyhow!(
+            "approval key {} has mode {mode:03o}; it must not be accessible by group or \
+             other. Run `chmod 600 {}`",
+            key_file.display(),
             key_file.display()
         ));
     }
@@ -282,16 +319,14 @@ fn mint_with_key(
     ))
 }
 
-/// Mint a token from the 32-byte key at `key_file`. The issuance mode signs
-/// the data-loss scope, which also authorizes a plain reverse-migration
-/// rollback and is what older issuers produced.
-fn mint_token(key_file: &Path, commit_hash: &str, uid: u32) -> anyhow::Result<String> {
-    mint_with_key(
-        &read_key(key_file)?.key,
-        agentic_core::approval::ApprovalScope::DataLoss,
-        commit_hash,
-        uid,
-    )
+/// Mint a token of `scope` from the 32-byte key at `key_file`.
+fn mint_token(
+    key_file: &Path,
+    scope: agentic_core::approval::ApprovalScope,
+    commit_hash: &str,
+    uid: u32,
+) -> anyhow::Result<String> {
+    mint_with_key(&read_key(key_file)?.key, scope, commit_hash, uid)
 }
 
 /// ADR-0014 operator token issuer. Prints a token to stdout. Does not
@@ -300,10 +335,11 @@ fn cmd_mint_approval(
     commit_hash: &str,
     uid: Option<u32>,
     key_file: Option<PathBuf>,
+    scope: agentic_core::approval::ApprovalScope,
 ) -> anyhow::Result<()> {
     let uid = uid.ok_or_else(|| anyhow!("--approval requires --uid <worker-uid>"))?;
     let key_file = key_file.ok_or_else(|| anyhow!("--approval requires --key-file <path>"))?;
-    println!("{}", mint_token(&key_file, commit_hash, uid)?);
+    println!("{}", mint_token(&key_file, scope, commit_hash, uid)?);
     Ok(())
 }
 
@@ -871,6 +907,34 @@ fn read_git_head(repo: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    fn write_key_0600(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn a_group_or_other_accessible_key_is_refused_with_a_chmod_hint() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("approval.key");
+        write_key_0600(&path, &[7u8; 32]);
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = read_key(&path)
+                .err()
+                .unwrap_or_else(|| panic!("{mode:o} accepted"));
+            assert!(
+                format!("{err:#}").contains("chmod 600"),
+                "{mode:o}: {err:#}"
+            );
+        }
+        for mode in [0o600, 0o400] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(read_key(&path).is_ok(), "{mode:o}");
+        }
+    }
+
     /// A reader that never ends and counts what it hands out.
     struct Endless(std::cell::Cell<usize>);
     impl std::io::Read for &Endless {
@@ -912,9 +976,15 @@ mod tests {
     fn minted_token_verifies_for_the_commit_and_uid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("approval.key");
-        std::fs::write(&path, [7u8; 32]).unwrap();
+        write_key_0600(&path, &[7u8; 32]);
         let hash = "ab".repeat(32);
-        let token = mint_token(&path, &hash, 1234).unwrap();
+        let token = mint_token(
+            &path,
+            agentic_core::approval::ApprovalScope::DataLoss,
+            &hash,
+            1234,
+        )
+        .unwrap();
         let key = agentic_core::approval::ApprovalKey::from_bytes(&[7u8; 32]).unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -922,7 +992,13 @@ mod tests {
             .as_secs();
         agentic_core::approval::verify_token(&key, &hash, 1234, &token, now).unwrap();
         assert!(agentic_core::approval::verify_token(&key, &hash, 1235, &token, now).is_err());
-        std::fs::write(&path, [7u8; 5]).unwrap();
-        assert!(mint_token(&path, &hash, 1234).is_err());
+        write_key_0600(&path, &[7u8; 5]);
+        assert!(mint_token(
+            &path,
+            agentic_core::approval::ApprovalScope::DataLoss,
+            &hash,
+            1234
+        )
+        .is_err());
     }
 }

@@ -40,7 +40,8 @@ If so, and the request is not a dry run, the request passes the same gate as an 
 The token format, the HMAC binding to the target commit and the peer UID, the five-minute window and the single-use ledger are the ADR-0014 ones, unchanged.
 
 The gate runs before any side effect.
-The down-migration files are loaded (read-only) just before it, so a missing or `IRREVERSIBLE` file is refused before a token is consumed or an `accepted` audit event is written.
+For a plain reverse-migration rollback, the down-migration files are loaded (read-only) just before the gate, so a missing or `IRREVERSIBLE` file is refused before a token is consumed or an `accepted` audit event is written.
+With `accept_data_loss=true` the gate runs earlier, at the start of the request, so there the token is consumed and the event written before the files are loaded.
 The code that builds the plan only reads: it resolves the ref, loads the target, checks the prompts tree and queries the backend for the live schema version and the pending migration names.
 The gate sits right after that, before the reverse migrations run, the memory restore, the prompts write-back and the forward-record.
 A refused request changes nothing.
@@ -53,6 +54,7 @@ That includes a rollback whose target has no `schema_version`, and one whose tar
 
 Audit.
 The gate emits the existing `RollbackForcedDataLoss` event, with the same `decision` values.
+An accepted event also carries `scope`, `data_loss` or `reverse_migration`, the scope the token verified under.
 The event gains a `reason` field: `accept_data_loss` for the ADR-0014 trigger and `reverse_migration` for this one.
 Events from before this ADR carry no `reason` and mean `accept_data_loss`.
 An alert on forced data loss should filter on `reason = "accept_data_loss"`, so routine operator rollbacks that run reverse migrations do not trip it.
@@ -118,6 +120,7 @@ The CLI also checks who it is talking to.
 In a flow that may auto-sign, every request (resolving the target, the preview, the applied request) goes over a connection whose peer uid, read from the kernel, is the uid that owns the key file.
 If a check fails, the CLI gives up on signing: it warns on stderr and carries on without a token, and the daemon's gate refuses if one was needed.
 With `--accept-data-loss` the applied request is signed after a successful preview even if the reply omits `approval_required`, as an older daemon's would.
+Both sides open the key file with `O_NOFOLLOW` and `O_NONBLOCK`, so a symlink swapped in after the default-path check is never followed, and a symlinked key path is refused whether it is the default or named explicitly.
 The CLI skips a default key path that is a symlink, FIFO or other special file, with a warning, and the daemon treats such a default path as no key, so a special file cannot block either.
 A key named explicitly must be a regular file (the CLI fails; the daemon warns and runs without a key, as for an unreadable file).
 It reads at most 33 bytes of the key file, as the daemon does.
@@ -151,7 +154,11 @@ Verification:
 - The single-use ledger keys on the decoded tag as before.
 
 The CLI mints a `DataLoss` token for `--accept-data-loss` requests and a `ReverseMigration` token otherwise.
-The `agentic rollback --approval` issuance mode keeps minting `DataLoss` tokens, which cover both.
+The `agentic rollback --approval` issuance mode takes `--scope reverse-migration|data-loss`.
+The default is `data-loss`, so existing callers keep getting the tokens they got before.
+An operator who hands a worker a token for an ordinary rollback should use `--scope reverse-migration`, because a `data-loss` token also authorizes `accept_data_loss`.
+The daemon's missing-token error says so: for a reverse-migration rollback it recommends `--scope reverse-migration`, and for `accept_data_loss` it recommends `--scope data-loss`.
+Both errors keep the wire code `approval_required`.
 
 ## Consequences
 

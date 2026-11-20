@@ -57,6 +57,16 @@ pub enum ApprovalScope {
     ReverseMigration,
 }
 
+impl ApprovalScope {
+    /// Stable name for audit events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalScope::DataLoss => "data_loss",
+            ApprovalScope::ReverseMigration => "reverse_migration",
+        }
+    }
+}
+
 /// Required approval-key length in bytes (256-bit, Decision 6).
 pub const APPROVAL_KEY_LEN: usize = 32;
 
@@ -189,6 +199,8 @@ pub fn generate_token_scoped(
 pub struct VerifiedToken {
     pub timestamp: u64,
     pub tag: [u8; 32],
+    /// The scope whose signing input the tag verified under.
+    pub scope: ApprovalScope,
 }
 
 impl VerifiedToken {
@@ -265,7 +277,11 @@ pub fn verify_token_any(
         mac.update(&signing_input(*scope, &commit_hash, peer_uid, timestamp));
         // Constant-time comparison of the decoded tag bytes.
         if mac.verify_slice(&tag).is_ok() {
-            return Ok(VerifiedToken { timestamp, tag });
+            return Ok(VerifiedToken {
+                timestamp,
+                tag,
+                scope: *scope,
+            });
         }
     }
     Err(ApprovalRejection::InvalidSignature)
@@ -482,5 +498,21 @@ mod tests {
         // A data-loss token also covers the weaker action.
         let dl = generate_token(&key(), &h, 1000, 5_000);
         assert!(verify_token_any(&key(), &both, &h, 1000, &dl, 5_000).is_ok());
+    }
+
+    #[test]
+    fn verified_token_reports_the_scope_it_matched() {
+        let h = "a".repeat(64);
+        let both = [ApprovalScope::ReverseMigration, ApprovalScope::DataLoss];
+        for scope in both {
+            let t = generate_token_scoped(&key(), scope, &h, 1, 100);
+            let v = verify_token_any(&key(), &both, &h, 1, &t, 100).unwrap();
+            assert_eq!(v.scope, scope);
+        }
+        assert_eq!(ApprovalScope::DataLoss.as_str(), "data_loss");
+        assert_eq!(
+            ApprovalScope::ReverseMigration.as_str(),
+            "reverse_migration"
+        );
     }
 }

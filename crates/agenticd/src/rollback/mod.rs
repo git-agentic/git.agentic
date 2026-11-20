@@ -105,12 +105,20 @@ pub enum ApprovalError {
     )]
     NoPeerUid,
     #[error(
-        "this rollback requires an approval_token (accept_data_loss=true per ADR-0014, or a \
-         reverse schema migration per ADR-0019), but none was supplied. The `agentic` CLI \
-         attaches one automatically when it can read the approval key; otherwise mint one \
-         with `agentic rollback --approval <commit> --uid <uid> --key-file <path>`."
+        "accept_data_loss=true requires an approval_token (ADR-0014), but none was supplied. \
+         The `agentic` CLI attaches one automatically when it can read the approval key; \
+         otherwise mint one with `agentic rollback --approval <commit> --uid <uid> \
+         --key-file <path> --scope data-loss`."
     )]
     TokenRequired,
+    #[error(
+        "this rollback runs reverse schema migrations and requires an approval_token \
+         (ADR-0019), but none was supplied. The `agentic` CLI attaches one automatically \
+         when it can read the approval key; otherwise mint one with `agentic rollback \
+         --approval <commit> --uid <uid> --key-file <path> --scope reverse-migration`. \
+         Do not hand out a data-loss token for this: it also authorizes accept_data_loss."
+    )]
+    TokenRequiredForReverseMigration,
     #[error("approval token rejected: {0}")]
     Rejected(#[from] ApprovalRejection),
 }
@@ -121,7 +129,9 @@ impl ApprovalError {
         match self {
             ApprovalError::KeyNotConfigured => "rejected_no_key_configured",
             ApprovalError::NoPeerUid => "rejected_no_peer_uid",
-            ApprovalError::TokenRequired => "rejected_no_token",
+            ApprovalError::TokenRequired | ApprovalError::TokenRequiredForReverseMigration => {
+                "rejected_no_token"
+            }
             ApprovalError::Rejected(r) => r.audit_decision(),
         }
     }
@@ -151,6 +161,7 @@ fn audit_forced_data_loss(
     decision: &str,
     token: Option<&str>,
     reason: GateReason,
+    scope: Option<ApprovalScope>,
 ) {
     let reason = reason.as_str();
     let token_prefix = token.map(token_prefix_for_audit);
@@ -163,6 +174,9 @@ fn audit_forced_data_loss(
             target_commit_hash,
             decision,
             reason,
+            // The scope the token verified under (ADR-0019): a data-loss
+            // token also covers a plain reverse-migration rollback.
+            scope = scope.map(ApprovalScope::as_str),
             ?token_prefix,
         );
     } else {
@@ -205,6 +219,7 @@ fn approval_gate(
             err.audit_decision(),
             approval_token,
             reason,
+            None,
         );
         err
     };
@@ -221,7 +236,10 @@ fn approval_gate(
     };
     // (c) Key present but no token supplied.
     let Some(token) = approval_token else {
-        return Err(reject(ApprovalError::TokenRequired));
+        return Err(reject(match reason {
+            GateReason::AcceptDataLoss => ApprovalError::TokenRequired,
+            GateReason::ReverseMigration => ApprovalError::TokenRequiredForReverseMigration,
+        }));
     };
     // (d) Verify.
     let now = now_unix_seconds();
@@ -254,7 +272,14 @@ fn approval_gate(
         }
     }
     // (e) Valid — audit the accepted path too.
-    audit_forced_data_loss(peer_uid, &commit_hash, "accepted", approval_token, reason);
+    audit_forced_data_loss(
+        peer_uid,
+        &commit_hash,
+        "accepted",
+        approval_token,
+        reason,
+        Some(verified.scope),
+    );
     Ok(())
 }
 
@@ -398,10 +423,13 @@ pub async fn execute(
             // Phase 2: synchronous filesystem I/O — no adapter call in
             // flight. `accept_data_loss` is forwarded so
             // `check_irreversible` can honor the operator's opt-in for
-            // IRREVERSIBLE-marked migrations. Read-only, and ahead of the
-            // approval gate so a missing or IRREVERSIBLE `.down.sql` is
-            // refused before a single-use token is consumed and before an
-            // `accepted` audit event.
+            // IRREVERSIBLE-marked migrations. Read-only. On this path (a
+            // plain reverse-migration rollback) it runs ahead of the approval
+            // gate, so a missing or IRREVERSIBLE `.down.sql` is refused
+            // before a single-use token is consumed and before an `accepted`
+            // audit event. With accept_data_loss=true the gate already ran at
+            // the top of `execute`, so there the token is consumed (and the
+            // audit event written) before this load.
             let steps = migrate::load_steps(
                 state.refs.agentic_dir(),
                 &migration_names,
