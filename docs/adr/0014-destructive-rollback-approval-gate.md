@@ -121,7 +121,8 @@ struct RollbackForcedDataLoss {
     peer_uid: u32,           // From the connection's SO_PEERCRED
     target_commit_hash: String,
     decision: &'static str,  // accepted, rejected_no_token, rejected_no_key_configured,
-                             // rejected_expired, rejected_invalid_signature, rejected_malformed
+                             // rejected_expired, rejected_invalid_signature, rejected_malformed,
+                             // rejected_replayed (amendment 2026-11-20)
     token_prefix: Option<String>,  // First 8 chars of the token, redacted hex for forensics
                                    // None when no token was supplied
     audit_event_version: u32,      // 1, for forward compat
@@ -176,3 +177,13 @@ This prints a token to stdout that the operator hands to the worker (or pastes i
 - The HMAC-domain string `"git.agentic/rollback-approval/v1"` is versioned. A future signed-message format using the same key MUST use a different domain string. Drift here is silent and dangerous; the convention belongs in CONTRIBUTING.md or a domain-strings registry doc when the second signed format appears.
 
 See also: [`docs/superpowers/specs/2026-05-21-pre-public-hardening-sprint-design.md`](../superpowers/specs/2026-05-21-pre-public-hardening-sprint-design.md) §"ADR-0014" (the sprint design that frames this ADR), `git.agentic-threat-model.md` TM-002 (the row this ADR closes), [ADR-0012](./0012-socket-peer-authentication.md) (the peer-UID source feeding the signed payload).
+
+## Amendment (2026-11-20): key-file mode check and single-use tokens
+
+Status is unchanged. Two hardening changes refine Decisions 3, 4 and 5.
+
+**Key-file mode check (refines Decision 4).** On unix, `agenticd` reads the mode from the opened key-file handle (`fstat`, not a separate path stat). If any group or other bit is set (`mode & 0o077 != 0`), startup aborts with an error naming the path and telling the operator to `chmod 600` it. This is a misconfiguration abort, like a wrong-length key, and is distinct from Decision 4's fail-closed case: a missing, unreadable or empty key file still lets the daemon run with destructive rollback disabled. Anyone who can read the key can mint tokens, so a key readable beyond its owner is not accepted. Non-unix platforms are unchanged. Operators creating the demo key file should `chmod 600` it.
+
+**Single-use tokens (refines Decision 3).** A token now authorizes at most one non-dry-run destructive rollback. The daemon keeps an in-memory ledger keyed by the decoded 32-byte HMAC tag, not the token string, because hex decoding is case-insensitive and the timestamp parse accepts a leading `+` and leading zeros, so one token has many spellings. Each entry expires at `token_timestamp + 300s`: the validity window is symmetric, so a future-dated token verifies until its timestamp plus the TTL. The check, insert and pruning of expired entries happen under one lock. A second use is rejected with audit decision `rejected_replayed`, wire code `approval_token_replayed`. Dry runs verify the token but do not consume it, so an operator can preview and then execute with the same token.
+
+Limits: the ledger is per process. A daemon restart, or a second daemon instance sharing the same key, accepts the token again until its time window closes. A token is also consumed when the gate passes even if the rollback then fails later, so the operator signs a fresh one for the retry.
