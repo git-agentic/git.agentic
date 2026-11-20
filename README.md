@@ -88,7 +88,7 @@ git.agentic/
 │   │   ├── roadmap.md            12-week build narrative; repo went public 2026-05-22
 │   │   └── demo-scenario.md      the canonical demo
 │   ├── adr/
-│   │   └── 0001 … 0017 — accepted architectural decision records
+│   │   └── 0001 … 0018 — accepted architectural decision records
 │   └── architecture/
 │       ├── overview.md           system diagram and component boundaries
 │       └── snapshot-model.md     the technical heart

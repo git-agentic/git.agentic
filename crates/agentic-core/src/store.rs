@@ -4,6 +4,8 @@
 //!   - Objects are zstd-compressed on disk.
 //!   - First two hex chars of the BLAKE3 hash form the shard directory.
 //!   - Filename is the remaining 62 hex chars plus `.zst`.
+//!   - Raw objects (`put_raw`) live apart, at `raw/<ab>/<rest>.raw`; see
+//!     `docs/adr/0018-separate-raw-object-namespace.md`.
 //!
 //! `FsObjectStore` is the local-filesystem implementation; `GcsObjectStore`
 //! (see `gcs.rs`) is the remote backend introduced for the sidecar
@@ -48,7 +50,7 @@ pub(crate) fn check_integrity(declared: &Hash, computed: Hash) -> Result<()> {
 /// `Commit`. Those objects hash `json(inner)`, so such a blob would share a
 /// content address with the typed object while being stored under a
 /// different envelope; whichever write came first would win the address.
-pub(crate) fn check_blob_unambiguous(bytes: &[u8]) -> Result<()> {
+pub fn check_blob_unambiguous(bytes: &[u8]) -> Result<()> {
     let canonical_tree = serde_json::from_slice::<Tree>(bytes)
         .ok()
         .is_some_and(|t| serde_json::to_vec(&t).is_ok_and(|c| c == bytes));
@@ -230,6 +232,12 @@ impl FsObjectStore {
     }
 
     fn write_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        Self::write_at_with(path, bytes, || NEXT_TMP.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// [`Self::write_at`] with an injectable temp-name counter, so tests can
+    /// force a collision deterministically.
+    fn write_at_with(path: &Path, bytes: &[u8], mut next: impl FnMut() -> u64) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -243,11 +251,7 @@ impl FsObjectStore {
         // different namespace); only a file this call created is ever removed.
         let mut opened = None;
         for _ in 0..16 {
-            let tmp = path.with_file_name(format!(
-                "{name}.{}.{}.tmp",
-                std::process::id(),
-                NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-            ));
+            let tmp = path.with_file_name(format!("{name}.{}.{}.tmp", std::process::id(), next()));
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -812,18 +816,23 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let pid = std::process::id();
-        // Occupy the next candidate names this process would pick.
-        let start = NEXT_TMP.load(Ordering::Relaxed);
-        let planted: Vec<_> = (start..start + 4)
+        // Occupy the first four names the (fixed, deterministic) counter yields.
+        let planted: Vec<_> = (0..4)
             .map(|n| path.with_file_name(format!("{name}.{pid}.{n}.tmp")))
             .collect();
         for p in &planted {
             std::fs::write(p, b"other writer").unwrap();
         }
-        store.write_at(&path, b"payload").unwrap();
+        let mut counter = 0u64;
+        FsObjectStore::write_at_with(&path, b"payload", || {
+            counter += 1;
+            counter - 1
+        })
+        .unwrap();
         for p in &planted {
             assert_eq!(std::fs::read(p).unwrap(), b"other writer");
         }
         assert_eq!(store.read_at(&path).unwrap(), b"payload");
+        assert_eq!(counter, 5, "names 0..4 were taken, 4 was the first free");
     }
 }

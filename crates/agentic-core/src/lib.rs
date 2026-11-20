@@ -26,7 +26,7 @@ pub use gcs_store::{GcsObjectStore, DEFAULT_GCS_ENDPOINT};
 pub use hash::Hash;
 pub use object::{Attestation, Blob, Commit, Object, ObjectKind, Tree, TypedRef};
 pub use refs::{HeadRef, Refs, RefsSnapshot};
-pub use store::{FsObjectStore, ObjectStore};
+pub use store::{check_blob_unambiguous, FsObjectStore, ObjectStore};
 
 /// Crate-level error type. Individual modules contribute their own variants.
 #[derive(Debug, thiserror::Error)]

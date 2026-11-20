@@ -582,9 +582,13 @@ impl ObjectStore for GcsObjectStore {
     }
 
     fn has(&self, hash: &Hash) -> bool {
-        [Ns::Raw, Ns::Typed]
-            .into_iter()
-            .any(|ns| self.cache_path(hash, ns).exists() || self.remote_exists(hash, ns))
+        // Both cache namespaces first, so a cached object answers without
+        // any network request; only then ask the bucket.
+        let namespaces = [Ns::Raw, Ns::Typed];
+        namespaces
+            .iter()
+            .any(|&ns| self.cache_path(hash, ns).exists())
+            || namespaces.iter().any(|&ns| self.remote_exists(hash, ns))
     }
 }
 
@@ -1082,5 +1086,25 @@ mod tests {
         assert!(store.put_raw(ObjectKind::Segment, b"honest").is_err());
         assert_eq!(mock.requests().len(), 2, "{:?}", mock.requests());
         assert!(!store.cache_path(&h, Ns::Raw).exists());
+    }
+
+    // A cached object (either namespace) answers `has` with no request.
+    #[test]
+    fn has_checks_both_caches_before_the_network() {
+        let dir = tempdir().unwrap();
+        let mock = Mock::start(|_| Resp::status(500));
+        let store = mock.store(dir.path());
+        let typed = Hash::of(b"typed");
+        let raw = Hash::of(b"raw");
+        store
+            .cache_write_compressed(&typed, Ns::Typed, &zst(b"t"))
+            .unwrap();
+        store
+            .cache_write_compressed(&raw, Ns::Raw, &zst(b"r"))
+            .unwrap();
+
+        assert!(store.has(&typed));
+        assert!(store.has(&raw));
+        assert!(mock.requests().is_empty(), "{:?}", mock.requests());
     }
 }
