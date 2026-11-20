@@ -62,9 +62,19 @@ fn startup_refuses_when_both_flags_set() {
     );
 }
 
+/// A repo dir with mode pinned to 0700. `tempfile::tempdir()` follows the
+/// umask (0775 under umask 002), which the daemon refuses as group-writable.
+#[cfg(unix)]
+fn private_repo() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(repo.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    repo
+}
+
 #[cfg(unix)]
 mod state_dir {
-    use super::agenticd_bin;
+    use super::{agenticd_bin, private_repo};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -189,7 +199,7 @@ mod state_dir {
 
     #[test]
     fn startup_tightens_0755_state_dir_to_0700() {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = private_repo();
         let state = repo.path().join(".agentic");
         std::fs::create_dir(&state).unwrap();
         set_mode(&state, 0o755);
@@ -200,7 +210,7 @@ mod state_dir {
     #[test]
     fn refuses_existing_writable_state_dir() {
         for m in [0o775, 0o777] {
-            let repo = tempfile::tempdir().unwrap();
+            let repo = private_repo();
             let state = repo.path().join(".agentic");
             std::fs::create_dir(&state).unwrap();
             set_mode(&state, m);
@@ -229,8 +239,8 @@ mod state_dir {
 
     #[test]
     fn startup_removes_dangling_symlink_at_socket_path() {
-        let repo = tempfile::tempdir().unwrap();
-        let sock_dir = tempfile::tempdir().unwrap();
+        let repo = private_repo();
+        let sock_dir = private_repo();
         let sock = sock_dir.path().join("d.sock");
         let target = sock_dir.path().join("does-not-exist");
         std::os::unix::fs::symlink(&target, &sock).unwrap();
@@ -268,18 +278,18 @@ mod state_dir {
         let other = (euid + 1).to_string();
         let own = euid.to_string();
 
-        let repo = tempfile::tempdir().unwrap();
+        let repo = private_repo();
         let (sock_mode, _) = run_and_stat(repo.path(), &["--allowed-uid", &other]);
         assert_eq!(
             sock_mode, 0o666,
             "worker uid listed: socket must be connectable"
         );
 
-        let repo = tempfile::tempdir().unwrap();
+        let repo = private_repo();
         let (sock_mode, _) = run_and_stat(repo.path(), &["--allowed-uid", &own]);
         assert_eq!(sock_mode, 0o755, "own uid only: default umask applies");
 
-        let repo = tempfile::tempdir().unwrap();
+        let repo = private_repo();
         let (sock_mode, _) = run_and_stat(repo.path(), &["--insecure-allow-any-uid"]);
         assert_eq!(sock_mode, 0o755);
     }
@@ -290,7 +300,7 @@ mod state_dir {
 fn startup_requires_socket_flag_when_allowlist_names_another_uid() {
     // SAFETY: geteuid cannot fail.
     let other = (unsafe { libc::geteuid() } + 1).to_string();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = private_repo();
     let out = Command::new(agenticd_bin())
         .arg("--repo")
         .arg(repo.path())

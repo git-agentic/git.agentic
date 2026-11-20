@@ -64,8 +64,32 @@ fn spawn_daemon_with(
         .expect("spawn agenticd")
 }
 
-async fn send(sock: &std::path::Path, request: Request) -> Response {
-    let conn = UnixStream::connect(sock).await.unwrap();
+/// The socket file appears at bind(), before listen(), so it existing does not
+/// mean connect() succeeds yet. Retry a refused connect for a bounded time.
+async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match UnixStream::connect(sock).await {
+            Ok(conn) => return conn,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => panic!("daemon never accepted a connection: {e}"),
+        }
+    }
+}
+
+/// `first`: only the first request of a test waits for the daemon to start
+/// accepting; later ones must connect on the first attempt.
+async fn send(sock: &std::path::Path, request: Request, first: bool) -> Response {
+    let conn = if first {
+        connect_when_ready(sock).await
+    } else {
+        UnixStream::connect(sock).await.expect("connect")
+    };
     let (r, w) = conn.into_split();
     let mut r = tokio::io::BufReader::new(r);
     let mut w = tokio::io::BufWriter::new(w);
@@ -112,6 +136,7 @@ async fn rollback_error_code_with(repo: &std::path::Path, extra: &[&std::ffi::Os
             model: None,
             no_memory: true,
         }),
+        true,
     )
     .await
     else {
@@ -125,6 +150,7 @@ async fn rollback_error_code_with(repo: &std::path::Path, extra: &[&std::ffi::Os
             accept_data_loss: true,
             approval_token: None,
         },
+        false,
     )
     .await;
     let _ = child.kill();

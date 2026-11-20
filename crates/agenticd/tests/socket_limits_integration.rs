@@ -15,6 +15,15 @@ fn agenticd_bin() -> std::path::PathBuf {
     env!("CARGO_BIN_EXE_agenticd").into()
 }
 
+/// Temp dir pinned to 0700: the daemon refuses a group-writable repo, and
+/// `TempDir::new` follows the umask (0775 under umask 002).
+fn private_dir() -> TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 /// Reaps the spawned daemon on drop so a failing assertion can't leak
 /// an orphaned agenticd process holding the test socket.
 struct DaemonProc(Child);
@@ -40,7 +49,8 @@ async fn spawn_daemon(dir: &TempDir, extra_args: &[&str]) -> (DaemonProc, std::p
         cmd.arg(a);
     }
     let child = DaemonProc(cmd.spawn().expect("spawn agenticd"));
-    for _ in 0..50 {
+    // Generous: startup on a loaded machine can take seconds.
+    for _ in 0..400 {
         if sock.exists() {
             break;
         }
@@ -50,9 +60,35 @@ async fn spawn_daemon(dir: &TempDir, extra_args: &[&str]) -> (DaemonProc, std::p
     (child, sock)
 }
 
+/// Connect, retrying while the daemon is not yet accepting. The socket file
+/// appears at bind(), before listen(), so its existence does not mean
+/// connect() succeeds. A refused connect is never admitted, so retrying it
+/// cannot count against the connection caps under test.
+async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match UnixStream::connect(sock).await {
+            Ok(conn) => return conn,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => panic!("daemon never accepted a connection: {e}"),
+        }
+    }
+}
+
 /// Open a connection and prove it is live with a Ping/Pong round trip.
-async fn connect_and_ping(sock: &std::path::Path, tag: &str) -> UnixStream {
-    let mut conn = UnixStream::connect(sock).await.expect("connect");
+/// `first`: only the first connection of a test waits for the daemon to start
+/// accepting; later ones must connect on the first attempt.
+async fn connect_and_ping(sock: &std::path::Path, tag: &str, first: bool) -> UnixStream {
+    let mut conn = if first {
+        connect_when_ready(sock).await
+    } else {
+        UnixStream::connect(sock).await.expect("connect")
+    };
     write_frame(&mut conn, &Envelope::new(tag.to_string(), Request::Ping))
         .await
         .expect("write ping");
@@ -92,11 +128,11 @@ async fn assert_dropped(sock: &std::path::Path) {
 
 #[tokio::test]
 async fn global_connection_cap_drops_excess_and_spares_existing() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_dir();
     let (_daemon, sock) = spawn_daemon(&dir, &["--max-connections", "2"]).await;
 
-    let mut c1 = connect_and_ping(&sock, "c1").await;
-    let _c2 = connect_and_ping(&sock, "c2").await;
+    let mut c1 = connect_and_ping(&sock, "c1", true).await;
+    let _c2 = connect_and_ping(&sock, "c2", false).await;
 
     // Third connection is over the global cap: dropped at accept.
     assert_dropped(&sock).await;
@@ -114,7 +150,7 @@ async fn global_connection_cap_drops_excess_and_spares_existing() {
 
 #[tokio::test]
 async fn per_uid_connection_cap_drops_excess() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_dir();
     // Global cap far above the per-UID cap so the per-UID path is the
     // one that trips: every connection here shares the test's UID.
     let (_daemon, sock) = spawn_daemon(
@@ -123,13 +159,13 @@ async fn per_uid_connection_cap_drops_excess() {
     )
     .await;
 
-    let _c1 = connect_and_ping(&sock, "c1").await;
+    let _c1 = connect_and_ping(&sock, "c1", true).await;
     assert_dropped(&sock).await;
 }
 
 #[tokio::test]
 async fn zero_limit_refuses_startup() {
-    let dir = TempDir::new().unwrap();
+    let dir = private_dir();
     let sock = dir.path().join("agenticd.sock");
     let mut child = Command::new(agenticd_bin())
         .arg("--repo")
