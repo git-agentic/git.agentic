@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agentic_core::{Commit, Hash, ObjectKind};
 use anyhow::{anyhow, Context};
@@ -41,13 +42,21 @@ use crate::server::DaemonState;
 /// outside the prompts directory), and the actual write is done as
 /// write-to-temp + atomic rename so a concurrent attacker can't plant a
 /// symlink between the unlink and the write. (Copilot review on PR #51.)
+///
+/// Ancestor directories get the same treatment: `<repo>/prompts` and every
+/// existing directory between it and a write target must not be a symlink
+/// ([`reject_symlinked_dirs`]), checked before and after `create_dir_all`,
+/// so a planted directory link can't redirect writes or the orphan sweep
+/// outside the prompts root.
 pub(super) fn restore_prompts(
     state: &DaemonState,
     repo: &Path,
     prompts_hash: &Hash,
 ) -> anyhow::Result<()> {
     let dir = repo.join("prompts");
+    reject_symlinked_dirs(repo, &dir)?;
     std::fs::create_dir_all(&dir)?;
+    reject_symlinked_dirs(repo, &dir)?;
 
     let tree = load_tree(state, prompts_hash)?;
     let mut wanted: BTreeSet<PathBuf> = BTreeSet::new();
@@ -55,7 +64,9 @@ pub(super) fn restore_prompts(
         validate_tree_entry_name(name)?;
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
+            reject_symlinked_dirs(repo, parent)?;
             std::fs::create_dir_all(parent)?;
+            reject_symlinked_dirs(repo, parent)?;
         }
         let blob = load_blob(state, &r.hash)?;
         write_blob_safely(&path, &blob.bytes)?;
@@ -66,6 +77,47 @@ pub(super) fn restore_prompts(
     Ok(())
 }
 
+/// Fail if any existing component of `target` below `base` is a symlink.
+/// `base` itself (and anything above it) is trusted: the repo root may
+/// legitimately live under a symlinked path. Components that don't exist
+/// yet are fine; any other `symlink_metadata` error propagates.
+fn reject_symlinked_dirs(base: &Path, target: &Path) -> anyhow::Result<()> {
+    let mut cur = base.to_path_buf();
+    for component in target.strip_prefix(base)?.components() {
+        cur.push(component);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "refusing prompt write-back: {} is a symlink",
+                    cur.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e).with_context(|| format!("inspecting {}", cur.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Marker in temp file names. Tree entry names containing it are rejected
+/// by [`validate_tree_entry_name`], so a temp name never equals an entry.
+const TMP_MARKER: &str = ".agentic-tmp-";
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Create `tmp` with `O_EXCL` semantics (`create_new`): fails if anything,
+/// including a planted symlink, already exists there, and never follows one.
+fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    f.write_all(bytes)
+}
+
 /// Write `bytes` to `path` safely:
 ///
 /// 1. If `path` already exists as a symlink, unlink it. Any other
@@ -74,7 +126,8 @@ pub(super) fn restore_prompts(
 ///    of the destination, since the attack we're defending against
 ///    is a redirected write. Only `NotFound` is benign (the file
 ///    doesn't exist yet, which is the common case).
-/// 2. Write the new bytes to a sibling `.tmp` file, then atomically
+/// 2. Write the new bytes to a uniquely named sibling temp file (created
+///    exclusively, so a pre-planted symlink is never followed), then atomically
 ///    `rename(2)` it over `path`. This closes the TOCTOU window
 ///    between the symlink unlink and the regular file write: even if
 ///    an attacker re-plants a symlink at `path` between steps, the
@@ -99,11 +152,25 @@ fn write_blob_safely(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             });
         }
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing temp file {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    Ok(())
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("prompt path {} has no file name", path.display()))?
+        .to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{file_name}{TMP_MARKER}{}-{}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = write_new_file(&tmp, bytes)
+        .with_context(|| format!("writing temp file {}", tmp.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Reject tree entry names that would escape the prompts directory or
@@ -119,6 +186,12 @@ fn validate_tree_entry_name(name: &str) -> anyhow::Result<()> {
     }
     for component in Path::new(name).components() {
         match component {
+            Component::Normal(c) if c.to_string_lossy().contains(TMP_MARKER) => {
+                return Err(anyhow!(
+                    "tree entry name {:?} uses the reserved temp-file marker {TMP_MARKER:?}",
+                    name
+                ));
+            }
             Component::Normal(_) => {}
             _ => {
                 return Err(anyhow!(
@@ -140,7 +213,17 @@ fn validate_tree_entry_name(name: &str) -> anyhow::Result<()> {
 /// review on PR #51: the prior `ft.is_file()` branch silently left
 /// dangling symlinks behind even though the docs claimed everything
 /// not in the target tree is removed).
+///
+/// Refuses to run on a symlinked `here` and never recurses through one
+/// (`DirEntry::file_type` doesn't follow links, so a symlinked directory
+/// is unlinked as an orphan, not descended into).
 fn sweep_orphans(root: &Path, here: &Path, wanted: &BTreeSet<PathBuf>) -> anyhow::Result<()> {
+    if std::fs::symlink_metadata(here)?.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing prompt sweep: {} is a symlink",
+            here.display()
+        ));
+    }
     for entry in std::fs::read_dir(here)? {
         let entry = entry?;
         let path = entry.path();
@@ -372,5 +455,160 @@ mod tests {
             .unwrap()
             .file_type()
             .is_file());
+    }
+
+    #[test]
+    fn validate_rejects_reserved_temp_marker() {
+        let err = validate_tree_entry_name("dir/.a.md.agentic-tmp-1-0").unwrap_err();
+        assert!(err.to_string().contains("reserved temp-file marker"));
+    }
+
+    // Build a DaemonState over a fresh object store, commit `files` as a
+    // prompts tree, and return (state, tree hash, repo dir guard).
+    async fn state_with_prompts(files: &[(&str, &[u8])]) -> (DaemonState, Hash, tempfile::TempDir) {
+        use agentic_core::{Blob, FsObjectStore, Object, ObjectStore, Tree, TypedRef};
+        use std::sync::Arc;
+        let repo = tempfile::tempdir().unwrap();
+        let agentic_dir = repo.path().join(".agentic");
+        std::fs::create_dir_all(agentic_dir.join("objects")).unwrap();
+        let store: Arc<dyn ObjectStore + Send + Sync> =
+            Arc::new(FsObjectStore::open(agentic_dir.join("objects")).unwrap());
+        let mut tree = Tree::new();
+        for (name, bytes) in files {
+            let hash = store.put(&Object::Blob(Blob::new(bytes.to_vec()))).unwrap();
+            tree.insert(
+                *name,
+                TypedRef {
+                    kind: ObjectKind::Blob,
+                    hash,
+                },
+            );
+        }
+        let tree_hash = store.put(&Object::Tree(tree)).unwrap();
+        let state = DaemonState::open(
+            repo.path().to_path_buf(),
+            agentic_dir,
+            store,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::peer_auth::PeerAuthPolicy::InsecureAllowAny),
+        )
+        .await
+        .unwrap();
+        (state, tree_hash, repo)
+    }
+
+    // Outside dir pre-populated with a file the sweep would delete if it
+    // followed a link, plus a name the tree would write.
+    #[cfg(unix)]
+    fn outside_dir() -> tempfile::TempDir {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("keep.txt"), b"outside").unwrap();
+        outside
+    }
+
+    #[cfg(unix)]
+    fn assert_outside_untouched(outside: &Path) {
+        let mut names: Vec<_> = std::fs::read_dir(outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["keep.txt"], "outside dir must be untouched");
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_prompts_rejects_symlinked_subdirectory() {
+        let (state, tree, repo) = state_with_prompts(&[("sub/x", b"payload")]).await;
+        let outside = outside_dir();
+        std::fs::create_dir_all(repo.path().join("prompts")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("prompts/sub")).unwrap();
+
+        let err = restore_prompts(&state, repo.path(), &tree).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got {err}");
+        assert_outside_untouched(outside.path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_prompts_rejects_symlinked_prompts_root() {
+        let (state, tree, repo) = state_with_prompts(&[("x", b"payload")]).await;
+        let outside = outside_dir();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("prompts")).unwrap();
+
+        let err = restore_prompts(&state, repo.path(), &tree).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got {err}");
+        assert_outside_untouched(outside.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_orphans_refuses_symlinked_root() {
+        let outside = outside_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("prompts");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert!(sweep_orphans(&link, &link, &BTreeSet::new()).is_err());
+        assert_outside_untouched(outside.path());
+    }
+
+    #[tokio::test]
+    async fn restore_prompts_handles_tmp_and_md_siblings() {
+        // `a.txt` sorts after `a.tmp`, so the old `with_extension("tmp")` temp
+        // name for `a.txt` clobbered the already-restored `a.tmp`.
+        let (state, tree, repo) = state_with_prompts(&[
+            ("a.md", b"markdown"),
+            ("a.tmp", b"tmpfile"),
+            ("a.txt", b"text"),
+        ])
+        .await;
+        restore_prompts(&state, repo.path(), &tree).unwrap();
+        let dir = repo.path().join("prompts");
+        assert_eq!(std::fs::read(dir.join("a.md")).unwrap(), b"markdown");
+        assert_eq!(std::fs::read(dir.join("a.tmp")).unwrap(), b"tmpfile");
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"text");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("agentic-tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    // A symlink planted at the old temp name (`a.tmp` for `a.md`) must not
+    // be followed: the outside file stays intact and `a.md` is written.
+    #[cfg(unix)]
+    #[test]
+    fn write_blob_safely_does_not_follow_symlink_at_legacy_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir();
+        let victim = outside.path().join("keep.txt");
+        std::os::unix::fs::symlink(&victim, dir.path().join("a.tmp")).unwrap();
+
+        write_blob_safely(&dir.path().join("a.md"), b"restored").unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"restored");
+        assert_outside_untouched(outside.path());
+    }
+
+    // O_EXCL: the temp writer refuses a pre-existing symlink instead of
+    // writing through it.
+    #[cfg(unix)]
+    #[test]
+    fn write_new_file_does_not_follow_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir();
+        let tmp = dir.path().join("planted");
+        std::os::unix::fs::symlink(outside.path().join("keep.txt"), &tmp).unwrap();
+
+        let err = write_new_file(&tmp, b"evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_outside_untouched(outside.path());
     }
 }
