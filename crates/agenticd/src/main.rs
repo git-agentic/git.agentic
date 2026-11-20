@@ -172,11 +172,13 @@ struct Args {
 ///   destructive rollback rejected, daemon runs — Decision 4).
 /// * file readable and non-empty but not exactly 32 bytes → abort startup
 ///   (clear operator misconfiguration — Decision 6).
-/// * unix: file readable by group or other (`mode & 0o077 != 0`) → abort
-///   startup. A key others can read lets them mint tokens, so this is an
-///   operator misconfiguration, not the unreadable-file case above. The mode
-///   is read from the opened handle, not a separate path stat, so the file
-///   checked is the file read.
+/// * unix: a file that otherwise loads as a key but is accessible by group or
+///   other (`mode & 0o077 != 0`) → abort startup. A key others can read lets
+///   them mint tokens, so this is an operator misconfiguration. The check runs
+///   after the read and empty checks, so an unreadable or empty file stays
+///   fail-closed whatever its mode. The mode comes from the opened handle, not
+///   a separate path stat, so the file checked is the file read. It only
+///   excludes other uids: a process sharing the daemon's uid can read a 0600 key.
 fn load_approval_key(
     path: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<agentic_core::approval::ApprovalKey>> {
@@ -198,6 +200,22 @@ fn load_approval_key(
             return Ok(None);
         }
     };
+    let mut bytes = Vec::new();
+    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
+        unreadable(e);
+        return Ok(None);
+    }
+    if bytes.is_empty() {
+        tracing::warn!(
+            target: "agenticd::approval",
+            path = %path.display(),
+            "approval key file is empty; destructive rollback disabled (fail-closed)"
+        );
+        return Ok(None);
+    }
+    // Mode check comes last so it only applies to a file that would
+    // otherwise load as a key: unreadable and empty files stay fail-closed
+    // (Decision 4) whatever their mode.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -218,19 +236,6 @@ fn load_approval_key(
                 return Ok(None);
             }
         }
-    }
-    let mut bytes = Vec::new();
-    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
-        unreadable(e);
-        return Ok(None);
-    }
-    if bytes.is_empty() {
-        tracing::warn!(
-            target: "agenticd::approval",
-            path = %path.display(),
-            "approval key file is empty; destructive rollback disabled (fail-closed)"
-        );
-        return Ok(None);
     }
     let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes).with_context(|| {
         format!(
@@ -570,6 +575,13 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             assert!(load_approval_key(Some(&path)).unwrap().is_some());
         }
+        // Empty file, even with a loose mode, stays fail-closed (Decision 4).
+        let empty = dir.path().join("empty.key");
+        std::fs::write(&empty, []).unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_approval_key(Some(&empty)).unwrap().is_none());
+        // A path that opens but fails to read (a directory) too.
+        assert!(load_approval_key(Some(dir.path())).unwrap().is_none());
         // Unreadable/missing stays fail-closed, not an abort.
         assert!(load_approval_key(Some(&dir.path().join("missing")))
             .unwrap()
