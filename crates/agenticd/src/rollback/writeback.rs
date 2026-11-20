@@ -51,12 +51,25 @@ pub(super) fn preflight_prompts(
 
 /// Reject a tree where one entry is both a file and a directory of another
 /// (`a` and `a/b`): the write would fail halfway, after the database changed.
+/// Names are compared as path components, lowercased, so `a//b` and a
+/// case-folding filesystem cannot hide the conflict.
 fn reject_file_dir_conflicts(names: &[&String]) -> anyhow::Result<()> {
-    for name in names {
-        let prefix = format!("{name}/");
-        if let Some(child) = names.iter().find(|m| m.starts_with(&prefix)) {
+    let key = |n: &str| -> Vec<String> {
+        Path::new(n)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let keys: Vec<Vec<String>> = names.iter().map(|n| key(n)).collect();
+    for (i, file) in keys.iter().enumerate() {
+        if let Some(j) = keys
+            .iter()
+            .position(|dir| dir.len() > file.len() && dir.starts_with(file))
+        {
             return Err(anyhow!(
-                "prompt tree entry {name:?} is both a file and the directory of {child:?}"
+                "prompt tree entry {:?} is both a file and the directory of {:?}",
+                names[i],
+                names[j]
             ));
         }
     }
@@ -367,6 +380,9 @@ mod tests {
         assert!(reject_file_dir_conflicts(&[&a, &ab]).is_err());
         assert!(reject_file_dir_conflicts(&[&a, &c]).is_ok());
         assert!(reject_file_dir_conflicts(&[&ab, &c]).is_ok());
+        let (p, pab, upper) = ("p//a".to_string(), "p/a/b".to_string(), "P/A".to_string());
+        assert!(reject_file_dir_conflicts(&[&p, &pab]).is_err());
+        assert!(reject_file_dir_conflicts(&[&upper, &pab]).is_err());
     }
 
     #[test]
