@@ -45,7 +45,8 @@ use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
 use crate::scanner::{Allowlist, ScanPolicy, Scanner};
 use crate::store::{
-    check_blob_unambiguous, check_integrity, decode_legacy_raw, decode_typed, ObjectStore,
+    check_blob_unambiguous, check_integrity, classify_raw, classify_typed, decode_legacy_raw,
+    decode_typed, ObjectStore, Occupant,
 };
 use crate::{Error, Result};
 
@@ -315,31 +316,6 @@ impl GcsObjectStore {
         }))
     }
 
-    /// Current generation of an object, from the metadata endpoint. Only
-    /// used when a download did not report one.
-    fn remote_generation(&self, hash: &Hash, ns: Ns) -> Result<String> {
-        let url = self.metadata_url(&self.object_name(hash, ns));
-        let resp = self
-            .with_auth(self.client.get(&url))
-            .send()
-            .map_err(|e| Error::Other(anyhow::anyhow!("GET {url}: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().unwrap_or_default();
-            return Err(Self::http_err("reading object metadata", status, &body));
-        }
-        let meta: serde_json::Value = resp
-            .json()
-            .map_err(|e| Error::Other(anyhow::anyhow!("parsing object metadata: {e}")))?;
-        meta.get("generation")
-            .and_then(|g| {
-                g.as_str()
-                    .map(str::to_owned)
-                    .or_else(|| g.as_u64().map(|n| n.to_string()))
-            })
-            .ok_or_else(|| Error::Other(anyhow::anyhow!("object metadata has no generation")))
-    }
-
     /// Fetch the bytes for `hash` and map them to `T`, where `map` also
     /// performs the integrity check as it maps.
     ///
@@ -456,50 +432,59 @@ impl GcsObjectStore {
 }
 
 impl GcsObjectStore {
-    /// Put `compressed` at `hash`, never replacing a *verified* object.
+    /// Put `compressed` at `hash`, never replacing a *valid* object.
     ///
     /// The upload is conditional on the name being free. On HTTP 412 the
-    /// occupant is downloaded and judged by `is_same` (it must decode as
-    /// the content being written, exactly as the matching read would). If
-    /// it is the same, this is a dedup hit. If not (a pre-fix squatter or
-    /// corruption) it is replaced, conditional on the generation just
-    /// observed; losing that race is an error, not success. The local
-    /// cache is written only once the bucket is known to hold the verified
-    /// object, so a failed or refused put never leaves a cache entry.
+    /// occupant is downloaded and judged by `classify` (exactly as the
+    /// matching read would judge it). The same content is a dedup hit; a
+    /// valid object of another kind is refused with
+    /// [`Error::AddressOccupied`], writing nothing. Only a corrupt occupant
+    /// (a pre-fix squatter or damage) is replaced, conditional on the
+    /// generation the download reported; if it reported none, or the
+    /// object changed meanwhile, the put fails rather than succeeding. The
+    /// local cache is written only once the bucket is known to hold the
+    /// verified object, so a failed or refused put never leaves a cache
+    /// entry.
     ///
     /// Network cost: 1 request for a new object; 2 (upload, download) for a
-    /// dedup hit; 3 when a bad occupant is replaced (4 if the download
-    /// carried no generation header).
+    /// dedup hit or a refusal; 3 when a corrupt occupant is replaced.
     fn store_compressed(
         &self,
         hash: &Hash,
         ns: Ns,
         compressed: &[u8],
-        is_same: impl FnOnce(Vec<u8>) -> bool,
+        classify: impl FnOnce(Vec<u8>) -> Occupant,
     ) -> Result<()> {
         if self.upload_compressed(hash, ns, compressed, "0")? == Upload::PreconditionFailed {
             let existing = self.download_compressed(hash, ns)?.ok_or_else(|| {
                 Error::Other(anyhow::anyhow!("object {hash} vanished during put"))
             })?;
-            let same = zstd::stream::decode_all(&existing.compressed[..])
-                .ok()
-                .is_some_and(is_same);
-            if !same {
-                let generation = match existing.generation {
-                    Some(g) => g,
-                    None => self.remote_generation(hash, ns)?,
-                };
-                tracing::warn!(
-                    target: "agentic-core::gcs_store",
-                    hash = %hash,
-                    "replacing unverifiable object at content address",
-                );
-                if self.upload_compressed(hash, ns, compressed, &generation)?
-                    == Upload::PreconditionFailed
-                {
-                    return Err(Error::Other(anyhow::anyhow!(
-                        "object {hash} changed while replacing an unverifiable occupant"
-                    )));
+            let occupant = match zstd::stream::decode_all(&existing.compressed[..]) {
+                Ok(stored) => classify(stored),
+                Err(_) => Occupant::Corrupt,
+            };
+            match occupant {
+                Occupant::Same => {}
+                Occupant::Different => return Err(Error::AddressOccupied { hash: *hash }),
+                Occupant::Corrupt => {
+                    let generation = existing.generation.ok_or_else(|| {
+                        Error::Other(anyhow::anyhow!(
+                            "cannot replace corrupt object {hash}: download carried no \
+                             x-goog-generation"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        target: "agentic-core::gcs_store",
+                        hash = %hash,
+                        "replacing corrupt object at content address",
+                    );
+                    if self.upload_compressed(hash, ns, compressed, &generation)?
+                        == Upload::PreconditionFailed
+                    {
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "object {hash} changed while replacing a corrupt occupant"
+                        )));
+                    }
                 }
             }
         }
@@ -540,7 +525,7 @@ impl ObjectStore for GcsObjectStore {
         let hash = object.hash();
         let compressed = zstd::stream::encode_all(&bytes[..], 3)?;
         self.store_compressed(&hash, Ns::Typed, &compressed, |stored| {
-            decode_typed(&hash, stored).is_ok_and(|existing| existing == *object)
+            classify_typed(&hash, stored, object)
         })?;
         Ok(hash)
     }
@@ -560,7 +545,7 @@ impl ObjectStore for GcsObjectStore {
         let hash = Hash::of(bytes);
         let compressed = zstd::stream::encode_all(bytes, 3)?;
         self.store_compressed(&hash, Ns::Raw, &compressed, |stored| {
-            Hash::of(&stored) == hash
+            classify_raw(&hash, &stored)
         })?;
         Ok(hash)
     }
@@ -1050,5 +1035,52 @@ mod tests {
             outer.object_name(&h, Ns::Raw),
             inner.object_name(&h, Ns::Typed)
         );
+    }
+
+    // A valid object of another kind (here a legacy Blob whose bytes are the
+    // canonical JSON of a Tree) is never replaced: the put is refused, and
+    // nothing is written or cached.
+    #[test]
+    fn put_over_valid_other_kind_occupant_is_refused() {
+        let dir = tempdir().unwrap();
+        let tree = crate::object::Tree::new();
+        let tree_json = serde_json::to_vec(&tree).unwrap();
+        let envelope =
+            serde_json::to_vec(&Object::Blob(crate::object::Blob::new(tree_json))).unwrap();
+        let mock = occupied_bucket(zst(&envelope), 200);
+        let store = mock.store(dir.path());
+
+        match store.put(&Object::Tree(tree.clone())) {
+            Err(Error::AddressOccupied { hash }) => assert_eq!(hash, tree.hash()),
+            other => panic!("expected AddressOccupied, got {other:?}"),
+        }
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "upload + download only: {reqs:?}");
+        assert!(!store.cache_path(&tree.hash(), Ns::Typed).exists());
+    }
+
+    // Replacing a corrupt occupant needs the generation from the download;
+    // without one the put fails, with no separate metadata lookup.
+    #[test]
+    fn replacing_without_generation_header_fails() {
+        let dir = tempdir().unwrap();
+        let mock = Mock::start(|req| {
+            if req.method == "POST" && req.target.contains("ifGenerationMatch=0") {
+                Resp::status(412)
+            } else if req.method == "GET" && req.target.contains("alt=media") {
+                Resp {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: zst(b"squatter"),
+                }
+            } else {
+                Resp::status(500)
+            }
+        });
+        let store = mock.store(dir.path());
+        let h = Hash::of(b"honest");
+        assert!(store.put_raw(ObjectKind::Segment, b"honest").is_err());
+        assert_eq!(mock.requests().len(), 2, "{:?}", mock.requests());
+        assert!(!store.cache_path(&h, Ns::Raw).exists());
     }
 }

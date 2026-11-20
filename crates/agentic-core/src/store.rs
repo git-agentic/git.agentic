@@ -79,6 +79,38 @@ pub(crate) fn decode_typed(hash: &Hash, stored: Vec<u8>) -> Result<Object> {
     Ok(object)
 }
 
+/// What an occupied address holds, relative to the object being written.
+pub(crate) enum Occupant {
+    /// The same content: a dedup hit.
+    Same,
+    /// A valid object that verifies at this address but is not the one
+    /// being written. Never replaced.
+    Different,
+    /// Undecodable or failing its integrity check: corruption or a
+    /// pre-fix squatter. Safe to replace.
+    Corrupt,
+}
+
+/// Judge the bytes stored at typed address `hash` against `object`, exactly
+/// as `get` would read them.
+pub(crate) fn classify_typed(hash: &Hash, stored: Vec<u8>, object: &Object) -> Occupant {
+    match decode_typed(hash, stored) {
+        Ok(existing) if existing == *object => Occupant::Same,
+        Ok(_) => Occupant::Different,
+        Err(_) => Occupant::Corrupt,
+    }
+}
+
+/// Judge the bytes stored at raw address `hash`. The address determines
+/// the content, so a verified occupant is always the same object.
+pub(crate) fn classify_raw(hash: &Hash, stored: &[u8]) -> Occupant {
+    if Hash::of(stored) == *hash {
+        Occupant::Same
+    } else {
+        Occupant::Corrupt
+    }
+}
+
 /// Read a raw object found at a legacy (typed) address. Besides bare
 /// `put_raw` bytes, that address may hold a blob envelope written by a
 /// `put` of the same bytes; both carry the same content, so both are valid.
@@ -149,30 +181,34 @@ impl FsObjectStore {
         self.root.join(prefix).join(format!("{rest}.zst"))
     }
 
-    /// Raw objects (`put_raw`): `<root>/raw/<ab>/<rest>.zst`. A separate
-    /// namespace so bare bytes and typed envelopes can never claim the
-    /// same file.
+    /// Raw objects (`put_raw`): `<root>/raw/<ab>/<rest>.raw`. A separate
+    /// namespace, with its own suffix, so bare bytes and typed envelopes
+    /// can never claim the same file, even for a store rooted at `<p>/raw`.
     fn raw_path_for(&self, hash: &Hash) -> PathBuf {
         let (prefix, rest) = hash.shard();
         self.root
             .join("raw")
             .join(prefix)
-            .join(format!("{rest}.zst"))
+            .join(format!("{rest}.raw"))
     }
 
-    /// Write `bytes` at `path` unless the path already holds the same
-    /// content. `is_same` judges whatever is stored there exactly as the
-    /// matching read would; a missing, unreadable or different occupant
-    /// (a legacy squatter or corruption) is replaced atomically.
-    fn write_unless_same(
+    /// Write `bytes` at `path` unless it is already occupied. `classify`
+    /// judges the occupant exactly as the matching read would: the same
+    /// content is a dedup hit, a valid object of another kind is refused
+    /// (nothing is written), and a missing, unreadable or corrupt occupant
+    /// is replaced atomically.
+    fn write_unless_occupied(
         &self,
+        hash: &Hash,
         path: &Path,
         bytes: &[u8],
-        is_same: impl FnOnce(Vec<u8>) -> bool,
+        classify: impl FnOnce(Vec<u8>) -> Occupant,
     ) -> Result<()> {
         if let Ok(stored) = self.read_at(path) {
-            if is_same(stored) {
-                return Ok(());
+            match classify(stored) {
+                Occupant::Same => return Ok(()),
+                Occupant::Different => return Err(Error::AddressOccupied { hash: *hash }),
+                Occupant::Corrupt => {}
             }
         }
         self.write_at(path, bytes)
@@ -223,8 +259,8 @@ impl ObjectStore for FsObjectStore {
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let path = self.path_for(&hash);
-        self.write_unless_same(&path, &bytes, |stored| {
-            decode_typed(&hash, stored).is_ok_and(|existing| existing == *object)
+        self.write_unless_occupied(&hash, &path, &bytes, |stored| {
+            classify_typed(&hash, stored, object)
         })?;
         Ok(hash)
     }
@@ -244,7 +280,7 @@ impl ObjectStore for FsObjectStore {
 
         let hash = Hash::of(bytes);
         let path = self.raw_path_for(&hash);
-        self.write_unless_same(&path, bytes, |stored| Hash::of(&stored) == hash)?;
+        self.write_unless_occupied(&hash, &path, bytes, |stored| classify_raw(&hash, &stored))?;
         Ok(hash)
     }
 
@@ -628,5 +664,38 @@ mod tests {
         store.write_at(&store.path_for(&hash), &envelope).unwrap();
 
         assert_eq!(store.get_raw(&hash).unwrap(), b);
+    }
+
+    // A valid object of another kind owns the address (a legacy Blob whose
+    // bytes are canonical Tree JSON): the Tree put is refused and the Blob
+    // stays readable.
+    #[test]
+    fn typed_put_refuses_a_valid_other_kind_occupant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let tree = Tree::new();
+        let tree_json = serde_json::to_vec(&tree).unwrap();
+        let hash = tree.hash();
+        let envelope = serde_json::to_vec(&Object::Blob(Blob::new(tree_json.clone()))).unwrap();
+        store.write_at(&store.path_for(&hash), &envelope).unwrap();
+
+        match store.put(&Object::Tree(tree)) {
+            Err(Error::AddressOccupied { hash: h }) => assert_eq!(h, hash),
+            other => panic!("expected AddressOccupied, got {other:?}"),
+        }
+        match store.get(&hash).unwrap() {
+            Object::Blob(got) => assert_eq!(got.bytes, tree_json),
+            other => panic!("expected the Blob to survive, got {other:?}"),
+        }
+    }
+
+    // Stores rooted at `<p>` and `<p>/raw` must not share a file.
+    #[test]
+    fn raw_paths_cannot_collide_with_typed_paths_of_a_raw_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = FsObjectStore::open(dir.path()).unwrap();
+        let inner = FsObjectStore::open(dir.path().join("raw")).unwrap();
+        let h = Hash::of(b"x");
+        assert_ne!(outer.raw_path_for(&h), inner.path_for(&h));
     }
 }

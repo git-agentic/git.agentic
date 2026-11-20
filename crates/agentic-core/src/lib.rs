@@ -58,6 +58,12 @@ pub enum Error {
     )]
     AmbiguousBlob { hash: Hash },
 
+    #[error(
+        "address {hash} is already occupied by a different valid object; \
+         refusing to replace it"
+    )]
+    AddressOccupied { hash: Hash },
+
     #[error("invalid branch name {name:?}: {reason}")]
     InvalidBranchName { name: String, reason: String },
 

@@ -101,6 +101,9 @@ fn classify_core_error(err: &CoreError) -> (ErrorClass, &'static str, bool) {
         // Structural rejection of untrusted blob bytes; the caller must
         // change the content, so retrying can never succeed.
         CoreError::AmbiguousBlob { .. } => (ErrorClass::Validation, "ambiguous_blob", false),
+        // Same structural rejection: a valid object of another kind
+        // already owns this address, so the write can never succeed.
+        CoreError::AddressOccupied { .. } => (ErrorClass::Validation, "address_occupied", false),
         // Structural rejection of an untrusted branch name (path
         // traversal defence). The caller must change the name; retrying
         // the identical request can never succeed.
@@ -429,6 +432,26 @@ mod tests {
             } => {
                 assert_eq!(class, ErrorClass::Validation);
                 assert_eq!(code, "ambiguous_blob");
+                assert!(!retryable);
+            }
+            _ => panic!("expected Response::Error"),
+        }
+    }
+
+    #[test]
+    fn core_address_occupied_classifies_as_validation() {
+        let core_err: anyhow::Error = anyhow::Error::new(agentic_core::Error::AddressOccupied {
+            hash: agentic_core::Hash::of(b"x"),
+        });
+        match map_anyhow_to_response_error(core_err) {
+            Response::Error {
+                class,
+                code,
+                retryable,
+                ..
+            } => {
+                assert_eq!(class, ErrorClass::Validation);
+                assert_eq!(code, "address_occupied");
                 assert!(!retryable);
             }
             _ => panic!("expected Response::Error"),
