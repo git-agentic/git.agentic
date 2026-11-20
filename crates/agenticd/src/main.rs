@@ -135,9 +135,11 @@ struct Args {
     #[arg(long = "scanner-exempt-entropy-prefix", default_values_t = vec!["__langgraph__/".to_string()])]
     scanner_exempt_entropy_prefixes: Vec<String>,
 
-    /// Path to the 32-byte operator approval key for destructive rollback
-    /// (ADR-0014). Without it, every `accept_data_loss = true` rollback is
-    /// rejected fail-closed. If the flag is passed but the file exists and
+    /// Path to the 32-byte operator approval key (ADR-0014, ADR-0019).
+    /// Without a key, every `accept_data_loss = true` rollback and every
+    /// rollback that runs reverse migrations is rejected fail-closed.
+    /// Default: `<repo>/.agentic/approval.key` when that file exists.
+    /// If a key path is configured but the file exists and
     /// is readable yet is not exactly 32 bytes, the daemon aborts startup
     /// (an operator who configured a key but got it wrong should find out
     /// loudly); an absent, unreadable, or empty file leaves the daemon
@@ -177,6 +179,32 @@ struct Args {
     write_idle_secs: u64,
 }
 
+/// The approval key path: the explicit flag, else `<agentic_dir>/approval.key`
+/// when that is a regular file (ADR-0019 Decision 3).
+fn approval_key_path(
+    explicit: Option<&std::path::Path>,
+    agentic_dir: &std::path::Path,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let default = agentic_dir.join("approval.key");
+    match std::fs::symlink_metadata(&default) {
+        Err(_) => None,
+        Ok(m) if m.is_file() => Some(default),
+        // A FIFO or other special file at the default path must not block
+        // startup. Treat it like an unreadable key: warn, run without one.
+        Ok(_) => {
+            tracing::warn!(
+                target: "agenticd::approval",
+                path = %default.display(),
+                "default approval key path is not a regular file; ignoring it (fail-closed)"
+            );
+            None
+        }
+    }
+}
+
 /// Load the ADR-0014 approval key per Decisions 4 and 6.
 ///
 /// Reconciliation of the two decisions, keeping the abort case narrow so a
@@ -193,8 +221,14 @@ struct Args {
 ///   fail-closed whatever its mode. The mode comes from the opened handle, not
 ///   a separate path stat, so the file checked is the file read. It only
 ///   excludes other uids: a process sharing the daemon's uid can read a 0600 key.
+///
+/// `nofollow` is set for the auto-discovered default path, so a symlink
+/// swapped in after the discovery check is never followed. A path named with
+/// `--approval-key-file` is an operator choice and follows symlinks, because
+/// Kubernetes and Cloud Run secret volumes expose files through them.
 fn load_approval_key(
     path: Option<&std::path::Path>,
+    nofollow: bool,
 ) -> anyhow::Result<Option<agentic_core::approval::ApprovalKey>> {
     let Some(path) = path else {
         return Ok(None);
@@ -207,13 +241,28 @@ fn load_approval_key(
             "approval key file unreadable; destructive rollback disabled (fail-closed)"
         );
     };
-    let mut file = match std::fs::File::open(path) {
+    // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
+    // writer; the regular-file check below then rejects it.
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut flags = libc::O_NONBLOCK;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path);
+    let mut file = match opened {
         Ok(f) => f,
         Err(e) => {
             unreadable(e);
             return Ok(None);
         }
     };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        unreadable(std::io::Error::other("not a regular file"));
+        return Ok(None);
+    }
     let mut bytes = Vec::new();
     // Cap the read: one byte past the key length is enough to reject a wrong-length
     // file, and a misconfigured path to an endless source cannot exhaust memory.
@@ -463,7 +512,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ADR-0014: load the approval key (or fail-closed None) BEFORE binding
     // the socket, so a malformed key aborts startup before accepting work.
-    let approval_key = load_approval_key(args.approval_key_file.as_deref())?;
+    let approval_key = load_approval_key(
+        approval_key_path(args.approval_key_file.as_deref(), &agentic_dir).as_deref(),
+        args.approval_key_file.is_none(),
+    )?;
 
     let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
@@ -638,7 +690,65 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_approval_key, validate_exempt_prefixes};
+    use super::{approval_key_path, load_approval_key, validate_exempt_prefixes};
+
+    // ADR-0019 Decision 3: the flag wins; otherwise the default file is used
+    // only when it exists.
+    #[test]
+    fn approval_key_path_discovers_the_default_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(approval_key_path(None, dir.path()), None);
+        let explicit = std::path::Path::new("/elsewhere/k");
+        assert_eq!(
+            approval_key_path(Some(explicit), dir.path()),
+            Some(explicit.to_path_buf())
+        );
+        std::fs::write(dir.path().join("approval.key"), [7u8; 32]).unwrap();
+        assert_eq!(
+            approval_key_path(None, dir.path()),
+            Some(dir.path().join("approval.key"))
+        );
+        // The flag still wins over an existing default.
+        assert_eq!(
+            approval_key_path(Some(explicit), dir.path()),
+            Some(explicit.to_path_buf())
+        );
+    }
+
+    // The default path is opened with O_NOFOLLOW; a named path follows
+    // symlinks (secret volumes).
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_applies_only_to_the_default_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.key");
+        std::fs::write(&real, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(load_approval_key(Some(&link), true).unwrap().is_none());
+        assert!(load_approval_key(Some(&link), false).unwrap().is_some());
+    }
+
+    // ADR-0019 Decision 3: only a regular file counts as the default key. A
+    // FIFO would block the open, a symlink is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn approval_key_path_ignores_a_non_regular_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("approval.key");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(approval_key_path(None, dir.path()), None);
+        std::fs::remove_file(&fifo).unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, [7u8; 32]).unwrap();
+        std::os::unix::fs::symlink(&real, &fifo).unwrap();
+        assert_eq!(approval_key_path(None, dir.path()), None);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -649,7 +759,7 @@ mod tests {
         std::fs::write(&path, [7u8; 32]).unwrap();
         for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let err = load_approval_key(Some(&path))
+            let err = load_approval_key(Some(&path), false)
                 .expect_err(&format!("mode {mode:o} must abort startup"));
             let msg = err.to_string();
             assert!(msg.contains("chmod 600"), "{msg}");
@@ -657,17 +767,19 @@ mod tests {
         }
         for mode in [0o600, 0o400] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(load_approval_key(Some(&path)).unwrap().is_some());
+            assert!(load_approval_key(Some(&path), false).unwrap().is_some());
         }
         // Empty file, even with a loose mode, stays fail-closed (Decision 4).
         let empty = dir.path().join("empty.key");
         std::fs::write(&empty, []).unwrap();
         std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(load_approval_key(Some(&empty)).unwrap().is_none());
+        assert!(load_approval_key(Some(&empty), false).unwrap().is_none());
         // A path that opens but fails to read (a directory) too.
-        assert!(load_approval_key(Some(dir.path())).unwrap().is_none());
+        assert!(load_approval_key(Some(dir.path()), false)
+            .unwrap()
+            .is_none());
         // Unreadable/missing stays fail-closed, not an abort.
-        assert!(load_approval_key(Some(&dir.path().join("missing")))
+        assert!(load_approval_key(Some(&dir.path().join("missing")), false)
             .unwrap()
             .is_none());
     }

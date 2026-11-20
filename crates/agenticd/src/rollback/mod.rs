@@ -37,7 +37,7 @@ mod writeback;
 
 use std::path::PathBuf;
 
-use agentic_core::approval::{verify_token, ApprovalRejection};
+use agentic_core::approval::{verify_token_any, ApprovalRejection, ApprovalScope};
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
 use agentic_core::{check_blob_unambiguous, Commit, Hash};
@@ -56,14 +56,34 @@ pub struct RollbackArgs {
     pub target: String,
     pub dry_run: bool,
     pub accept_data_loss: bool,
-    /// Operator approval token for the ADR-0014 destructive-rollback gate.
-    /// Only consulted when `accept_data_loss` is `true`.
+    /// Operator approval token for the ADR-0014 gate. Consulted when
+    /// `accept_data_loss` is `true` or when the plan runs reverse
+    /// migrations (ADR-0019).
     pub approval_token: Option<String>,
     /// Filesystem root of the repo (where `prompts/` lives).
     pub repo: PathBuf,
 }
 
-/// Rejection from the ADR-0014 destructive-rollback approval gate. Every
+/// Why a rollback must pass the approval gate. Carried on every audit event
+/// as `reason` so alerts can tell the two apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GateReason {
+    /// `accept_data_loss = true` (ADR-0014).
+    AcceptDataLoss,
+    /// The plan runs at least one reverse migration (ADR-0019).
+    ReverseMigration,
+}
+
+impl GateReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            GateReason::AcceptDataLoss => "accept_data_loss",
+            GateReason::ReverseMigration => "reverse_migration",
+        }
+    }
+}
+
+/// Rejection from the ADR-0014 / ADR-0019 approval gate. Every
 /// variant maps to a `RollbackForcedDataLoss` audit `decision` (emitted by
 /// [`approval_gate`] before the error is returned) and is classified on the
 /// wire as non-retryable `Validation` — the caller must obtain a valid
@@ -71,24 +91,34 @@ pub struct RollbackArgs {
 #[derive(Debug, thiserror::Error)]
 pub enum ApprovalError {
     #[error(
-        "accept_data_loss=true requires an operator approval token (ADR-0014), but this \
-         daemon has no --approval-key-file configured — failing closed. Destructive rollback \
-         is unavailable until an approval key is provisioned."
+        "this rollback requires an operator approval token (accept_data_loss=true per \
+         ADR-0014, or a reverse schema migration per ADR-0019), but this daemon has no \
+         approval key configured — failing closed. Start agenticd with \
+         --approval-key-file <path> (or place a 32-byte key at <repo>/.agentic/approval.key)."
     )]
     KeyNotConfigured,
     #[error(
-        "accept_data_loss=true cannot be authorized because the connection has no attested \
+        "this rollback requires an operator approval token, but the connection has no attested \
          peer UID (the daemon is running with --insecure-allow-any-uid). An approval token \
-         binds to a specific worker UID (ADR-0014 Decision 2), so destructive rollback is \
-         refused in this mode."
+         binds to a specific peer UID (ADR-0014 Decision 2), so the rollback is refused in \
+         this mode. Run agenticd with --allowed-uid instead."
     )]
     NoPeerUid,
     #[error(
-        "accept_data_loss=true requires an approval_token, but none was supplied (ADR-0014). \
-         Have the operator mint one with `agentic rollback --approval <commit> --uid <uid> \
-         --key-file <path>`."
+        "accept_data_loss=true requires an approval_token (ADR-0014), but none was supplied. \
+         The `agentic` CLI attaches one automatically when it can read the approval key; \
+         otherwise mint one with `agentic rollback --approval <commit> --uid <uid> \
+         --key-file <path> --scope data-loss`."
     )]
     TokenRequired,
+    #[error(
+        "this rollback runs reverse schema migrations and requires an approval_token \
+         (ADR-0019), but none was supplied. The `agentic` CLI attaches one automatically \
+         when it can read the approval key; otherwise mint one with `agentic rollback \
+         --approval <commit> --uid <uid> --key-file <path> --scope reverse-migration`. \
+         Do not hand out a data-loss token for this: it also authorizes accept_data_loss."
+    )]
+    TokenRequiredForReverseMigration,
     #[error("approval token rejected: {0}")]
     Rejected(#[from] ApprovalRejection),
 }
@@ -99,7 +129,9 @@ impl ApprovalError {
         match self {
             ApprovalError::KeyNotConfigured => "rejected_no_key_configured",
             ApprovalError::NoPeerUid => "rejected_no_peer_uid",
-            ApprovalError::TokenRequired => "rejected_no_token",
+            ApprovalError::TokenRequired | ApprovalError::TokenRequiredForReverseMigration => {
+                "rejected_no_token"
+            }
             ApprovalError::Rejected(r) => r.audit_decision(),
         }
     }
@@ -117,17 +149,21 @@ fn token_prefix_for_audit(token: &str) -> String {
     hmac_part.chars().take(8).collect()
 }
 
-/// Emit the ADR-0014 Decision 5 audit event for one `accept_data_loss=true`
-/// attempt. Fires on EVERY branch — accepted and every rejection — so an
+/// Emit the ADR-0014 Decision 5 audit event for one gated rollback attempt.
+/// Fires on EVERY branch — accepted and every rejection — so an
 /// attacker probing for the gate shows up and operators can alert on
 /// `decision = "rejected_*"` rates. `warn` for rejections, `info` for the
-/// accepted path.
+/// accepted path. `reason` (ADR-0019) says which gate fired, so an alert on
+/// forced data loss can exclude the routine reverse-migration approvals.
 fn audit_forced_data_loss(
     peer_uid: Option<u32>,
     target_commit_hash: &str,
     decision: &str,
     token: Option<&str>,
+    reason: GateReason,
+    scope: Option<ApprovalScope>,
 ) {
+    let reason = reason.as_str();
     let token_prefix = token.map(token_prefix_for_audit);
     if decision == "accepted" {
         tracing::info!(
@@ -137,6 +173,10 @@ fn audit_forced_data_loss(
             ?peer_uid,
             target_commit_hash,
             decision,
+            reason,
+            // The scope the token verified under (ADR-0019): a data-loss
+            // token also covers a plain reverse-migration rollback.
+            scope = scope.map(ApprovalScope::as_str),
             ?token_prefix,
         );
     } else {
@@ -147,15 +187,16 @@ fn audit_forced_data_loss(
             ?peer_uid,
             target_commit_hash,
             decision,
+            reason,
             ?token_prefix,
         );
     }
 }
 
-/// The ADR-0014 approval gate. Called only when `accept_data_loss == true`,
-/// before any object-store or Postgres work and before the dry-run branch,
-/// so a rejected request has zero side effects. Emits exactly one audit
-/// event and returns `Ok(())` only when a valid token is present.
+/// The ADR-0014 approval gate, also used for reverse migrations (ADR-0019).
+/// Called before any side effect, so a rejected request has zero side
+/// effects. Emits exactly one audit event and returns `Ok(())` only when a
+/// valid token is present.
 ///
 /// A token is single-use for non-dry-run rollbacks: the decoded HMAC tag is
 /// recorded in `state.used_approval_tokens` and a second use is rejected as
@@ -168,10 +209,18 @@ fn approval_gate(
     peer_uid: Option<u32>,
     approval_token: Option<&str>,
     dry_run: bool,
+    reason: GateReason,
 ) -> Result<(), ApprovalError> {
     let commit_hash = target_hash.to_hex(); // lowercase 64-hex (Decision 2)
     let reject = |err: ApprovalError| -> ApprovalError {
-        audit_forced_data_loss(peer_uid, &commit_hash, err.audit_decision(), approval_token);
+        audit_forced_data_loss(
+            peer_uid,
+            &commit_hash,
+            err.audit_decision(),
+            approval_token,
+            reason,
+            None,
+        );
         err
     };
 
@@ -187,11 +236,23 @@ fn approval_gate(
     };
     // (c) Key present but no token supplied.
     let Some(token) = approval_token else {
-        return Err(reject(ApprovalError::TokenRequired));
+        return Err(reject(match reason {
+            GateReason::AcceptDataLoss => ApprovalError::TokenRequired,
+            GateReason::ReverseMigration => ApprovalError::TokenRequiredForReverseMigration,
+        }));
     };
     // (d) Verify.
     let now = now_unix_seconds();
-    let verified = match verify_token(key, &commit_hash, uid, token, now) {
+    // ADR-0019 scope binding: accept_data_loss needs a data-loss token (which
+    // is also what legacy tokens are). A plain reverse-migration rollback
+    // accepts either scope, because a data-loss approval covers the weaker
+    // action. A reverse-migration token therefore cannot be replayed with
+    // accept_data_loss=true to switch off the IRREVERSIBLE check.
+    let scopes: &[ApprovalScope] = match reason {
+        GateReason::AcceptDataLoss => &[ApprovalScope::DataLoss],
+        GateReason::ReverseMigration => &[ApprovalScope::ReverseMigration, ApprovalScope::DataLoss],
+    };
+    let verified = match verify_token_any(key, scopes, &commit_hash, uid, token, now) {
         Ok(v) => v,
         Err(rej) => return Err(reject(ApprovalError::Rejected(rej))),
     };
@@ -211,7 +272,14 @@ fn approval_gate(
         }
     }
     // (e) Valid — audit the accepted path too.
-    audit_forced_data_loss(peer_uid, &commit_hash, "accepted", approval_token);
+    audit_forced_data_loss(
+        peer_uid,
+        &commit_hash,
+        "accepted",
+        approval_token,
+        reason,
+        Some(verified.scope),
+    );
     Ok(())
 }
 
@@ -240,8 +308,14 @@ pub async fn execute(
 
     // ADR-0014 destructive-rollback approval gate. Evaluated before any
     // object-store or Postgres work and before the dry-run branch, so a
-    // rejected request has zero side effects. Only destructive rollbacks
-    // (`accept_data_loss = true`) pass through it.
+    // rejected request has zero side effects. `accept_data_loss = true`
+    // passes through it here; a plain rollback that runs reverse migrations
+    // passes through it below, once the plan is known (ADR-0019). `gated`
+    // stops the second check from consuming the same single-use token twice.
+    let mut gated = false;
+    // Reported to the caller so a client can tell whether a token will be
+    // needed before it asks for one to be minted.
+    let mut approval_required = args.accept_data_loss;
     if args.accept_data_loss {
         approval_gate(
             &state,
@@ -249,8 +323,10 @@ pub async fn execute(
             peer_uid,
             args.approval_token.as_deref(),
             args.dry_run,
+            GateReason::AcceptDataLoss,
         )
         .map_err(anyhow::Error::new)?;
+        gated = true;
     }
 
     let target = load_commit(&state, &target_hash)?;
@@ -347,13 +423,48 @@ pub async fn execute(
             // Phase 2: synchronous filesystem I/O — no adapter call in
             // flight. `accept_data_loss` is forwarded so
             // `check_irreversible` can honor the operator's opt-in for
-            // IRREVERSIBLE-marked migrations.
+            // IRREVERSIBLE-marked migrations. Read-only. On this path (a
+            // plain reverse-migration rollback) it runs ahead of the approval
+            // gate, so a missing or IRREVERSIBLE `.down.sql` is refused
+            // before a single-use token is consumed and before an `accepted`
+            // audit event. With accept_data_loss=true the gate already ran at
+            // the top of `execute`, so there the token is consumed (and the
+            // audit event written) before this load.
             let steps = migrate::load_steps(
                 state.refs.agentic_dir(),
                 &migration_names,
                 args.accept_data_loss,
             )
             .context("loading reverse migration files")?;
+
+            // ADR-0019: a rollback that runs reverse migrations needs the
+            // approval token whether or not accept_data_loss is set. Nothing
+            // above this point has a side effect. A dry run without a token
+            // only reports the requirement; a supplied token is still
+            // verified (and, being a dry run, not consumed).
+            if !migration_names.is_empty() {
+                approval_required = true;
+            }
+            if !migration_names.is_empty() && !gated {
+                if args.dry_run {
+                    plan.push(
+                        "operator approval token required: this rollback runs reverse \
+                         migrations (ADR-0019)"
+                            .into(),
+                    );
+                }
+                if !args.dry_run || args.approval_token.is_some() {
+                    approval_gate(
+                        &state,
+                        &target_hash,
+                        peer_uid,
+                        args.approval_token.as_deref(),
+                        args.dry_run,
+                        GateReason::ReverseMigration,
+                    )
+                    .map_err(anyhow::Error::new)?;
+                }
+            }
 
             // Phase 3: execute — atomic inside the backend.
             if !args.dry_run {
@@ -435,6 +546,7 @@ pub async fn execute(
             planned_steps: plan,
             executed: false,
             new_head_hash: None,
+            approval_required,
         });
     }
 
@@ -472,6 +584,7 @@ pub async fn execute(
         planned_steps: plan,
         executed: true,
         new_head_hash: Some(out.commit_hash.to_hex()),
+        approval_required,
     })
 }
 

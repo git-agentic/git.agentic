@@ -108,9 +108,21 @@ rm -rf "${DEMO_DIR}/.agentic"
 # agenticd refuses a repo or .agentic that is group- or world-writable.
 # A checkout or `init` under umask 002 creates them 0775.
 chmod go-w "${DEMO_DIR}" "${DEMO_DIR}/.agentic"
+# Operator approval key (ADR-0019). A rollback that reverses a schema
+# migration needs an approval token; the daemon reads this key and the
+# `agentic` CLI mints the token from it, so the visible commands stay the
+# same. The demo's step 10 rollback has no schema change today and so
+# consumes no token. The key must be 0600 or the daemon refuses to start.
+APPROVAL_KEY="${DEMO_DIR}/.agentic/approval.key"
+if [[ ! -f "${APPROVAL_KEY}" ]]; then
+    ( umask 077 && head -c 32 /dev/urandom > "${APPROVAL_KEY}" )
+    chmod 600 "${APPROVAL_KEY}"
+fi
+# A token binds to the caller's uid, so the daemon must attest peers:
+# --allowed-uid, not --insecure-allow-any-uid.
 "${AGENTICD_BIN}" --repo "${DEMO_DIR}" --postgres "${DATABASE_URL}" --tables episodes:id \
     --socket "${AGENTIC_SOCKET}" \
-    --insecure-allow-any-uid \
+    --allowed-uid "$(id -u)" \
     > "${DEMO_DIR}/.agentic/daemon.log" 2>&1 &
 DAEMON_PID=$!
 

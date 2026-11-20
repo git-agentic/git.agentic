@@ -5,6 +5,7 @@
 **Deciders:** Toni
 **Closes:** [`git.agentic-threat-model.md`](../../git.agentic-threat-model.md) TM-002 (sibling worker triggers destructive down-migration via `Rollback { accept_data_loss: true }`)
 **Closed in:** `beacd65` / PR #121 (2026-07-10) — approval gate implemented; interim hard-reject shipped earlier in `aabcbda` / PR #114
+**Amended by:** [ADR-0019](./0019-approval-for-reverse-migration-rollback.md) (2026-11-20): rollbacks that run reverse migrations pass the same gate, with or without `accept_data_loss`.
 **Relates to:** [ADR-0002](./0002-substrate-and-supercommit.md) Decision 5 (bounded rollback for destructive migrations), [ADR-0004](./0004-realtime-agenticd-for-executor.md) Decision 4 (loud-fail discipline), [ADR-0012](./0012-socket-peer-authentication.md) Decision 2 (`peer_uid` on every accepted connection), [issue #37 / audit §A8](../ops/2026-05-21-agenticd-architectural-analysis.md#a8) (the reverse-migration outer-transaction work that wired `accept_data_loss` end-to-end).
 
 ## Context
@@ -148,8 +149,10 @@ v1.1 may introduce KMS-backed signing where the operator holds a KMS key referen
 The operator's CLI for issuing tokens is a separate concern, handled by the `agentic` command:
 
 ```
-agentic rollback --approval <commit-hash> --uid <worker-uid> --key-file <path>
+agentic rollback --approval <commit-hash> --uid <worker-uid> --key-file <path> --scope data-loss
 ```
+
+(`--scope data-loss` since ADR-0019; the default scope only authorizes a rollback that runs reverse migrations.)
 
 This prints a token to stdout that the operator hands to the worker (or pastes into a CI variable, or whatever the deployment shape requires). The token-issuing path lives in `agentic-cli` and does not require the daemon to be running.
 

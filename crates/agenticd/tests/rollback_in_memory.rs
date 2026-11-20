@@ -73,7 +73,9 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
             .build()
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
-        approval_key: None,
+        // ADR-0019: a rollback that runs reverse migrations needs an
+        // operator approval token.
+        approval_key: Some(test_key()),
         used_approval_tokens: Default::default(),
         limits: agenticd::limits::LimitsConfig::default(),
         rate: agenticd::limits::RateLimiter::new(
@@ -95,6 +97,7 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
     .await
     .expect("baseline commit with memory should succeed");
     let baseline_ref = baseline.commit_hash.clone();
+    let token = generate_token(&test_key(), &baseline_ref, 1000, now_secs());
 
     // -- Act 1: contaminate — bump schema and dirty the data. ------------
     adapter.apply_migration("002_bump").await;
@@ -123,10 +126,10 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
             target: baseline_ref,
             dry_run: false,
             accept_data_loss: false,
-            approval_token: None,
+            approval_token: Some(token),
             repo: repo_root.clone(),
         },
-        None,
+        Some(1000),
     )
     .await
     .expect("rollback against InMemoryAdapter should succeed");
@@ -874,5 +877,521 @@ async fn rollback_refuses_legacy_ambiguous_blob_before_any_side_effect() {
         assert_eq!(rows[0]["body"], "bad");
         assert_eq!(state.refs.read_branch("main").unwrap(), tip);
         assert!(!state.repo_root.join("prompts").exists());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0019: a rollback that runs reverse migrations passes the approval gate
+// whether or not accept_data_loss is set.
+// ---------------------------------------------------------------------------
+
+/// Bump the schema, dirty the data and provide the down.sql, so a rollback to
+/// the baseline has a reverse migration to run.
+async fn contaminate(state: &DaemonState, adapter: &InMemoryAdapter) {
+    adapter.apply_migration("002_bump").await;
+    adapter
+        .insert_rows(
+            "messages",
+            vec![serde_json::json!({"id": 99, "body": "bad"})],
+        )
+        .await;
+    let schema_dir = state.refs.agentic_dir().join("schema");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(schema_dir.join("002_bump.down.sql"), "-- no-op\n").unwrap();
+}
+
+fn plain_args(
+    state: &DaemonState,
+    target: &str,
+    token: Option<String>,
+    dry_run: bool,
+) -> RollbackArgs {
+    RollbackArgs {
+        target: target.to_string(),
+        dry_run,
+        accept_data_loss: false,
+        approval_token: token,
+        repo: state.repo_root.clone(),
+    }
+}
+
+/// Nothing a rollback touches has changed: schema, memory, branch tip.
+async fn assert_untouched(
+    state: &DaemonState,
+    adapter: &InMemoryAdapter,
+    tip: Option<agentic_core::Hash>,
+) {
+    assert_eq!(adapter.current_schema_version().await.unwrap(), "002_bump");
+    let rows = adapter.rows_of("messages").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["body"], "bad");
+    assert_eq!(state.refs.read_branch("main").unwrap(), tip);
+}
+
+#[tokio::test]
+async fn reverse_migration_rollback_without_token_is_refused_before_side_effects() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let tip = state.refs.read_branch("main").unwrap();
+    let err = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, false),
+        Some(1000),
+    )
+    .await
+    .expect_err("a plain reverse-migration rollback needs a token");
+    assert!(matches!(
+        downcast_approval(&err),
+        ApprovalError::TokenRequiredForReverseMigration
+    ));
+    assert_untouched(&state, &adapter, tip).await;
+    assert!(
+        !state.repo_root.join("prompts").exists(),
+        "prompts must not be written back"
+    );
+}
+
+#[tokio::test]
+async fn reverse_migration_rollback_with_wrong_uid_or_no_peer_is_refused() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let tip = state.refs.read_branch("main").unwrap();
+    let tok = generate_token(&test_key(), &baseline, 2000, now_secs());
+    let err = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok.clone()), false),
+        Some(1000),
+    )
+    .await
+    .expect_err("token for another uid must be refused");
+    assert!(matches!(
+        downcast_approval(&err),
+        ApprovalError::Rejected(agentic_core::approval::ApprovalRejection::InvalidSignature)
+    ));
+    let err = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        None,
+    )
+    .await
+    .expect_err("no attested peer uid must be refused");
+    assert!(matches!(downcast_approval(&err), ApprovalError::NoPeerUid));
+    assert_untouched(&state, &adapter, tip).await;
+}
+
+#[tokio::test]
+async fn reverse_migration_rollback_with_valid_token_succeeds_once() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok.clone()), false),
+        Some(1000),
+    )
+    .await
+    .expect("valid token lets the rollback run");
+    assert!(out.executed);
+    assert_eq!(adapter.current_schema_version().await.unwrap(), "001_init");
+
+    // Single use: with the schema bumped again, the same token is a replay.
+    contaminate(&state, &adapter).await;
+    let tip = state.refs.read_branch("main").unwrap();
+    let err = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        Some(1000),
+    )
+    .await
+    .expect_err("second use must be refused");
+    assert!(is_replayed(&err), "got: {err:#}");
+    assert_untouched(&state, &adapter, tip).await;
+}
+
+#[tokio::test]
+async fn reverse_migration_rollback_without_a_key_names_the_flag() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(false).await;
+    contaminate(&state, &adapter).await;
+    let tip = state.refs.read_branch("main").unwrap();
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let err = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        Some(1000),
+    )
+    .await
+    .expect_err("no key configured must refuse");
+    assert!(matches!(
+        downcast_approval(&err),
+        ApprovalError::KeyNotConfigured
+    ));
+    assert!(
+        format!("{err:#}").contains("--approval-key-file"),
+        "message must name the flag: {err:#}"
+    );
+    assert_untouched(&state, &adapter, tip).await;
+}
+
+#[tokio::test]
+async fn rollback_without_schema_change_needs_no_token() {
+    // Key configured and no key configured: both run with no token.
+    for with_key in [true, false] {
+        let (state, _adapter, baseline, _dir) = setup_gate_state(with_key).await;
+        let out = rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, None, false),
+            Some(1000),
+        )
+        .await
+        .expect("no reverse migration, no approval needed");
+        assert!(out.executed);
+    }
+}
+
+#[tokio::test]
+async fn reverse_migration_dry_run_reports_approval_and_verifies_a_supplied_token() {
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let tip = state.refs.read_branch("main").unwrap();
+
+    // No token: the plan says approval is required; nothing is refused.
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, true),
+        Some(1000),
+    )
+    .await
+    .expect("a dry run without a token reports the requirement");
+    assert!(!out.executed);
+    assert!(
+        out.planned_steps
+            .iter()
+            .any(|s| s.contains("approval token required")),
+        "plan: {:?}",
+        out.planned_steps
+    );
+
+    // A bad token is still verified on a dry run.
+    let bad = generate_token(&test_key(), &baseline, 2000, now_secs());
+    rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(bad), true),
+        Some(1000),
+    )
+    .await
+    .expect_err("a supplied token is verified on a dry run");
+
+    // A good token is verified but not consumed.
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    for _ in 0..2 {
+        rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok.clone()), true),
+            Some(1000),
+        )
+        .await
+        .expect("dry run with a valid token");
+    }
+    assert_untouched(&state, &adapter, tip).await;
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        Some(1000),
+    )
+    .await
+    .expect("the token survived the dry runs");
+    assert!(out.executed);
+}
+
+#[tokio::test]
+async fn accept_data_loss_with_reverse_migration_consumes_one_token_once() {
+    // Both gates apply; the single token must not be checked (and consumed)
+    // twice within one request.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let out = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok)),
+        Some(1000),
+    )
+    .await
+    .expect("one token covers accept_data_loss plus reverse migrations");
+    assert!(out.executed);
+    assert_eq!(state.used_approval_tokens.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn refused_down_migration_load_does_not_consume_the_token() {
+    // The down.sql is checked before the gate, so a missing or IRREVERSIBLE
+    // file is refused with the token unspent.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let down = state.refs.agentic_dir().join("schema/002_bump.down.sql");
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let tip = state.refs.read_branch("main").unwrap();
+
+    for (what, contents, expect) in [
+        (
+            "irreversible",
+            Some("-- IRREVERSIBLE\nDROP TABLE t;\n"),
+            "IRREVERSIBLE",
+        ),
+        ("missing", None, "002_bump"),
+    ] {
+        match contents {
+            Some(c) => std::fs::write(&down, c).unwrap(),
+            None => std::fs::remove_file(&down).unwrap(),
+        }
+        let err = rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok.clone()), false),
+            Some(1000),
+        )
+        .await
+        .expect_err("an unloadable down migration must refuse the rollback");
+        assert!(format!("{err:#}").contains(expect), "{what}: {err:#}");
+        assert!(
+            state.used_approval_tokens.lock().unwrap().is_empty(),
+            "{what}: the token must not be consumed"
+        );
+        assert_untouched(&state, &adapter, tip).await;
+    }
+
+    // With the file fixed, the same token still works.
+    std::fs::write(&down, "-- no-op\n").unwrap();
+    rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, Some(tok), false),
+        Some(1000),
+    )
+    .await
+    .expect("the unspent token authorizes the corrected rollback");
+}
+
+#[tokio::test]
+async fn plans_report_whether_approval_is_required() {
+    // Reverse migration in the plan: true, on a dry run with no token.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, true),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(out.approval_required);
+
+    // No schema change and no accept_data_loss: false.
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    let out = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, true),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(!out.approval_required);
+
+    // accept_data_loss: true, even with no schema change.
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let out = rollback::execute(
+        Arc::clone(&state),
+        dry_run_args(&state, &baseline, tok),
+        Some(1000),
+    )
+    .await
+    .unwrap();
+    assert!(out.approval_required);
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0019 scope binding.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reverse_migration_token_cannot_authorize_accept_data_loss() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    // The attack: a token issued for an ordinary reverse-migration rollback
+    // replayed with accept_data_loss=true, which would switch off the
+    // IRREVERSIBLE check. It must be refused before any SQL.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let down = state.refs.agentic_dir().join("schema/002_bump.down.sql");
+    std::fs::write(&down, "-- IRREVERSIBLE\nDROP TABLE messages;\n").unwrap();
+    let tip = state.refs.read_branch("main").unwrap();
+    let rm = generate_token_scoped(
+        &test_key(),
+        ApprovalScope::ReverseMigration,
+        &baseline,
+        1000,
+        now_secs(),
+    );
+    for dry_run in [true, false] {
+        let args = RollbackArgs {
+            dry_run,
+            ..real_args(&state, &baseline, Some(rm.clone()))
+        };
+        let err = rollback::execute(Arc::clone(&state), args, Some(1000))
+            .await
+            .expect_err("a reverse-migration token must not authorize accept_data_loss");
+        assert!(matches!(
+            downcast_approval(&err),
+            ApprovalError::Rejected(agentic_core::approval::ApprovalRejection::InvalidSignature)
+        ));
+    }
+    assert!(state.used_approval_tokens.lock().unwrap().is_empty());
+    assert_untouched(&state, &adapter, tip).await;
+}
+
+#[tokio::test]
+async fn either_scope_authorizes_a_plain_reverse_migration_rollback() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    for scope in [ApprovalScope::ReverseMigration, ApprovalScope::DataLoss] {
+        let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+        contaminate(&state, &adapter).await;
+        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs());
+        let out = rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok), false),
+            Some(1000),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{scope:?}: {e:#}"));
+        assert!(out.executed, "{scope:?}");
+        assert_eq!(adapter.current_schema_version().await.unwrap(), "001_init");
+    }
+}
+
+#[tokio::test]
+async fn legacy_format_token_still_authorizes_accept_data_loss() {
+    // A token built the way pre-ADR-0019 issuers built it (the signing input
+    // is pinned in agentic-core), not through the scoped API.
+    use hmac::{Hmac, Mac};
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let now = now_secs();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&TEST_KEY_BYTES).unwrap();
+    mac.update(format!("git.agentic/rollback-approval/v1:{baseline}:1000:{now}").as_bytes());
+    let legacy = format!("{now}:{}", hex::encode(mac.finalize().into_bytes()));
+    let out = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(legacy)),
+        Some(1000),
+    )
+    .await
+    .expect("a legacy token keeps working for accept_data_loss");
+    assert!(out.executed);
+}
+
+#[tokio::test]
+async fn missing_token_diagnostics_name_the_right_scope() {
+    // A plain reverse-migration rollback must point operators at the
+    // reverse-migration scope, never at a data-loss token, which a worker
+    // could replay with accept_data_loss. accept_data_loss points at data-loss.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let plain = rollback::execute(
+        Arc::clone(&state),
+        plain_args(&state, &baseline, None, false),
+        Some(1000),
+    )
+    .await
+    .expect_err("no token");
+    let msg = format!("{plain:#}");
+    assert!(msg.contains("--scope reverse-migration"), "{msg}");
+    assert!(!msg.contains("--scope data-loss"), "{msg}");
+
+    let destructive = rollback::execute(
+        Arc::clone(&state),
+        destructive_args(&baseline, None),
+        Some(1000),
+    )
+    .await
+    .expect_err("no token");
+    let msg = format!("{destructive:#}");
+    assert!(msg.contains("--scope data-loss"), "{msg}");
+    assert!(!msg.contains("--scope reverse-migration"), "{msg}");
+}
+
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// The process-wide log buffer. A global subscriber, installed once, because
+/// a thread-local default can lose to callsite-interest caching when other
+/// tests in the binary hit the same callsites first.
+fn audit_log() -> &'static LogBuf {
+    static LOG: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        let buf = LogBuf::default();
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        buf
+    })
+}
+
+#[tokio::test]
+async fn accepted_audit_event_names_the_scope_the_token_verified_under() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    let buf = audit_log();
+    for (scope, expect) in [
+        (
+            ApprovalScope::ReverseMigration,
+            "scope=\"reverse_migration\"",
+        ),
+        (ApprovalScope::DataLoss, "scope=\"data_loss\""),
+    ] {
+        let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+        contaminate(&state, &adapter).await;
+        // A timestamp no other test uses (they mint at now_secs()), still
+        // inside the TTL: tokens are deterministic in (key, scope, commit,
+        // uid, timestamp), so another test sharing the baseline hash and the
+        // second would otherwise mint a byte-identical token.
+        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs() - 37);
+        // The audited token_prefix is the first 8 hex chars of the tag: unique
+        // to this scope's token, even if another test shares the commit hash.
+        let prefix = tok.split_once(':').unwrap().1[..8].to_string();
+        rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok), false),
+            Some(1000),
+        )
+        .await
+        .unwrap();
+        // Other tests log into the same buffer; find this run's event by it.
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| {
+                l.contains("RollbackForcedDataLoss")
+                    && l.contains(&prefix)
+                    && l.contains("reason=\"reverse_migration\"")
+            })
+            .unwrap_or_else(|| panic!("no audit event for {prefix} in: {log}"));
+        assert!(line.contains("decision=\"accepted\""), "{line}");
+        assert!(line.contains(expect), "{expect}: {line}");
+        assert!(line.contains("reason=\"reverse_migration\""), "{line}");
     }
 }
