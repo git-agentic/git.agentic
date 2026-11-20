@@ -2,17 +2,20 @@
 # Idempotent: issue any missing certs for git-agentic.{com,dev,org} and
 # swap nginx to the TLS-enabled config once they are in place.
 #
-# Lives at /usr/local/bin/finish-git-agentic-certs.sh on bergholm.net.
+# Installed on the web host as /usr/local/bin/finish-git-agentic-certs.sh.
+# Requires CERT_EMAIL (Let's Encrypt contact address) in the environment.
 # Safe to run repeatedly — it skips work that's already done.
 
 set -uo pipefail
+
+: "${CERT_EMAIL:?set CERT_EMAIL (certbot contact address)}"
 
 LOG=/var/log/git-agentic-finalize.log
 exec >>"$LOG" 2>&1
 echo
 echo "=== $(date -u +%FT%TZ) run ==="
 
-EMAIL=toni@git-agentic.com
+EMAIL=$CERT_EMAIL
 WEBROOT=/var/www/certbot
 
 issue() {
