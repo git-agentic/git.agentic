@@ -359,8 +359,9 @@ async fn main() -> anyhow::Result<()> {
     // Before anything reads or writes state: the daemon must own the repo
     // and `.agentic` (see state_dir.rs). Runs before the object store opens
     // so no state is created under a directory we then refuse.
-    // The canonical path is used from here on so the checked path cannot
-    // be redirected through a symlink afterwards.
+    // `repo` is the canonical path and is used for all state and the default
+    // socket from here on, so the checked path cannot be redirected through
+    // a symlink afterwards. `args.repo` is only the operator's spelling.
     let repo =
         agenticd::state_dir::secure_state_dir(&args.repo, args.trusted_volume_root.as_deref())?;
 
@@ -412,12 +413,16 @@ async fn main() -> anyhow::Result<()> {
     // failure, etc.) would leave a stale socket lying around and clients
     // / health checks would see ECONNREFUSED on connect instead of the
     // honest ENOENT. (Copilot review on PR #50, third pass.)
-    let socket_path = args
-        .socket
-        .clone()
-        // Built from the repo as given, not the canonical path, so a deep
-        // checkout is not pushed past the Unix socket path limit.
-        .unwrap_or_else(|| args.repo.join(".agentic").join("agenticd.sock"));
+    let socket_path = match args.socket.clone() {
+        Some(p) => p,
+        None => {
+            let p = agentic_dir.join("agenticd.sock");
+            // A deep canonical path can exceed sun_path; say how to fix it
+            // instead of failing later in bind.
+            agenticd::state_dir::check_default_socket_len(&p)?;
+            p
+        }
+    };
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket parent directory {}", parent.display()))?;

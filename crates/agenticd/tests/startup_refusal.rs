@@ -213,6 +213,21 @@ mod state_dir {
     }
 
     #[test]
+    fn long_canonical_repo_path_gets_socket_flag_hint() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("a".repeat(120));
+        let out = Command::new(agenticd_bin())
+            .arg("--repo")
+            .arg(&repo)
+            .arg("--insecure-allow-any-uid")
+            .output()
+            .expect("run agenticd");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--socket <shorter path>"), "{stderr}");
+    }
+
+    #[test]
     fn startup_removes_dangling_symlink_at_socket_path() {
         let repo = tempfile::tempdir().unwrap();
         let sock_dir = tempfile::tempdir().unwrap();

@@ -29,12 +29,12 @@ The worker runs model-driven code and is treated as adversarial. The layout belo
 
   Otherwise it creates `.agentic` at mode 0700 or tightens an existing one to 0700.
 - Group-write with the daemon's own gid is allowed on ancestors, so user-private-group checkouts under umask 002 keep working. The residual is that the worker must not share the daemon's primary group (the sidecar image uses gid 65532).
-- `--trusted-volume-root <dir>` exempts one ancestor, matched by canonical path, from the ancestor check. Use it when only agenticd mounts that directory. Kubernetes-style emptyDir roots are often world-writable, and without the flag the daemon refuses to start. It never exempts the repo itself.
+- `--trusted-volume-root <dir>` exempts one ancestor, matched by canonical path, from the ancestor check. Use it when only agenticd mounts that directory. Kubernetes-style emptyDir roots are often world-writable, and without the flag the daemon refuses to start. It skips only the write-bit checks, so the directory must still be owned by the daemon or root, and it never exempts the repo itself. Drop the flag whenever the worker mounts the state volume, even read-only.
 - The socket path lives on the shared volume, so the worker can replace or remove the socket file. Nothing other than the worker's own client should trust that path.
 - Refs, objects, the GCS cache and `schema/*.down.sql` live in `.agentic`, so the worker cannot edit them. If the worker must read the prompts that rollback restores, mount the `state` volume into the worker read-only. Do not mount it writable.
 - Credentials arrive as files from Secret Manager volumes mounted into the `agenticd` container only. This removes the argv and environment exposure. It does not isolate the secrets from the worker: all containers in one Cloud Run instance share the service identity, so the worker can fetch the same secrets or call the bucket directly. Real isolation needs a separate identity for the sidecar (ADR-0015, Proposed).
 
-**Not verified on Cloud Run.** We have not confirmed the owner and mode of an emptyDir volume root, or whether it can be mounted read-only into one container. If the root is world-writable, the daemon refuses to start unless you pass `--trusted-volume-root /state`. Pass it only because the `state` volume is mounted into the `agenticd` container alone. Test the exact deployment before relying on it.
+**Not verified on Cloud Run.** We have not confirmed the owner and mode of an emptyDir volume root, or whether it can be mounted read-only into one container. If the root is world-writable, the daemon refuses to start unless you pass `--trusted-volume-root /state`. Pass it only because the `state` volume is mounted into the `agenticd` container alone; drop it if you give the worker the read-only prompt mount. Test the exact deployment before relying on it.
 
 ## Cloud Run service definition (excerpt)
 

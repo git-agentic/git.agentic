@@ -50,7 +50,7 @@ pub fn secure_state_dir(repo: &Path, trusted_root: Option<&Path>) -> anyhow::Res
         })
         .transpose()?;
 
-    let repo_meta = std::fs::metadata(&repo).with_context(|| format!("stat {}", repo.display()))?;
+    let repo_meta = lstat_no_symlink(&repo)?;
     if repo_meta.uid() != euid {
         bail!(
             "repo directory {} is owned by uid {}, not the daemon's uid {euid}; refusing to start",
@@ -71,13 +71,10 @@ pub fn secure_state_dir(repo: &Path, trusted_root: Option<&Path>) -> anyhow::Res
     let chain: Vec<&Path> = repo.ancestors().collect();
     for pair in chain.windows(2) {
         let (child, dir) = (pair[0], pair[1]);
-        if trusted_root.as_deref() == Some(dir) {
-            continue;
-        }
-        let m = std::fs::metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
-        let child_m =
-            std::fs::metadata(child).with_context(|| format!("stat {}", child.display()))?;
-        if let Some(why) = ancestor_writable_by_others(&m, &child_m, euid, egid) {
+        let m = lstat_no_symlink(dir)?;
+        let child_m = lstat_no_symlink(child)?;
+        let trusted = trusted_root.as_deref() == Some(dir);
+        if let Some(why) = ancestor_writable_by_others(&m, &child_m, euid, egid, trusted) {
             bail!(
                 "{} {why}; another uid could replace the daemon's state, refusing to start \
                  (if only agenticd mounts this directory, pass --trusted-volume-root)",
@@ -126,10 +123,28 @@ pub fn secure_state_dir(repo: &Path, trusted_root: Option<&Path>) -> anyhow::Res
     Ok(repo)
 }
 
+/// `symlink_metadata` that refuses a symlink. After canonicalize no
+/// component of the repo path can be one, so a symlink means it was swapped
+/// since, and following it would check the wrong directory. The entry's own
+/// uid and mode are what matter, never its target's.
+#[cfg(unix)]
+fn lstat_no_symlink(p: &Path) -> anyhow::Result<std::fs::Metadata> {
+    use anyhow::Context;
+    let m = std::fs::symlink_metadata(p).with_context(|| format!("stat {}", p.display()))?;
+    anyhow::ensure!(
+        !m.file_type().is_symlink(),
+        "{} is a symlink in the resolved repo path; refusing to start",
+        p.display()
+    );
+    Ok(m)
+}
+
 /// Whether a principal other than the daemon (and root) could add, remove
 /// or rename `child` through this strict ancestor, with a reason if so.
 ///
 /// - Owned by neither the daemon nor root: the owner can chmod and write.
+///   This applies even to a `trusted` ancestor (`--trusted-volume-root`),
+///   which skips only the checks below.
 /// - Sticky: exempt from the group and other write checks, because a
 ///   sticky directory (a root-owned `/tmp`) only lets an entry's owner
 ///   rename or remove it. That holds only if `child` is owned by the daemon
@@ -145,11 +160,14 @@ fn ancestor_writable_by_others(
     child: &std::fs::Metadata,
     euid: u32,
     egid: u32,
+    trusted: bool,
 ) -> Option<&'static str> {
     use std::os::unix::fs::MetadataExt;
     let mode = m.mode();
     if m.uid() != euid && m.uid() != 0 {
         Some("is owned by another uid")
+    } else if trusted {
+        None
     } else if mode & 0o1000 != 0 {
         (child.uid() != euid && child.uid() != 0)
             .then_some("is sticky but its child on the path to the repo is owned by another uid")
@@ -162,6 +180,31 @@ fn ancestor_writable_by_others(
     }
 }
 
+/// Refuse a default socket path that `bind` would reject for length
+/// (`sun_path` is 104 bytes on macOS, 108 on Linux, and must leave room for
+/// the NUL), with an error that says what to do about it.
+#[cfg(unix)]
+pub fn check_default_socket_len(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: sockaddr_un is plain data; all-zero is a valid value.
+    let limit = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len();
+    let len = path.as_os_str().as_bytes().len();
+    anyhow::ensure!(
+        len < limit,
+        "default socket path {} is {len} bytes, over the {} byte limit; pass --socket <shorter path>",
+        path.display(),
+        limit - 1
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn check_default_socket_len(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(unix))]
 pub fn secure_state_dir(repo: &Path, _trusted_root: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(repo.to_path_buf())
@@ -170,7 +213,7 @@ pub fn secure_state_dir(repo: &Path, _trusted_root: Option<&Path>) -> anyhow::Re
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn set_mode(p: &Path, mode: u32) {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -271,6 +314,50 @@ mod tests {
             let _ = std::os::unix::fs::chown(&outer, None, Some(other));
         }
         secure_state_dir(&repo, None).unwrap();
+    }
+
+    #[test]
+    fn long_default_socket_path_gets_actionable_error() {
+        let t = tempfile::tempdir().unwrap();
+        let repo = secure_state_dir(&t.path().join("a".repeat(120)), None).unwrap();
+        let sock = repo.join(".agentic").join("agenticd.sock");
+        let err = check_default_socket_len(&sock).unwrap_err().to_string();
+        assert!(err.contains("--socket <shorter path>"), "{err}");
+        assert!(check_default_socket_len(Path::new("/tmp/x.sock")).is_ok());
+    }
+
+    #[test]
+    fn chain_entries_that_are_symlinks_are_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = lstat_no_symlink(&link).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(lstat_no_symlink(&real).is_ok());
+        // A symlinked repo path is fine: it is resolved before the checks.
+        let repo = secure_state_dir(&link.join("repo"), None).unwrap();
+        assert!(repo.starts_with(std::fs::canonicalize(&real).unwrap()));
+    }
+
+    #[test]
+    fn trusted_flag_skips_write_bits_but_not_ownership() {
+        let (_t, outer, repo) = nested(0o777);
+        let m = std::fs::symlink_metadata(&outer).unwrap();
+        let child = std::fs::symlink_metadata(repo.parent().unwrap()).unwrap();
+        // SAFETY: getegid cannot fail.
+        let (uid, egid) = (m.uid(), unsafe { libc::getegid() });
+        assert!(ancestor_writable_by_others(&m, &child, uid, egid, false).is_some());
+        assert!(ancestor_writable_by_others(&m, &child, uid, egid, true).is_none());
+        if uid != 0 {
+            // A daemon whose euid is neither the owner nor root.
+            let other = uid + 1;
+            assert_eq!(
+                ancestor_writable_by_others(&m, &child, other, egid, true),
+                Some("is owned by another uid")
+            );
+        }
     }
 
     #[test]
