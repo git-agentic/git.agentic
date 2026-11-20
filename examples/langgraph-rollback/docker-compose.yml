@@ -18,7 +18,7 @@ services:
       POSTGRES_PASSWORD: agentic
       POSTGRES_DB: agentic
     ports:
-      - "54322:5432"
+      - "127.0.0.1:54322:5432"
     command:
       - "postgres"
       - "-c"
