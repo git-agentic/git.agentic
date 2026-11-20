@@ -156,11 +156,18 @@ fn audit_forced_data_loss(
 /// before any object-store or Postgres work and before the dry-run branch,
 /// so a rejected request has zero side effects. Emits exactly one audit
 /// event and returns `Ok(())` only when a valid token is present.
+///
+/// A token is single-use for non-dry-run rollbacks: the decoded HMAC tag is
+/// recorded in `state.used_approval_tokens` and a second use is rejected as
+/// `Replayed`. Dry runs verify but do not consume. The ledger is per
+/// process, so a daemon restart or a second instance accepts the token
+/// again until its time window closes.
 fn approval_gate(
     state: &DaemonState,
     target_hash: &Hash,
     peer_uid: Option<u32>,
     approval_token: Option<&str>,
+    dry_run: bool,
 ) -> Result<(), ApprovalError> {
     let commit_hash = target_hash.to_hex(); // lowercase 64-hex (Decision 2)
     let reject = |err: ApprovalError| -> ApprovalError {
@@ -183,8 +190,25 @@ fn approval_gate(
         return Err(reject(ApprovalError::TokenRequired));
     };
     // (d) Verify.
-    if let Err(rej) = verify_token(key, &commit_hash, uid, token, now_unix_seconds()) {
-        return Err(reject(ApprovalError::Rejected(rej)));
+    let now = now_unix_seconds();
+    let verified = match verify_token(key, &commit_hash, uid, token, now) {
+        Ok(v) => v,
+        Err(rej) => return Err(reject(ApprovalError::Rejected(rej))),
+    };
+    if !dry_run {
+        // Check-and-insert, plus pruning, under one lock acquisition so two
+        // concurrent requests can't both consume the same tag. A poisoned
+        // lock still holds a consistent map (no panic-prone code runs while
+        // it is held), so recover it rather than failing the gate open.
+        let mut used = state
+            .used_approval_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        used.retain(|_, expiry| *expiry >= now);
+        if used.insert(verified.tag, verified.expires_at()).is_some() {
+            drop(used);
+            return Err(reject(ApprovalError::Rejected(ApprovalRejection::Replayed)));
+        }
     }
     // (e) Valid — audit the accepted path too.
     audit_forced_data_loss(peer_uid, &commit_hash, "accepted", approval_token);
@@ -224,6 +248,7 @@ pub async fn execute(
             &target_hash,
             peer_uid,
             args.approval_token.as_deref(),
+            args.dry_run,
         )
         .map_err(anyhow::Error::new)?;
     }

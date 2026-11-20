@@ -22,7 +22,7 @@ The threat model recommends an out-of-band approval mechanism. This ADR specifie
 The constraints:
 
 - **No long-lived secrets in the worker.** The worker is the adversarial party for TM-002. Any approval credential that lives in the worker's process state, env, or filesystem is bypassable by definition.
-- **No persistent server-side approval store.** The daemon already has `commit_lock` as its serialization primitive; adding a separate approval-state table or in-memory store complicates the failure model. Approval should be self-contained per request.
+- **No persistent server-side approval store.** The daemon already has `commit_lock` as its serialization primitive; adding a persistent approval-state table complicates the failure model. Approval should be self-contained per request. (Amended 2026-11-20: a small in-memory, per-process single-use ledger is kept; see the amendment at the end.)
 - **Fail-closed default.** A daemon without an approval mechanism configured must reject `accept_data_loss=true` outright — not allow it for ergonomics, not silently ignore the flag, not log a warning and proceed.
 - **Compatible with the ADR-0004 sidecar shape.** The approval must be issuable by an out-of-band actor (the operator, a side-channel signer, a future KMS) and verifiable by the daemon without contacting that actor at verification time.
 - **Backwards-compatible wire schema.** Same constraint as ADR-0012: `Request::Rollback` extends, does not break.
@@ -32,8 +32,8 @@ The constraints:
 | # | Decision | One-line rationale |
 |---|---|---|
 | 1 | **`Request::Rollback` grows `approval_token: Option<String>`.** When `accept_data_loss == true`, the request is rejected unless `approval_token` is present AND verifies. | Additive wire change; the gate lives on the request itself so the daemon can decide at handler time without consulting external state. |
-| 2 | **Approval tokens are HMAC-SHA256 over `(commit_hash, requesting_peer_uid, timestamp)` with a key held by an out-of-band approver.** The daemon verifies; it does not generate. | Self-contained, stateless verification. Operator holds the key; worker cannot forge. The signed payload is the minimum needed to scope the approval to one specific destructive operation. |
-| 3 | **Tokens are short-lived (≤ 5 minutes from `timestamp` to verification).** No replay store needed — the window is the only replay defense. | Stateless replay prevention. The 5-minute window matches the operator's coordination loop (run rollback, see audit event, move on) and is short enough that a leaked token's blast radius is bounded. |
+| 2 | **Approval tokens are HMAC-SHA256 over `(commit_hash, requesting_peer_uid, timestamp)` with a key held by an out-of-band approver.** The daemon verifies; it does not generate. | Self-contained verification that needs no contact with the approver. Operator holds the key; worker cannot forge. The signed payload is the minimum needed to scope the approval to one specific destructive operation. |
+| 3 | **Tokens are short-lived (≤ 5 minutes from `timestamp` to verification).** The window bounds replay; the amendment at the end adds a per-process single-use ledger on top. | Time-bound replay prevention. The 5-minute window matches the operator's coordination loop (run rollback, see audit event, move on) and is short enough that a leaked token's blast radius is bounded. |
 | 4 | **Without an approval-key file configured (`--approval-key-file <path>`), `accept_data_loss = true` is always rejected. Fail-closed.** | The escape hatch from ADR-0012 (`--insecure-allow-any-uid`) is per-deployment ergonomic; there is no equivalent for TM-002. Destructive operations require explicit operator configuration, full stop. |
 | 5 | **Every `accept_data_loss = true` attempt emits a structured `RollbackForcedDataLoss` audit event regardless of outcome.** Includes `peer_uid`, `target_commit_hash`, decision (`accepted` / `rejected_no_token` / `rejected_expired` / `rejected_invalid_signature`), and a redacted token prefix for forensics. | The audit primitive a sidecar operator monitors and an after-the-fact forensics consumer reads. Rejection paths emit too so an attacker cannot probe for the gate's existence silently. |
 | 6 | **HMAC key distribution is operator-managed in v1.0.** The daemon reads it from `--approval-key-file <path>` at startup; rotation is operator-driven (restart the daemon with a new key file). | KMS-backed signing is the v1.1 conversation. The v1.0 shape needs to ship before 2026-05-26 and a file-on-disk key is the simplest contract that closes TM-002. |
@@ -89,7 +89,7 @@ At verification time the daemon computes `abs(now_unix - token_timestamp)`. If t
 
 The window is symmetric (covers both stale tokens and clock-skewed-future tokens) so a daemon with a slightly slow clock does not accept arbitrarily-future tokens.
 
-No persistent anti-replay store is needed. Within the 5-minute window a token can be replayed — but only against its bound `(commit_hash, peer_uid)` tuple, and operators in production should treat the window as the "if you sign it, run it immediately" contract. A token that's been used once and leaked still has a bounded blast radius (the same commit + the same UID, within 5 minutes).
+No persistent anti-replay store is needed. As originally accepted, a token could be replayed within the 5-minute window against its bound `(commit_hash, peer_uid)` tuple. The 2026-11-20 amendment at the end of this ADR supersedes that: a token now authorizes at most one non-dry-run destructive rollback per daemon process, tracked in an in-memory ledger. The ledger does not survive a restart and is not shared between instances, so a restarted or second daemon accepts the token again until the window closes. Operators should still treat the window as the "if you sign it, run it immediately" contract.
 
 The 5-minute window is a constant in v1.0: `const APPROVAL_TOKEN_TTL_SECONDS: u64 = 300;` in `agentic-core/src/approval.rs`. If real operator coordination loops force a wider window, that's a v1.1 conversation.
 
@@ -121,7 +121,8 @@ struct RollbackForcedDataLoss {
     peer_uid: u32,           // From the connection's SO_PEERCRED
     target_commit_hash: String,
     decision: &'static str,  // accepted, rejected_no_token, rejected_no_key_configured,
-                             // rejected_expired, rejected_invalid_signature, rejected_malformed
+                             // rejected_expired, rejected_invalid_signature, rejected_malformed,
+                             // rejected_replayed (amendment 2026-11-20)
     token_prefix: Option<String>,  // First 8 chars of the token, redacted hex for forensics
                                    // None when no token was supplied
     audit_event_version: u32,      // 1, for forward compat
@@ -138,7 +139,7 @@ The `token_prefix` (first 8 hex chars of the supplied token) is included in reje
 
 ### Decision 6 — Operator-managed key in v1.0; KMS in v1.1
 
-The key is read once at daemon startup from `--approval-key-file <path>`. The file contains exactly 32 bytes (256 bits) — any deviation aborts daemon startup. The file is read with `tokio::fs::read` (not memory-mapped) so the bytes can be zeroized in `Drop` on shutdown.
+The key is read once at daemon startup from `--approval-key-file <path>`. The file contains exactly 32 bytes (256 bits). A non-empty file of any other length aborts daemon startup; a missing, unreadable or empty file disables destructive rollback instead (Decision 4). The file is read once at startup with `std::fs` (not memory-mapped) into an `ApprovalKey`, which is zeroized on drop; the temporary read buffer is not zeroized.
 
 Rotation is operator-driven: stop the daemon, write a new key file, restart. There is no in-process rotation in v1.0 — the operational complexity isn't worth the small reduction in key-lifetime risk for a sidecar that restarts on every Cloud Run instance boot anyway.
 
@@ -158,7 +159,7 @@ This prints a token to stdout that the operator hands to the worker (or pastes i
 
 - TM-002 closes. The worker cannot forge an approval token because it does not hold the key. An operator who has access to the key must explicitly sign each destructive operation, bounded to that specific commit + that specific peer UID within a 5-minute window.
 - The audit event gives operators a continuous detection primitive. A spike in `RollbackForcedDataLoss { decision: "rejected_*" }` events is the signal that something is probing the gate or that a worker is misconfigured.
-- Stateless verification keeps the daemon's failure model simple. No new persistence layer, no new lock ordering, no new race conditions.
+- Verification needs no contact with the approver and no persistence layer. The only daemon state is the in-memory single-use ledger from the amendment, guarded by one mutex that is never held across other locks or I/O.
 - The contract is durable: the HMAC-domain prefix lets us add other signed-message formats on the same key in the future without ambiguity.
 - The ADR composes cleanly with ADR-0012. The `peer_uid` from the connection feeds the signed payload directly; the two ADRs together produce "who is connecting" + "what operations they are authorized for", which is the v1.0 authorization model.
 
@@ -176,3 +177,13 @@ This prints a token to stdout that the operator hands to the worker (or pastes i
 - The HMAC-domain string `"git.agentic/rollback-approval/v1"` is versioned. A future signed-message format using the same key MUST use a different domain string. Drift here is silent and dangerous; the convention belongs in CONTRIBUTING.md or a domain-strings registry doc when the second signed format appears.
 
 See also: [`docs/superpowers/specs/2026-05-21-pre-public-hardening-sprint-design.md`](../superpowers/specs/2026-05-21-pre-public-hardening-sprint-design.md) §"ADR-0014" (the sprint design that frames this ADR), `git.agentic-threat-model.md` TM-002 (the row this ADR closes), [ADR-0012](./0012-socket-peer-authentication.md) (the peer-UID source feeding the signed payload).
+
+## Amendment (2026-11-20): key-file mode check and single-use tokens
+
+Status is unchanged. Two hardening changes refine Decisions 3, 4 and 5.
+
+**Key-file mode check (refines Decision 4).** On unix, `agenticd` reads the mode from the opened key-file handle (`fstat`, not a separate path stat). If any group or other bit is set (`mode & 0o077 != 0`), startup aborts with an error naming the path and telling the operator to `chmod 600` it. This is a misconfiguration abort, like a wrong-length key, and is distinct from Decision 4's fail-closed case: a missing, unreadable or empty key file still lets the daemon run with destructive rollback disabled. Anyone who can read the key can mint tokens, so a key readable beyond its owner is not accepted. The check runs after the read and empty checks, so an unreadable or empty file is still fail-closed whatever its mode. The check only stops readers running under other uids: a process sharing the daemon's uid (such as a sibling worker in the sidecar shape, see the threat model's attacker capabilities) can still read a 0600 key. Non-unix platforms are unchanged. Operators creating the demo key file should `chmod 600` it.
+
+**Single-use tokens (refines Decision 3).** A token now authorizes at most one non-dry-run destructive rollback. The daemon keeps an in-memory ledger keyed by the decoded 32-byte HMAC tag, not the token string, because hex decoding is case-insensitive and the timestamp parse accepts a leading `+` and leading zeros, so one token has many spellings. Each entry expires at `token_timestamp + 300s`: the validity window is symmetric, so a future-dated token verifies until its timestamp plus the TTL. The check, insert and pruning of expired entries happen under one lock. A second use is rejected with audit decision `rejected_replayed`, wire code `approval_token_replayed`. Dry runs verify the token but do not consume it, so an operator can preview and then execute with the same token.
+
+Limits: the ledger is per process. A daemon restart, or a second daemon instance sharing the same key, accepts the token again until its time window closes. A token is also consumed when the gate passes even if the rollback then fails later, so the operator signs a fresh one for the retry.

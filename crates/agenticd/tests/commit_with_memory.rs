@@ -122,6 +122,7 @@ async fn commit_with_memory_persists_manifest_via_put_raw() {
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        used_approval_tokens: Default::default(),
         limits: agenticd::limits::LimitsConfig::default(),
         rate: agenticd::limits::RateLimiter::new(
             agenticd::limits::LimitsConfig::default().rate_per_uid,

@@ -51,6 +51,7 @@ pub fn map_anyhow_to_response_error(err: anyhow::Error) -> Response {
             A::Rejected(R::Malformed) => "approval_token_malformed",
             A::Rejected(R::Expired { .. }) => "approval_token_expired",
             A::Rejected(R::InvalidSignature) => "approval_token_invalid_signature",
+            A::Rejected(R::Replayed) => "approval_token_replayed",
         };
         return Response::validation(code, message);
     }
@@ -310,6 +311,10 @@ mod tests {
             (
                 anyhow::Error::new(ApprovalError::Rejected(ApprovalRejection::InvalidSignature)),
                 "approval_token_invalid_signature",
+            ),
+            (
+                anyhow::Error::new(ApprovalError::Rejected(ApprovalRejection::Replayed)),
+                "approval_token_replayed",
             ),
         ];
         for (err, expected_code) in cases {

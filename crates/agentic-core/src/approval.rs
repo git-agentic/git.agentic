@@ -27,8 +27,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// Symmetric-token time-to-live, in seconds (Decision 3). The window is
 /// symmetric — a token is rejected if `|now - timestamp|` exceeds it — so
 /// a slightly fast/slow daemon clock can't accept arbitrarily-future
-/// tokens. It is the *only* replay defense; there is no persistent
-/// anti-replay store.
+/// tokens. It bounds how long a token is accepted; the daemon adds a
+/// per-process single-use set on top (see `VerifiedToken`).
 pub const APPROVAL_TOKEN_TTL_SECONDS: u64 = 300;
 
 /// HMAC domain-separation string. A future signed-message format using
@@ -88,6 +88,8 @@ pub enum ApprovalRejection {
     Expired { ttl: u64 },
     #[error("approval token signature does not verify")]
     InvalidSignature,
+    #[error("approval token was already used for a destructive rollback")]
+    Replayed,
 }
 
 impl ApprovalRejection {
@@ -97,6 +99,7 @@ impl ApprovalRejection {
             ApprovalRejection::Malformed => "rejected_malformed",
             ApprovalRejection::Expired { .. } => "rejected_expired",
             ApprovalRejection::InvalidSignature => "rejected_invalid_signature",
+            ApprovalRejection::Replayed => "rejected_replayed",
         }
     }
 }
@@ -129,6 +132,25 @@ pub fn generate_token(key: &ApprovalKey, commit_hash: &str, peer_uid: u32, now: 
     format!("{now}:{}", hex::encode(mac))
 }
 
+/// A token that passed `verify_token`. `tag` is the decoded 32-byte HMAC,
+/// the canonical identity of the token: the wire string is not canonical
+/// (hex decoding is case-insensitive and the timestamp parse accepts a
+/// leading `+` and leading zeros), so replay tracking must key on `tag`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedToken {
+    pub timestamp: u64,
+    pub tag: [u8; 32],
+}
+
+impl VerifiedToken {
+    /// Unix second after which the token fails the time window for every
+    /// possible `now`. Symmetric window, so a future-dated token verifies
+    /// until `timestamp + TTL`, not `issue time + TTL`.
+    pub fn expires_at(&self) -> u64 {
+        self.timestamp.saturating_add(APPROVAL_TOKEN_TTL_SECONDS)
+    }
+}
+
 /// Verify a token against the expected `(commit_hash, peer_uid)` at time
 /// `now`. The comparison is constant-time: the supplied hex tag is decoded
 /// and checked with `Mac::verify_slice`, never a short-circuiting string
@@ -142,15 +164,16 @@ pub fn verify_token(
     peer_uid: u32,
     token: &str,
     now: u64,
-) -> Result<(), ApprovalRejection> {
+) -> Result<VerifiedToken, ApprovalRejection> {
     let (ts_str, hex_tag) = token.split_once(':').ok_or(ApprovalRejection::Malformed)?;
     let timestamp: u64 = ts_str.parse().map_err(|_| ApprovalRejection::Malformed)?;
     let provided_tag = hex::decode(hex_tag).map_err(|_| ApprovalRejection::Malformed)?;
     // An HMAC-SHA256 tag is exactly 32 bytes; anything else (empty, short,
     // long) is structurally malformed, not a mis-signed token.
-    if provided_tag.len() != 32 {
-        return Err(ApprovalRejection::Malformed);
-    }
+    let tag: [u8; 32] = provided_tag
+        .as_slice()
+        .try_into()
+        .map_err(|_| ApprovalRejection::Malformed)?;
 
     // Time-bound check before the cryptographic one. Symmetric window so a
     // skewed-future token is also rejected. Saturating so neither side
@@ -168,8 +191,9 @@ pub fn verify_token(
     let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
     mac.update(&signing_input(&commit_hash, peer_uid, timestamp));
     // Constant-time comparison of the decoded tag bytes.
-    mac.verify_slice(&provided_tag)
-        .map_err(|_| ApprovalRejection::InvalidSignature)
+    mac.verify_slice(&tag)
+        .map_err(|_| ApprovalRejection::InvalidSignature)?;
+    Ok(VerifiedToken { timestamp, tag })
 }
 
 #[cfg(test)]
@@ -312,5 +336,32 @@ mod tests {
             ApprovalRejection::InvalidSignature.audit_decision(),
             "rejected_invalid_signature"
         );
+        assert_eq!(
+            ApprovalRejection::Replayed.audit_decision(),
+            "rejected_replayed"
+        );
+    }
+
+    #[test]
+    fn verified_token_exposes_canonical_tag_across_wire_variants() {
+        let hash = "a".repeat(64);
+        let tok = generate_token(&key(), &hash, 1, 100);
+        let (ts, hex_tag) = tok.split_once(':').unwrap();
+        let canonical = verify_token(&key(), &hash, 1, &tok, 100).unwrap();
+        assert_eq!(canonical.timestamp, 100);
+        assert_eq!(canonical.expires_at(), 100 + APPROVAL_TOKEN_TTL_SECONDS);
+        // Uppercase hex, `+`-prefixed and zero-padded timestamps all verify
+        // to the same tag.
+        for variant in [
+            format!("{ts}:{}", hex_tag.to_ascii_uppercase()),
+            format!("+{ts}:{hex_tag}"),
+            format!("000{ts}:{hex_tag}"),
+        ] {
+            assert_eq!(
+                verify_token(&key(), &hash, 1, &variant, 100),
+                Ok(canonical.clone()),
+                "variant {variant:?}"
+            );
+        }
     }
 }

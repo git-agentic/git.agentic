@@ -74,6 +74,7 @@ async fn rollback_reverses_schema_and_restores_memory_in_memory_backend() {
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        used_approval_tokens: Default::default(),
         limits: agenticd::limits::LimitsConfig::default(),
         rate: agenticd::limits::RateLimiter::new(
             agenticd::limits::LimitsConfig::default().rate_per_uid,
@@ -209,6 +210,7 @@ async fn setup_gate_state(
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        used_approval_tokens: Default::default(),
         limits: agenticd::limits::LimitsConfig::default(),
         rate: agenticd::limits::RateLimiter::new(
             agenticd::limits::LimitsConfig::default().rate_per_uid,
@@ -448,6 +450,142 @@ async fn gate_accepts_valid_token_and_rollback_proceeds() {
     );
 }
 
+fn is_replayed(err: &anyhow::Error) -> bool {
+    matches!(
+        downcast_approval(err),
+        ApprovalError::Rejected(agentic_core::approval::ApprovalRejection::Replayed)
+    )
+}
+
+/// Non-dry-run destructive args whose `repo` is the real daemon repo, for
+/// tests where the rollback must actually execute.
+fn real_args(state: &DaemonState, target: &str, token: Option<String>) -> RollbackArgs {
+    RollbackArgs {
+        repo: state.repo_root.clone(),
+        ..destructive_args(target, token)
+    }
+}
+
+fn dry_run_args(state: &DaemonState, target: &str, token: String) -> RollbackArgs {
+    RollbackArgs {
+        target: target.to_string(),
+        dry_run: true,
+        accept_data_loss: true,
+        approval_token: Some(token),
+        repo: state.repo_root.clone(),
+    }
+}
+
+#[tokio::test]
+async fn gate_token_is_single_use_for_destructive_rollback() {
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    let first = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok.clone())),
+        Some(1000),
+    )
+    .await
+    .expect("first use of a valid token succeeds");
+    assert!(first.executed);
+
+    let tip = state.refs.read_branch("main").unwrap();
+    let err = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok)),
+        Some(1000),
+    )
+    .await
+    .expect_err("second use of the same token must be rejected");
+    assert!(is_replayed(&err), "got: {err:#}");
+    assert_no_side_effects(&state, tip).await;
+}
+
+#[tokio::test]
+async fn gate_dry_run_verifies_but_does_not_consume_token() {
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    // Several dry runs first: none consume.
+    for _ in 0..2 {
+        let out = rollback::execute(
+            Arc::clone(&state),
+            dry_run_args(&state, &baseline, tok.clone()),
+            Some(1000),
+        )
+        .await
+        .expect("dry run with a valid token succeeds");
+        assert!(!out.executed);
+    }
+    let out = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok.clone())),
+        Some(1000),
+    )
+    .await
+    .expect("real run after dry runs still succeeds once");
+    assert!(out.executed);
+    let err = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok)),
+        Some(1000),
+    )
+    .await
+    .expect_err("second real run is a replay");
+    assert!(is_replayed(&err), "got: {err:#}");
+}
+
+#[tokio::test]
+async fn gate_replay_detected_across_token_encodings() {
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    let ts = now_secs();
+    let tok = generate_token(&test_key(), &baseline, 1000, ts);
+    let hex_tag = tok.split_once(':').unwrap().1.to_string();
+    rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok)),
+        Some(1000),
+    )
+    .await
+    .expect("canonical token succeeds once");
+
+    // Same tag, different wire spelling: still the same token.
+    for variant in [
+        format!("{ts}:{}", hex_tag.to_ascii_uppercase()),
+        format!("+{ts}:{hex_tag}"),
+        format!("000{ts}:{hex_tag}"),
+    ] {
+        let err = rollback::execute(
+            Arc::clone(&state),
+            real_args(&state, &baseline, Some(variant.clone())),
+            Some(1000),
+        )
+        .await
+        .expect_err("re-encoded token must still be a replay");
+        assert!(is_replayed(&err), "variant {variant:?}: {err:#}");
+    }
+}
+
+#[tokio::test]
+async fn gate_prunes_expired_ledger_entries() {
+    let (state, _adapter, baseline, _dir) = setup_gate_state(true).await;
+    state
+        .used_approval_tokens
+        .lock()
+        .unwrap()
+        .insert([9u8; 32], now_secs() - 1);
+    let tok = generate_token(&test_key(), &baseline, 1000, now_secs());
+    rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(tok)),
+        Some(1000),
+    )
+    .await
+    .expect("valid token succeeds");
+    let used = state.used_approval_tokens.lock().unwrap();
+    assert_eq!(used.len(), 1, "stale entry pruned, new entry recorded");
+    assert!(!used.contains_key(&[9u8; 32]));
+}
+
 // ADR-0017: rollback forward-records by re-staging the target commit's
 // prompt blobs. A baseline containing a high-entropy checkpoint blob
 // under an exempt prefix must therefore roll back cleanly — without the
@@ -477,6 +615,7 @@ async fn rollback_restages_exempt_checkpoint_blob() {
             .unwrap(),
         peer_auth: Arc::new(agenticd::peer_auth::PeerAuthPolicy::InsecureAllowAny),
         approval_key: None,
+        used_approval_tokens: Default::default(),
         limits: agenticd::limits::LimitsConfig::default(),
         rate: agenticd::limits::RateLimiter::new(
             agenticd::limits::LimitsConfig::default().rate_per_uid,

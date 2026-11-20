@@ -72,6 +72,12 @@ pub struct DaemonState {
     /// (Decision 4). Set at startup from `--approval-key-file` via
     /// [`DaemonState::with_approval_key`].
     pub approval_key: Option<agentic_core::approval::ApprovalKey>,
+    /// Single-use ledger for approval tokens (ADR-0014 amendment): decoded
+    /// HMAC tag -> expiry (`token_timestamp + TTL`, unix seconds). A token
+    /// authorizes at most one non-dry-run destructive rollback per daemon
+    /// process; this is in-memory only, so a restart or a second daemon
+    /// instance accepts the token again until it expires.
+    pub used_approval_tokens: std::sync::Mutex<std::collections::HashMap<[u8; 32], u64>>,
     /// Static limits in force (issue #118). Set at startup via
     /// [`DaemonState::with_limits`]; defaults are spec values.
     pub limits: crate::limits::LimitsConfig,
@@ -154,6 +160,7 @@ impl DaemonState {
             http,
             peer_auth,
             approval_key: None,
+            used_approval_tokens: Default::default(),
             limits: crate::limits::LimitsConfig::default(),
             rate: crate::limits::RateLimiter::new(
                 crate::limits::LimitsConfig::default().rate_per_uid,
