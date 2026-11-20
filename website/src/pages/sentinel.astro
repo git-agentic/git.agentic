@@ -76,7 +76,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
     </Panel>
   </Section>
 
-  <Section id="features" title="Features" note="Sentinel audits each tarball before it installs, and runs lifecycle scripts in a capability sandbox.">
+  <Section id="features" title="Features" note="Sentinel audits each tarball before it installs. In enforced runs, lifecycle scripts execute in a capability sandbox.">
     <div class="grid-2">
       <div class="card feature feature--wide">
         <div class="badges"><Badge kind="prod" /></div>
@@ -84,10 +84,11 @@ $ sentinel audit is-odd 3.0.1</code></pre>
         <p>
           The proxy resolves and serves real npm packages unchanged. It
           intercepts every tarball, scores it and returns the verdict in
-          response headers. Under the <code>block</code> policy a tarball
-          with a block verdict gets a 403. Under <code>observe</code>, the
-          default, the proxy reports the verdict and still serves the
-          tarball.
+          response headers. For a tarball that has not been retracted,
+          the <code>block</code> policy answers a block verdict with a 403,
+          and <code>observe</code>, the default, reports the verdict and
+          still serves the tarball. A retracted tarball gets a 410 in either
+          mode.
         </p>
         <p>
           Codento Engine runs this proxy in its build stack in observe mode.
@@ -105,7 +106,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
       </div>
       <div class="card feature">
         <h3>Deny-by-default sandbox</h3>
-        <p>In runs that Sentinel enforces, lifecycle scripts get no network, no credential environment variables and no writes outside a fixed floor unless a capability is approved. It uses macOS Seatbelt or Linux bubblewrap.</p>
+        <p>In an enforced run, lifecycle scripts get by default no network, no credential environment variables and no writes outside a fixed floor. Approved capabilities can relax each default. It uses macOS Seatbelt or Linux bubblewrap.</p>
       </div>
       <div class="card feature">
         <h3>Audit-gated publish</h3>
@@ -177,9 +178,11 @@ $ sentinel audit is-odd 3.0.1
           The audit engine starts at 100 and subtracts a weighted penalty
           per finding. Under the default scoring policy an unwaived critical
           finding produces a block verdict. The verdict is separate from
-          HTTP enforcement: under <code>block</code> the proxy answers a
-          block verdict with a 403, and under <code>observe</code> it
-          reports the verdict and still serves the tarball. An LLM adapter
+          HTTP enforcement. For a scoring verdict on a tarball that has not
+          been retracted, the proxy answers a block verdict with a 403 under
+          <code>block</code>, and under <code>observe</code> it reports the
+          verdict and still serves the tarball. A retracted tarball gets a
+          410 in either mode. An LLM adapter
           can add context to a verdict. It never changes the score.
         </dd>
       </div>
@@ -196,17 +199,19 @@ $ sentinel audit is-odd 3.0.1
       <div>
         <dt>Sandbox</dt>
         <dd>
-          The sandbox covers only runs that Sentinel starts:
-          <code>sentinel run-scripts</code>, an enforced
-          <code>sentinel install</code> and <code>sentinel exec</code>. A
-          plain <code>npm install</code> or <code>npx</code> outside those
-          commands is not contained. Inside the sandbox, lifecycle scripts
-          get no network, no credential environment variables and no writes
-          outside a fixed floor. <code>$HOME</code> reads are denied by
-          default, except what a script needs: system paths, the Node
-          install prefix, the project root and the build caches. Each denial
-          is lifted only by an approved capability. On macOS, executing a
-          binary outside an approved floor is denied. On Linux that
+          The sandbox covers only enforced runs:
+          <code>sentinel run-scripts</code>,
+          <code>sentinel install --enforce</code> and
+          <code>sentinel exec</code>. <code>sentinel install</code> without
+          <code>--enforce</code> only routes npm through the proxy, and a
+          plain <code>npm install</code> or <code>npx</code> is not
+          contained either. In an enforced run the defaults are no network,
+          no credential environment variables, no writes outside a fixed
+          floor, and no <code>$HOME</code> reads except what a script needs:
+          system paths, the Node install prefix, the project root and the
+          build caches. Approved capabilities can relax each default. On
+          macOS, executing a binary outside an approved floor is denied by
+          default. On Linux that
           restriction needs Landlock and the compiled
           <code>landlock-exec</code> helper. Without them the run stays
           filesystem and network confined, and only the listed exfiltration
@@ -245,9 +250,11 @@ $ sentinel audit is-odd 3.0.1
           cumulative downloads. Past either limit the release cannot be
           retracted. A retracted version leaves a 410 tombstone and its
           identifier is permanently spent. A local retraction takes effect
-          at once on that installation. Other installations get the
-          retraction advisory when they load the next signed corpus release,
-          and from then on it flags a lockfile that still pins the version.
+          at once on that installation. It reaches other installations only
+          if the advisory is submitted to the steward, which accepts only
+          packages in claimed namespaces. Those installations see it when
+          they load a signed corpus that contains it, and from then on it
+          flags a lockfile that still pins the version.
         </dd>
       </div>
       <div>

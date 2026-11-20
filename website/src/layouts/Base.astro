@@ -449,6 +449,7 @@ const serializeStructuredData = (item: Record<string, unknown>) =>
           status.className = 'sr-only';
           status.setAttribute('role', 'status');
           status.setAttribute('aria-live', 'polite');
+          let resetTimer;
           button.addEventListener('click', async () => {
             const code = panel.querySelector('code').cloneNode(true);
             code.querySelectorAll('.comment').forEach((node) => node.remove());
@@ -461,7 +462,8 @@ const serializeStructuredData = (item: Record<string, unknown>) =>
             }
             button.textContent = copied ? 'Copied' : 'Copy failed';
             status.textContent = copied ? 'Commands copied to the clipboard.' : 'Copy failed. Select the commands and copy them manually.';
-            setTimeout(() => { button.textContent = 'Copy'; status.textContent = ''; }, 3000);
+            clearTimeout(resetTimer);
+            resetTimer = setTimeout(() => { button.textContent = 'Copy'; status.textContent = ''; }, 3000);
           });
           panel.querySelector('.panel__bar').append(status, button);
         });

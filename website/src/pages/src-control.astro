@@ -217,8 +217,8 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
         <dt>Provenance</dt>
         <dd>
           src-control supports Ed25519 signing of commits and verification
-          of trusted signatures with <code>sc verify</code>. The results of
-          amend, rebase and merge start unsigned. Sealed
+          of trusted signatures with <code>sc verify</code>. New commits
+          created by amend, rebase or merge start unsigned. Sealed
           agent-session transcripts attach to commits.
           Plaintext never enters the object store, and a keyless clone gets
           ciphertext only.
