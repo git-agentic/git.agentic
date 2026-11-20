@@ -26,6 +26,26 @@ use anyhow::{anyhow, Context};
 use super::loaders::{load_blob, load_tree};
 use crate::server::DaemonState;
 
+/// Check, without touching the filesystem, that [`restore_prompts`] would
+/// accept this tree: every entry name is valid and neither `<repo>/prompts`
+/// nor any existing directory above a target is a symlink. Rollback runs it
+/// before migrations or memory restore so a bad tree can't tear a rollback.
+pub(super) fn preflight_prompts(
+    state: &DaemonState,
+    repo: &Path,
+    prompts_hash: &Hash,
+) -> anyhow::Result<()> {
+    let dir = repo.join("prompts");
+    reject_symlinked_dirs(repo, &dir)?;
+    for name in load_tree(state, prompts_hash)?.entries.keys() {
+        validate_tree_entry_name(name)?;
+        if let Some(parent) = dir.join(name).parent() {
+            reject_symlinked_dirs(repo, parent)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write target prompts back to `<repo>/prompts/`. Files present on disk
 /// but not in the target tree are removed so the working set matches.
 ///
@@ -45,9 +65,11 @@ use crate::server::DaemonState;
 ///
 /// Ancestor directories get the same treatment: `<repo>/prompts` and every
 /// existing directory between it and a write target must not be a symlink
-/// ([`reject_symlinked_dirs`]), checked before and after `create_dir_all`,
-/// so a planted directory link can't redirect writes or the orphan sweep
-/// outside the prompts root.
+/// ([`reject_symlinked_dirs`]), checked before and after `create_dir_all`.
+/// This covers links that exist before the call. A concurrent swap during
+/// the call is out of scope: the daemon's state directory must not be
+/// writable by other uids (see the isolate-sidecar-state change), so no
+/// other uid can plant links under the prompts directory.
 pub(super) fn restore_prompts(
     state: &DaemonState,
     repo: &Path,
@@ -102,20 +124,37 @@ fn reject_symlinked_dirs(base: &Path, target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Marker in temp file names. Tree entry names containing it are rejected
-/// by [`validate_tree_entry_name`], so a temp name never equals an entry.
-const TMP_MARKER: &str = ".agentic-tmp-";
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TMP_ATTEMPTS: usize = 16;
 
-/// Create `tmp` with `O_EXCL` semantics (`create_new`): fails if anything,
-/// including a planted symlink, already exists there, and never follows one.
-fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)?;
-    f.write_all(bytes)
+/// Exclusively create a temp file next to `path`, named independently of
+/// the prompt name (`.agentic-tmp-<pid>-<n>`, `n` from `next`). `create_new`
+/// (`O_EXCL`) fails on anything already there, including a planted symlink,
+/// and never follows one; on `AlreadyExists` we try the next `n`, up to
+/// [`TMP_ATTEMPTS`] times. The returned path is ours alone, so callers may
+/// remove it on failure.
+fn create_temp(
+    path: &Path,
+    mut next: impl FnMut() -> u64,
+) -> anyhow::Result<(PathBuf, std::fs::File)> {
+    for _ in 0..TMP_ATTEMPTS {
+        let tmp = path.with_file_name(format!(".agentic-tmp-{}-{}", std::process::id(), next()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("creating temp file {}", tmp.display()));
+            }
+        }
+    }
+    Err(anyhow!(
+        "no free temp file name next to {} after {TMP_ATTEMPTS} attempts",
+        path.display()
+    ))
 }
 
 /// Write `bytes` to `path` safely:
@@ -136,6 +175,10 @@ fn write_new_file(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Mirrors `agentic-core::store::FsObjectStore::write_at`'s
 /// temp-then-rename pattern. (Copilot review on PR #51, second pass.)
 fn write_blob_safely(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    write_blob_with(path, bytes, || TMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn write_blob_with(path: &Path, bytes: &[u8], next: impl FnMut() -> u64) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             std::fs::remove_file(path)
@@ -152,16 +195,9 @@ fn write_blob_safely(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             });
         }
     }
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("prompt path {} has no file name", path.display()))?
-        .to_string_lossy();
-    let tmp = path.with_file_name(format!(
-        ".{file_name}{TMP_MARKER}{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = write_new_file(&tmp, bytes)
+    let (tmp, mut file) = create_temp(path, next)?;
+    // The temp is ours from here on, so it is safe to remove on failure.
+    let result = std::io::Write::write_all(&mut file, bytes)
         .with_context(|| format!("writing temp file {}", tmp.display()))
         .and_then(|()| {
             std::fs::rename(&tmp, path)
@@ -186,12 +222,6 @@ fn validate_tree_entry_name(name: &str) -> anyhow::Result<()> {
     }
     for component in Path::new(name).components() {
         match component {
-            Component::Normal(c) if c.to_string_lossy().contains(TMP_MARKER) => {
-                return Err(anyhow!(
-                    "tree entry name {:?} uses the reserved temp-file marker {TMP_MARKER:?}",
-                    name
-                ));
-            }
             Component::Normal(_) => {}
             _ => {
                 return Err(anyhow!(
@@ -457,12 +487,6 @@ mod tests {
             .is_file());
     }
 
-    #[test]
-    fn validate_rejects_reserved_temp_marker() {
-        let err = validate_tree_entry_name("dir/.a.md.agentic-tmp-1-0").unwrap_err();
-        assert!(err.to_string().contains("reserved temp-file marker"));
-    }
-
     // Build a DaemonState over a fresh object store, commit `files` as a
     // prompts tree, and return (state, tree hash, repo dir guard).
     async fn state_with_prompts(files: &[(&str, &[u8])]) -> (DaemonState, Hash, tempfile::TempDir) {
@@ -597,18 +621,54 @@ mod tests {
         assert_outside_untouched(outside.path());
     }
 
-    // O_EXCL: the temp writer refuses a pre-existing symlink instead of
-    // writing through it.
+    // O_EXCL + retry: files or symlinks already sitting at the first
+    // candidate temp names are left untouched and the write still succeeds
+    // on the next free name. A fixed counter makes the candidates known.
     #[cfg(unix)]
     #[test]
-    fn write_new_file_does_not_follow_planted_symlink() {
+    fn write_blob_safely_skips_pre_planted_temp_names() {
         let dir = tempfile::tempdir().unwrap();
         let outside = outside_dir();
-        let tmp = dir.path().join("planted");
-        std::os::unix::fs::symlink(outside.path().join("keep.txt"), &tmp).unwrap();
+        let pid = std::process::id();
+        let planted_file = dir.path().join(format!(".agentic-tmp-{pid}-0"));
+        std::fs::write(&planted_file, b"planted").unwrap();
+        let planted_link = dir.path().join(format!(".agentic-tmp-{pid}-1"));
+        std::os::unix::fs::symlink(outside.path().join("keep.txt"), &planted_link).unwrap();
 
-        let err = write_new_file(&tmp, b"evil").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let mut n = 0;
+        write_blob_with(&dir.path().join("a.md"), b"restored", || {
+            n += 1;
+            n - 1
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"restored");
+        assert_eq!(std::fs::read(&planted_file).unwrap(), b"planted");
+        assert!(std::fs::symlink_metadata(&planted_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_outside_untouched(outside.path());
+    }
+
+    #[test]
+    fn write_blob_safely_gives_up_after_bounded_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        for i in 0..TMP_ATTEMPTS {
+            std::fs::write(dir.path().join(format!(".agentic-tmp-{pid}-{i}")), b"x").unwrap();
+        }
+        let mut n = 0;
+        let err = write_blob_with(&dir.path().join("a.md"), b"y", || {
+            n += 1;
+            n - 1
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("no free temp file name"), "{err}");
+        assert!(!dir.path().join("a.md").exists());
+        // Planted files must not have been removed by the error path.
+        for i in 0..TMP_ATTEMPTS {
+            assert!(dir.path().join(format!(".agentic-tmp-{pid}-{i}")).exists());
+        }
     }
 }
