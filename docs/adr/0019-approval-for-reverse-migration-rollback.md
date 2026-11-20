@@ -28,6 +28,7 @@ The owner decided that any rollback that runs reverse migrations needs the ADR-0
 | 2 | Without an approval key, such a rollback is refused, and the error names `--approval-key-file`. | Fail closed, as ADR-0014 Decision 4. |
 | 3 | If `--approval-key-file` is not given, the daemon uses `<repo>/.agentic/approval.key` when that file exists. | The operator needs no extra flag, and the CLI and daemon share one default location. |
 | 4 | The `agentic` CLI attaches a token to rollback requests on its own when it can read the key. | The operator's commands stay the same. A socket client without the key cannot run reverse migrations. |
+| 5 | A token is bound to a scope, `DataLoss` or `ReverseMigration`, by domain-separating the signed input. The token text format is unchanged. | One token must not authorize both modes: a reverse-migration approval replayed with `accept_data_loss` would switch off the `IRREVERSIBLE` check. |
 
 ## Decisions
 
@@ -113,9 +114,12 @@ Without this rule, a forward migration that lands between the preview and the ap
 With the rule, the daemon's gate refuses that apply and the operator previews again.
 With `--yes` no plan is shown, but the CLI still sends the preview request silently, when it holds a key, to read the field.
 
-The CLI also checks who it is talking to before it sends a minted token.
-It reads the connected socket's peer uid from the kernel and sends the token only if that uid owns the key file the token came from.
-Otherwise it sends no token and warns on stderr.
+The CLI also checks who it is talking to.
+In a flow that may auto-sign, every request (resolving the target, the preview, the applied request) goes over a connection whose peer uid, read from the kernel, is the uid that owns the key file.
+If a check fails, the CLI gives up on signing: it warns on stderr and carries on without a token, and the daemon's gate refuses if one was needed.
+With `--accept-data-loss` the applied request is signed after a successful preview even if the reply omits `approval_required`, as an older daemon's would.
+The CLI skips a default key path that is a symlink, FIFO or other special file, with a warning, and the daemon treats such a default path as no key, so a special file cannot block either.
+A key named explicitly must be a regular file (the CLI fails; the daemon warns and runs without a key, as for an unreadable file).
 It reads at most 33 bytes of the key file, as the daemon does.
 
 A token passed explicitly with `--approval-token` is sent as given, on both requests, and the target is left as typed.
@@ -127,6 +131,27 @@ A token is consumed only when the gate passes on a non-dry-run request.
 
 This also lets an operator who holds the key run `--accept-data-loss` without minting a token by hand.
 The flag is still required.
+
+### Decision 5: Tokens are bound to a scope
+
+One token format now covers two modes, so a token issued for an ordinary reverse-migration rollback could be replayed with `accept_data_loss=true`.
+The daemon would then load the down migrations with the `IRREVERSIBLE` check off.
+Approval tokens therefore carry a scope.
+
+The scope is part of the signed input, not of the token text.
+The text stays `<unix_ts>:<hex_hmac>`.
+A `DataLoss` token signs exactly the ADR-0014 input, `git.agentic/rollback-approval/v1:<commit>:<uid>:<ts>`, so every token minted by an older CLI is a `DataLoss` token and keeps verifying.
+A `ReverseMigration` token signs the same fields under the domain string `git.agentic/rollback-approval/v1/reverse-migration`.
+The two domain strings differ at a fixed position before any variable field, so no commit, uid or timestamp can make the inputs equal.
+
+Verification:
+
+- An `accept_data_loss` request needs a `DataLoss` token.
+- A plain reverse-migration rollback accepts either scope, because a data-loss approval also covers the weaker action.
+- The single-use ledger keys on the decoded tag as before.
+
+The CLI mints a `DataLoss` token for `--accept-data-loss` requests and a `ReverseMigration` token otherwise.
+The `agentic rollback --approval` issuance mode keeps minting `DataLoss` tokens, which cover both.
 
 ## Consequences
 
@@ -153,6 +178,9 @@ The flag is still required.
 
 **Not covered:**
 
+- The token authorizes the target commit, not a specific migration list, because ADR-0014 binds approval to the target commit.
+  A rollback to that commit reverses whatever is above it at apply time.
+  The CLI's preview rule (Decision 4) narrows the window, but binding approval to the plan would need a token format change.
 - A rollback with no schema change still restores memory without a token.
   Per-operation authorization for the other requests, `ReadObject` among them, stays an open decision in TM-001 and TM-002.
 - The ledger is per process, as in ADR-0014.

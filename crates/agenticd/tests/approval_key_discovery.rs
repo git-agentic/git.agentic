@@ -35,8 +35,24 @@ fn write_key(repo: &std::path::Path, mode: u32) {
     std::fs::set_permissions(&key, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+fn mkfifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
 fn spawn_daemon(repo: &std::path::Path, sock: &std::path::Path) -> Child {
+    spawn_daemon_with(repo, sock, &[])
+}
+
+fn spawn_daemon_with(
+    repo: &std::path::Path,
+    sock: &std::path::Path,
+    extra: &[&std::ffi::OsStr],
+) -> Child {
     Command::new(env!("CARGO_BIN_EXE_agenticd"))
+        .args(extra)
         .arg("--repo")
         .arg(repo)
         .arg("--socket")
@@ -63,17 +79,26 @@ async fn send(sock: &std::path::Path, request: Request) -> Response {
 /// Commit once, then send `Rollback { accept_data_loss: true }` with no
 /// token. Which error comes back says whether the daemon holds a key.
 async fn rollback_error_code(repo: &std::path::Path) -> String {
+    rollback_error_code_with(repo, &[]).await
+}
+
+async fn rollback_error_code_with(repo: &std::path::Path, extra: &[&std::ffi::OsStr]) -> String {
     let sock_dir = tempfile::Builder::new()
         .prefix("agd")
         .tempdir_in("/tmp")
         .unwrap();
     let sock = sock_dir.path().join("d.sock");
-    let mut child = spawn_daemon(repo, &sock);
+    let mut child = spawn_daemon_with(repo, &sock, extra);
     let deadline = Instant::now() + Duration::from_secs(20);
     while !sock.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(sock.exists(), "daemon did not bind its socket");
+    if !sock.exists() {
+        // A daemon blocked on a FIFO never binds; do not leave it behind.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("daemon did not bind its socket");
+    }
 
     let Response::Commit(c) = send(
         &sock,
@@ -156,4 +181,26 @@ fn group_or_other_readable_default_key_aborts_startup() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("chmod 600"), "stderr: {stderr}");
+}
+
+#[tokio::test]
+async fn a_fifo_at_the_default_key_path_does_not_block_startup() {
+    let repo = tempfile::tempdir().unwrap();
+    mkfifo(&state_dir(repo.path()).join("approval.key"));
+    assert_eq!(
+        rollback_error_code(repo.path()).await,
+        "approval_key_not_configured"
+    );
+}
+
+#[tokio::test]
+async fn a_fifo_named_with_the_flag_does_not_block_startup_either() {
+    let repo = tempfile::tempdir().unwrap();
+    let fifo = state_dir(repo.path()).join("k.fifo");
+    mkfifo(&fifo);
+    let flag = std::ffi::OsString::from("--approval-key-file");
+    assert_eq!(
+        rollback_error_code_with(repo.path(), &[flag.as_os_str(), fifo.as_os_str()]).await,
+        "approval_key_not_configured"
+    );
 }

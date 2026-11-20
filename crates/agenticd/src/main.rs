@@ -180,8 +180,7 @@ struct Args {
 }
 
 /// The approval key path: the explicit flag, else `<agentic_dir>/approval.key`
-/// when that file exists (ADR-0019 Decision 3). `Path::exists` follows
-/// symlinks, so a dangling link counts as absent.
+/// when that is a regular file (ADR-0019 Decision 3).
 fn approval_key_path(
     explicit: Option<&std::path::Path>,
     agentic_dir: &std::path::Path,
@@ -190,7 +189,20 @@ fn approval_key_path(
         return Some(p.to_path_buf());
     }
     let default = agentic_dir.join("approval.key");
-    default.exists().then_some(default)
+    match std::fs::symlink_metadata(&default) {
+        Err(_) => None,
+        Ok(m) if m.is_file() => Some(default),
+        // A FIFO or other special file at the default path must not block
+        // startup. Treat it like an unreadable key: warn, run without one.
+        Ok(_) => {
+            tracing::warn!(
+                target: "agenticd::approval",
+                path = %default.display(),
+                "default approval key path is not a regular file; ignoring it (fail-closed)"
+            );
+            None
+        }
+    }
 }
 
 /// Load the ADR-0014 approval key per Decisions 4 and 6.
@@ -223,13 +235,24 @@ fn load_approval_key(
             "approval key file unreadable; destructive rollback disabled (fail-closed)"
         );
     };
-    let mut file = match std::fs::File::open(path) {
+    // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
+    // writer; the regular-file check below then rejects it.
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path);
+    let mut file = match opened {
         Ok(f) => f,
         Err(e) => {
             unreadable(e);
             return Ok(None);
         }
     };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        unreadable(std::io::Error::other("not a regular file"));
+        return Ok(None);
+    }
     let mut bytes = Vec::new();
     // Cap the read: one byte past the key length is enough to reject a wrong-length
     // file, and a misconfigured path to an endless source cannot exhaust memory.
@@ -679,6 +702,25 @@ mod tests {
             approval_key_path(Some(explicit), dir.path()),
             Some(explicit.to_path_buf())
         );
+    }
+
+    // ADR-0019 Decision 3: only a regular file counts as the default key. A
+    // FIFO would block the open, a symlink is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn approval_key_path_ignores_a_non_regular_default() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("approval.key");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(approval_key_path(None, dir.path()), None);
+        std::fs::remove_file(&fifo).unwrap();
+        let real = dir.path().join("real");
+        std::fs::write(&real, [7u8; 32]).unwrap();
+        std::os::unix::fs::symlink(&real, &fifo).unwrap();
+        assert_eq!(approval_key_path(None, dir.path()), None);
     }
 
     #[cfg(unix)]

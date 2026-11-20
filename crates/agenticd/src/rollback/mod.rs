@@ -37,7 +37,7 @@ mod writeback;
 
 use std::path::PathBuf;
 
-use agentic_core::approval::{verify_token, ApprovalRejection};
+use agentic_core::approval::{verify_token_any, ApprovalRejection, ApprovalScope};
 use agentic_core::commit::{stage_and_commit, CommitInputs};
 use agentic_core::refs::HeadRef;
 use agentic_core::{check_blob_unambiguous, Commit, Hash};
@@ -225,7 +225,16 @@ fn approval_gate(
     };
     // (d) Verify.
     let now = now_unix_seconds();
-    let verified = match verify_token(key, &commit_hash, uid, token, now) {
+    // ADR-0019 scope binding: accept_data_loss needs a data-loss token (which
+    // is also what legacy tokens are). A plain reverse-migration rollback
+    // accepts either scope, because a data-loss approval covers the weaker
+    // action. A reverse-migration token therefore cannot be replayed with
+    // accept_data_loss=true to switch off the IRREVERSIBLE check.
+    let scopes: &[ApprovalScope] = match reason {
+        GateReason::AcceptDataLoss => &[ApprovalScope::DataLoss],
+        GateReason::ReverseMigration => &[ApprovalScope::ReverseMigration, ApprovalScope::DataLoss],
+    };
+    let verified = match verify_token_any(key, scopes, &commit_hash, uid, token, now) {
         Ok(v) => v,
         Err(rej) => return Err(reject(ApprovalError::Rejected(rej))),
     };

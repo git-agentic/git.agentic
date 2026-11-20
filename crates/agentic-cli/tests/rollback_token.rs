@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use agentic_core::approval::{verify_token, ApprovalKey};
+use agentic_core::approval::{verify_token, verify_token_any, ApprovalKey, ApprovalScope};
 use agentic_proto::framing::{read_frame, write_frame};
 use agentic_proto::{Envelope, Request, Response, RollbackOutput};
 use tokio::net::UnixListener;
@@ -119,8 +119,9 @@ fn fixture_with(resolved: String, needs_approval: bool) -> Fixture {
     }
 }
 
-/// Run `agentic rollback main` with `args`, answering the confirmation
-/// prompt (when there is one) with `stdin`.
+/// Run `agentic` with `args`, answering the confirmation prompt (when there
+/// is one) with `stdin`. A run that does not finish in 20s is killed and
+/// fails the test, so a regression that blocks is a failure, not a hang.
 fn agentic(f: &Fixture, args: &[&str], stdin: &str) -> std::process::Output {
     use std::io::Write;
     use std::process::Stdio;
@@ -140,6 +141,14 @@ fn agentic(f: &Fixture, args: &[&str], stdin: &str) -> std::process::Output {
         .unwrap()
         .write_all(stdin.as_bytes())
         .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("agentic {args:?} did not finish in 20s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     child.wait_with_output().unwrap()
 }
 
@@ -182,8 +191,18 @@ fn attaches_a_token_from_the_default_key_file() {
     assert!(seen[0].dry_run && seen[0].token.is_none());
     let token = seen[1].token.as_deref().expect("token must be attached");
     let key = ApprovalKey::from_bytes(&KEY).unwrap();
-    verify_token(&key, &target_hash(), euid(), token, now())
-        .expect("token must verify for the resolved commit and the caller's uid");
+    verify_token_any(
+        &key,
+        &[ApprovalScope::ReverseMigration],
+        &target_hash(),
+        euid(),
+        token,
+        now(),
+    )
+    .expect("token must verify for the resolved commit and the caller's uid");
+    // A plain rollback's token is reverse-migration scope: it cannot
+    // authorize accept_data_loss.
+    assert!(verify_token(&key, &target_hash(), euid(), token, now()).is_err());
 }
 
 #[test]
@@ -260,8 +279,9 @@ fn preview_and_applied_rollback_name_the_pinned_hash_and_only_the_applied_one_is
     assert_eq!(applied.target, target_hash(), "apply must be pinned");
     assert_eq!(preview.token, None, "a preview carries no auto token");
     let key = ApprovalKey::from_bytes(&KEY).unwrap();
-    verify_token(
+    verify_token_any(
         &key,
+        &[ApprovalScope::ReverseMigration],
         &applied.target,
         euid(),
         applied.token.as_deref().expect("applied request is signed"),
@@ -283,6 +303,12 @@ fn destructive_preview_gets_its_own_token_and_the_apply_is_minted_fresh() {
     let seen = f.seen.lock().unwrap();
     assert!(seen[0].dry_run && seen[0].token.is_some());
     assert!(!seen[1].dry_run && seen[1].token.is_some());
+    // --accept-data-loss tokens, preview and apply, are data-loss scope.
+    let key = ApprovalKey::from_bytes(&KEY).unwrap();
+    for r in seen.iter() {
+        verify_token(&key, &r.target, euid(), r.token.as_deref().unwrap(), now())
+            .expect("a destructive request carries a data-loss-scope token");
+    }
 }
 
 #[test]
@@ -378,4 +404,64 @@ fn oversized_default_key_file_is_rejected_without_a_token() {
     let seen = f.seen.lock().unwrap();
     assert_eq!(seen.len(), 1, "no key, so no pinning preview: {seen:?}");
     assert_eq!(seen[0].token, None);
+}
+
+#[test]
+fn accept_data_loss_apply_is_signed_even_if_the_preview_omits_approval_required() {
+    // An older daemon's reply has no approval_required (it reads as false).
+    let f = fixture_no_approval();
+    std::fs::write(f.repo.path().join(".agentic/approval.key"), KEY).unwrap();
+    let out = agentic(&f, &["rollback", "main", "--accept-data-loss"], "y\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let seen = f.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(!seen[1].dry_run && seen[1].token.is_some(), "{seen:?}");
+}
+
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+#[test]
+fn a_fifo_at_the_default_key_path_is_skipped_not_blocked_on() {
+    let f = fixture();
+    mkfifo(&f.repo.path().join(".agentic/approval.key"));
+    let out = rollback_cmd(&f, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
+    let seen = f.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "no key, so no silent preview: {seen:?}");
+    assert_eq!(seen[0].token, None);
+}
+
+#[test]
+fn a_symlinked_default_key_is_skipped() {
+    let f = fixture();
+    let real = f.repo.path().join("real.key");
+    std::fs::write(&real, KEY).unwrap();
+    std::os::unix::fs::symlink(&real, f.repo.path().join(".agentic/approval.key")).unwrap();
+    run_rollback(&f, &[]);
+    assert_eq!(f.seen.lock().unwrap()[0].token, None);
+}
+
+#[test]
+fn an_explicit_key_that_is_not_a_regular_file_is_an_error() {
+    let f = fixture();
+    let fifo = f.repo.path().join("k.fifo");
+    mkfifo(&fifo);
+    let out = rollback_cmd(&f, &["--key-file", fifo.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a regular file"));
+    assert!(f.seen.lock().unwrap().is_empty());
 }

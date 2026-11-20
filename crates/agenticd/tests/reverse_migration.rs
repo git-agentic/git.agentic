@@ -376,7 +376,7 @@ async fn ac3c_accept_data_loss_reverses_irreversible_migration() {
 #[tokio::test]
 #[ignore]
 async fn adr_0019_reverse_migration_rollback_needs_a_token_against_postgres() {
-    use agentic_core::approval::{generate_token, ApprovalKey};
+    use agentic_core::approval::{generate_token_scoped, ApprovalKey, ApprovalScope};
     use agentic_core::refs::Refs;
     use agentic_core::ObjectStore;
     use agentic_proto::CommitInput;
@@ -510,8 +510,9 @@ async fn adr_0019_reverse_migration_rollback_needs_a_token_against_postgres() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let token = generate_token(
+    let token = generate_token_scoped(
         &ApprovalKey::from_bytes(&[42u8; 32]).unwrap(),
+        ApprovalScope::ReverseMigration,
         &baseline,
         1000,
         now,

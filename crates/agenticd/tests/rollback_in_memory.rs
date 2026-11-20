@@ -1205,3 +1205,82 @@ async fn plans_report_whether_approval_is_required() {
     .unwrap();
     assert!(out.approval_required);
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0019 scope binding.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reverse_migration_token_cannot_authorize_accept_data_loss() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    // The attack: a token issued for an ordinary reverse-migration rollback
+    // replayed with accept_data_loss=true, which would switch off the
+    // IRREVERSIBLE check. It must be refused before any SQL.
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let down = state.refs.agentic_dir().join("schema/002_bump.down.sql");
+    std::fs::write(&down, "-- IRREVERSIBLE\nDROP TABLE messages;\n").unwrap();
+    let tip = state.refs.read_branch("main").unwrap();
+    let rm = generate_token_scoped(
+        &test_key(),
+        ApprovalScope::ReverseMigration,
+        &baseline,
+        1000,
+        now_secs(),
+    );
+    for dry_run in [true, false] {
+        let args = RollbackArgs {
+            dry_run,
+            ..real_args(&state, &baseline, Some(rm.clone()))
+        };
+        let err = rollback::execute(Arc::clone(&state), args, Some(1000))
+            .await
+            .expect_err("a reverse-migration token must not authorize accept_data_loss");
+        assert!(matches!(
+            downcast_approval(&err),
+            ApprovalError::Rejected(agentic_core::approval::ApprovalRejection::InvalidSignature)
+        ));
+    }
+    assert!(state.used_approval_tokens.lock().unwrap().is_empty());
+    assert_untouched(&state, &adapter, tip).await;
+}
+
+#[tokio::test]
+async fn either_scope_authorizes_a_plain_reverse_migration_rollback() {
+    use agentic_core::approval::{generate_token_scoped, ApprovalScope};
+    for scope in [ApprovalScope::ReverseMigration, ApprovalScope::DataLoss] {
+        let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+        contaminate(&state, &adapter).await;
+        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs());
+        let out = rollback::execute(
+            Arc::clone(&state),
+            plain_args(&state, &baseline, Some(tok), false),
+            Some(1000),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{scope:?}: {e:#}"));
+        assert!(out.executed, "{scope:?}");
+        assert_eq!(adapter.current_schema_version().await.unwrap(), "001_init");
+    }
+}
+
+#[tokio::test]
+async fn legacy_format_token_still_authorizes_accept_data_loss() {
+    // A token built the way pre-ADR-0019 issuers built it (the signing input
+    // is pinned in agentic-core), not through the scoped API.
+    use hmac::{Hmac, Mac};
+    let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
+    contaminate(&state, &adapter).await;
+    let now = now_secs();
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&TEST_KEY_BYTES).unwrap();
+    mac.update(format!("git.agentic/rollback-approval/v1:{baseline}:1000:{now}").as_bytes());
+    let legacy = format!("{now}:{}", hex::encode(mac.finalize().into_bytes()));
+    let out = rollback::execute(
+        Arc::clone(&state),
+        real_args(&state, &baseline, Some(legacy)),
+        Some(1000),
+    )
+    .await
+    .expect("a legacy token keeps working for accept_data_loss");
+    assert!(out.executed);
+}

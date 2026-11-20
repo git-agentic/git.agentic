@@ -19,6 +19,12 @@
 //! The `v1` domain-separation prefix guarantees a token minted for
 //! rollback approval can never be reused for a different signed-message
 //! format on the same key.
+//!
+//! ADR-0019 adds a second scope on the same token text format. A
+//! [`ApprovalScope::DataLoss`] token signs the input above, unchanged, so
+//! tokens from older issuers keep verifying for `accept_data_loss`. A
+//! [`ApprovalScope::ReverseMigration`] token signs the same fields under a
+//! distinct domain string, so it can never authorize `accept_data_loss`.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -34,6 +40,22 @@ pub const APPROVAL_TOKEN_TTL_SECONDS: u64 = 300;
 /// HMAC domain-separation string. A future signed-message format using
 /// the same key MUST use a different domain string (Decision 2).
 const DOMAIN: &str = "git.agentic/rollback-approval/v1";
+
+/// Domain string of the reverse-migration scope (ADR-0019). It differs from
+/// [`DOMAIN`] at the byte after `v1` (`/` against `:`), so no choice of
+/// commit hash, uid or timestamp can make the two signed inputs equal.
+const DOMAIN_REVERSE_MIGRATION: &str = "git.agentic/rollback-approval/v1/reverse-migration";
+
+/// What an approval token authorizes (ADR-0019).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalScope {
+    /// `accept_data_loss = true`: the pre-ADR-0019 signing input. Legacy
+    /// tokens are this scope. It also covers a plain reverse-migration
+    /// rollback, the weaker action.
+    DataLoss,
+    /// A rollback that runs reverse migrations without `accept_data_loss`.
+    ReverseMigration,
+}
 
 /// Required approval-key length in bytes (256-bit, Decision 6).
 pub const APPROVAL_KEY_LEN: usize = 32;
@@ -106,17 +128,32 @@ impl ApprovalRejection {
 
 /// The canonical signed payload for a `(commit_hash, peer_uid, timestamp)`
 /// tuple. `commit_hash` is normalized to lowercase hex by the caller.
-fn signing_input(commit_hash: &str, peer_uid: u32, timestamp: u64) -> Vec<u8> {
-    format!("{DOMAIN}:{commit_hash}:{peer_uid}:{timestamp}").into_bytes()
+fn signing_input(
+    scope: ApprovalScope,
+    commit_hash: &str,
+    peer_uid: u32,
+    timestamp: u64,
+) -> Vec<u8> {
+    let domain = match scope {
+        ApprovalScope::DataLoss => DOMAIN,
+        ApprovalScope::ReverseMigration => DOMAIN_REVERSE_MIGRATION,
+    };
+    format!("{domain}:{commit_hash}:{peer_uid}:{timestamp}").into_bytes()
 }
 
 /// Compute the raw HMAC-SHA256 tag for a tuple.
-fn tag(key: &ApprovalKey, commit_hash: &str, peer_uid: u32, timestamp: u64) -> Vec<u8> {
+fn tag(
+    key: &ApprovalKey,
+    scope: ApprovalScope,
+    commit_hash: &str,
+    peer_uid: u32,
+    timestamp: u64,
+) -> Vec<u8> {
     // INVARIANT: HMAC accepts a key of any length; `new_from_slice` only
     // errors for algorithms with a fixed key size, which HMAC is not — so
     // this never returns Err. The `expect` documents that.
     let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
-    mac.update(&signing_input(commit_hash, peer_uid, timestamp));
+    mac.update(&signing_input(scope, commit_hash, peer_uid, timestamp));
     mac.finalize().into_bytes().to_vec()
 }
 
@@ -127,8 +164,20 @@ fn tag(key: &ApprovalKey, commit_hash: &str, peer_uid: u32, timestamp: u64) -> V
 /// upper/mixed-case hash still verifies against the daemon's normalized
 /// target hash.
 pub fn generate_token(key: &ApprovalKey, commit_hash: &str, peer_uid: u32, now: u64) -> String {
+    generate_token_scoped(key, ApprovalScope::DataLoss, commit_hash, peer_uid, now)
+}
+
+/// [`generate_token`] for a given scope (ADR-0019). The token text format is
+/// the same for every scope.
+pub fn generate_token_scoped(
+    key: &ApprovalKey,
+    scope: ApprovalScope,
+    commit_hash: &str,
+    peer_uid: u32,
+    now: u64,
+) -> String {
     let commit_hash = commit_hash.to_ascii_lowercase();
-    let mac = tag(key, &commit_hash, peer_uid, now);
+    let mac = tag(key, scope, &commit_hash, peer_uid, now);
     format!("{now}:{}", hex::encode(mac))
 }
 
@@ -152,14 +201,37 @@ impl VerifiedToken {
 }
 
 /// Verify a token against the expected `(commit_hash, peer_uid)` at time
-/// `now`. The comparison is constant-time: the supplied hex tag is decoded
-/// and checked with `Mac::verify_slice`, never a short-circuiting string
-/// compare of the hex (Decision 2).
+/// `now`, for `accept_data_loss` ([`ApprovalScope::DataLoss`], which is what
+/// legacy tokens are). The comparison is constant-time: the supplied hex tag
+/// is decoded and checked with `Mac::verify_slice`, never a short-circuiting
+/// string compare of the hex (Decision 2).
 ///
 /// `commit_hash` is normalized to lowercase before verification, matching
 /// `generate_token`.
 pub fn verify_token(
     key: &ApprovalKey,
+    commit_hash: &str,
+    peer_uid: u32,
+    token: &str,
+    now: u64,
+) -> Result<VerifiedToken, ApprovalRejection> {
+    verify_token_any(
+        key,
+        &[ApprovalScope::DataLoss],
+        commit_hash,
+        peer_uid,
+        token,
+        now,
+    )
+}
+
+/// [`verify_token`] accepting a token of any of `scopes` (ADR-0019). A plain
+/// reverse-migration rollback passes `[ReverseMigration, DataLoss]`, because
+/// a data-loss approval also covers the weaker action; `accept_data_loss`
+/// passes `[DataLoss]` only. A token that fits none is `InvalidSignature`.
+pub fn verify_token_any(
+    key: &ApprovalKey,
+    scopes: &[ApprovalScope],
     commit_hash: &str,
     peer_uid: u32,
     token: &str,
@@ -188,12 +260,15 @@ pub fn verify_token(
     }
 
     let commit_hash = commit_hash.to_ascii_lowercase();
-    let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
-    mac.update(&signing_input(&commit_hash, peer_uid, timestamp));
-    // Constant-time comparison of the decoded tag bytes.
-    mac.verify_slice(&tag)
-        .map_err(|_| ApprovalRejection::InvalidSignature)?;
-    Ok(VerifiedToken { timestamp, tag })
+    for scope in scopes {
+        let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
+        mac.update(&signing_input(*scope, &commit_hash, peer_uid, timestamp));
+        // Constant-time comparison of the decoded tag bytes.
+        if mac.verify_slice(&tag).is_ok() {
+            return Ok(VerifiedToken { timestamp, tag });
+        }
+    }
+    Err(ApprovalRejection::InvalidSignature)
 }
 
 #[cfg(test)]
@@ -363,5 +438,49 @@ mod tests {
                 "variant {variant:?}"
             );
         }
+    }
+
+    // ADR-0019: the scopes sign different inputs for the same tuple, and a
+    // token of one scope does not verify as the other.
+    #[test]
+    fn scopes_sign_distinct_inputs() {
+        let h = "a".repeat(64);
+        assert_ne!(
+            signing_input(ApprovalScope::DataLoss, &h, 1000, 5_000),
+            signing_input(ApprovalScope::ReverseMigration, &h, 1000, 5_000)
+        );
+        let dl = generate_token_scoped(&key(), ApprovalScope::DataLoss, &h, 1000, 5_000);
+        let rm = generate_token_scoped(&key(), ApprovalScope::ReverseMigration, &h, 1000, 5_000);
+        assert_ne!(dl, rm);
+    }
+
+    #[test]
+    fn legacy_signing_input_is_unchanged() {
+        // Pinned byte for byte: tokens minted by older CLIs must keep verifying.
+        assert_eq!(
+            signing_input(ApprovalScope::DataLoss, "abc", 1000, 5),
+            b"git.agentic/rollback-approval/v1:abc:1000:5".to_vec()
+        );
+        // And a token built the way the old code built it verifies as DataLoss.
+        let mut mac = HmacSha256::new_from_slice(&[7u8; APPROVAL_KEY_LEN]).unwrap();
+        mac.update(b"git.agentic/rollback-approval/v1:abc:1000:5");
+        let legacy = format!("5:{}", hex::encode(mac.finalize().into_bytes()));
+        assert!(verify_token(&key(), "abc", 1000, &legacy, 5).is_ok());
+        assert_eq!(legacy, generate_token(&key(), "abc", 1000, 5));
+    }
+
+    #[test]
+    fn a_reverse_migration_token_does_not_verify_for_data_loss() {
+        let h = "a".repeat(64);
+        let rm = generate_token_scoped(&key(), ApprovalScope::ReverseMigration, &h, 1000, 5_000);
+        assert_eq!(
+            verify_token(&key(), &h, 1000, &rm, 5_000),
+            Err(ApprovalRejection::InvalidSignature)
+        );
+        let both = [ApprovalScope::ReverseMigration, ApprovalScope::DataLoss];
+        assert!(verify_token_any(&key(), &both, &h, 1000, &rm, 5_000).is_ok());
+        // A data-loss token also covers the weaker action.
+        let dl = generate_token(&key(), &h, 1000, 5_000);
+        assert!(verify_token_any(&key(), &both, &h, 1000, &dl, 5_000).is_ok());
     }
 }

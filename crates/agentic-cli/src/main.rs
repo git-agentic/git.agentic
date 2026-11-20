@@ -12,7 +12,9 @@ use agentic_proto::{CommitInput, ErrorClass, Request, Response};
 use anyhow::{anyhow, Context};
 use clap::{Parser, Subcommand};
 
-use crate::client::{resolve_repo, round_trip, round_trip_signed, AutoToken};
+use crate::client::{
+    resolve_repo, round_trip, round_trip_pinned, round_trip_signed, AutoToken, PeerMismatch,
+};
 
 /// Format a structured `Response::Error` as a human-readable error string
 /// suitable for `anyhow!`. The shape is `[class:code] message`, e.g.
@@ -235,19 +237,35 @@ fn read_capped(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
 }
 
 fn read_key(key_file: &Path) -> anyhow::Result<LoadedKey> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let ctx = || format!("reading approval key {}", key_file.display());
-    let file = std::fs::File::open(key_file).with_context(ctx)?;
-    let owner_uid = file.metadata().with_context(ctx)?.uid();
+    // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
+    // writer; the regular-file check below then refuses it.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(key_file)
+        .with_context(ctx)?;
+    let meta = file.metadata().with_context(ctx)?;
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "approval key {} is not a regular file",
+            key_file.display()
+        ));
+    }
     let bytes = read_capped(&file).with_context(ctx)?;
     let key = agentic_core::approval::ApprovalKey::from_bytes(&bytes)
         .with_context(|| format!("approval key {} is malformed", key_file.display()))?;
-    Ok(LoadedKey { key, owner_uid })
+    Ok(LoadedKey {
+        key,
+        owner_uid: meta.uid(),
+    })
 }
 
-/// Mint an approval token bound to `(commit_hash, uid, now)`.
+/// Mint an approval token of `scope` bound to `(commit_hash, uid, now)`.
 fn mint_with_key(
     key: &agentic_core::approval::ApprovalKey,
+    scope: agentic_core::approval::ApprovalScope,
     commit_hash: &str,
     uid: u32,
 ) -> anyhow::Result<String> {
@@ -255,17 +273,25 @@ fn mint_with_key(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .map_err(|_| anyhow!("system clock is before the Unix epoch"))?;
-    Ok(agentic_core::approval::generate_token(
+    Ok(agentic_core::approval::generate_token_scoped(
         key,
+        scope,
         commit_hash,
         uid,
         now,
     ))
 }
 
-/// Mint a token from the 32-byte key at `key_file`.
+/// Mint a token from the 32-byte key at `key_file`. The issuance mode signs
+/// the data-loss scope, which also authorizes a plain reverse-migration
+/// rollback and is what older issuers produced.
 fn mint_token(key_file: &Path, commit_hash: &str, uid: u32) -> anyhow::Result<String> {
-    mint_with_key(&read_key(key_file)?.key, commit_hash, uid)
+    mint_with_key(
+        &read_key(key_file)?.key,
+        agentic_core::approval::ApprovalScope::DataLoss,
+        commit_hash,
+        uid,
+    )
 }
 
 /// ADR-0014 operator token issuer. Prints a token to stdout. Does not
@@ -282,12 +308,25 @@ fn cmd_mint_approval(
 }
 
 /// The key a rollback mints its own token from (ADR-0019 Decision 4): the
-/// `--key-file` flag, else `<repo>/.agentic/approval.key` when it exists.
+/// `--key-file` flag, else `<repo>/.agentic/approval.key` when it exists as a
+/// regular file. A default path that is a symlink, FIFO or other special file
+/// is skipped with a warning on stderr, so it cannot block the command.
 fn rollback_key_path(repo: &Path, key_file: Option<PathBuf>) -> Option<PathBuf> {
-    key_file.or_else(|| {
-        let default = repo.join(".agentic").join("approval.key");
-        default.exists().then_some(default)
-    })
+    if key_file.is_some() {
+        return key_file;
+    }
+    let default = repo.join(".agentic").join("approval.key");
+    match std::fs::symlink_metadata(&default) {
+        Err(_) => None,
+        Ok(m) if m.is_file() => Some(default),
+        Ok(_) => {
+            eprintln!(
+                "warning: not attaching an approval token: {} is not a regular file",
+                default.display()
+            );
+            None
+        }
+    }
 }
 
 /// The caller's effective uid, which the daemon reads from the socket peer
@@ -332,12 +371,18 @@ fn is_signable_hash(hash: &str) -> bool {
 }
 
 /// Resolve `target` to the commit hash the daemon will gate on.
-async fn resolve_pinned_hash(repo: &Path, target: &str) -> anyhow::Result<String> {
-    let hash = match round_trip(
+async fn resolve_pinned_hash(
+    repo: &Path,
+    target: &str,
+    key_owner_uid: u32,
+) -> anyhow::Result<String> {
+    let hash = match round_trip_pinned(
         repo,
         Request::ResolveRef {
             name: target.to_string(),
         },
+        key_owner_uid,
+        None,
     )
     .await?
     {
@@ -383,29 +428,35 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
     // ADR-0019 Decision 4. With no user-supplied token and a usable key, pin
     // the target to the resolved commit hash so the token, the preview and
     // the applied rollback all name the same commit, even if a branch moves.
-    let key = if approval_token.is_none() {
+    let mut key = if approval_token.is_none() {
         load_rollback_key(repo, key_file)?
     } else {
         None
     };
-    let target = if key.is_some() {
-        resolve_pinned_hash(repo, &target).await?
+    // Every request of an auto-signing flow goes over a connection whose
+    // peer uid is the key owner's. If one is not, give up on signing: warn,
+    // carry on unsigned, and let the daemon refuse if it needs a token.
+    let abandon = |e: &anyhow::Error| eprintln!("warning: not auto-signing the rollback: {e}");
+    let target = match &key {
+        Some(k) => match resolve_pinned_hash(repo, &target, k.owner_uid).await {
+            Ok(hash) => hash,
+            Err(e) if e.downcast_ref::<PeerMismatch>().is_some() => {
+                abandon(&e);
+                key = None;
+                target
+            }
+            Err(e) => return Err(e),
+        },
+        None => target,
+    };
+    // ADR-0019: a data-loss token for --accept-data-loss, a reverse-migration
+    // token otherwise.
+    let scope = if accept_data_loss {
+        agentic_core::approval::ApprovalScope::DataLoss
     } else {
-        target
+        agentic_core::approval::ApprovalScope::ReverseMigration
     };
-    let auto = |k: &LoadedKey| -> anyhow::Result<AutoToken> {
-        Ok(AutoToken {
-            token: mint_with_key(&k.key, &target, current_uid())?,
-            key_owner_uid: k.owner_uid,
-        })
-    };
-    // A preview is a dry run, which verifies a token without consuming it.
-    // It carries only a token the user supplied, except that a destructive
-    // preview is refused without one, so it gets its own short-lived mint.
-    let preview_auto = match &key {
-        Some(k) if accept_data_loss => Some(auto(k)?),
-        _ => None,
-    };
+    let mint = |k: &LoadedKey| mint_with_key(&k.key, scope, &target, current_uid());
     // The apply is signed only if the preview reported that this plan needs
     // approval. Otherwise a forward migration landing after the preview
     // would be reversed under a token minted for a plan nobody saw; the
@@ -414,18 +465,34 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
     // holds a key) to learn the flag.
     let mut preview_needs_approval = false;
     if !dry_run && (!yes || key.is_some()) {
-        let plan = match round_trip_signed(
-            repo,
-            Request::Rollback {
-                target: target.clone(),
-                dry_run: true,
-                accept_data_loss,
-                approval_token: approval_token.clone(),
-            },
-            preview_auto,
-        )
-        .await?
-        {
+        let preview = |token: Option<String>| Request::Rollback {
+            target: target.clone(),
+            dry_run: true,
+            accept_data_loss,
+            approval_token: token,
+        };
+        let reply = match &key {
+            // A preview is a dry run, which verifies a token without
+            // consuming it. A destructive preview is refused without one,
+            // so it gets its own short-lived mint.
+            Some(k) => {
+                let token = if accept_data_loss {
+                    Some(mint(k)?)
+                } else {
+                    None
+                };
+                match round_trip_pinned(repo, preview(None), k.owner_uid, token).await {
+                    Err(e) if e.downcast_ref::<PeerMismatch>().is_some() => {
+                        abandon(&e);
+                        key = None;
+                        round_trip(repo, preview(None)).await?
+                    }
+                    other => other?,
+                }
+            }
+            None => round_trip(repo, preview(approval_token.clone())).await?,
+        };
+        let plan = match reply {
             Response::Rollback(p) => p,
             Response::Error {
                 class,
@@ -435,7 +502,9 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
             } => return Err(daemon_error(class, &code, &message, retryable)),
             other => return Err(anyhow!("unexpected response: {other:?}")),
         };
-        preview_needs_approval = plan.approval_required;
+        // A destructive request always needs a token, even if an older
+        // daemon's reply omits the field.
+        preview_needs_approval = plan.approval_required || accept_data_loss;
         if !yes {
             // Show the plan, then confirm.
             println!("Planned rollback to {target}:");
@@ -461,7 +530,10 @@ async fn cmd_rollback(repo: &Path, o: RollbackOpts) -> anyhow::Result<()> {
         (None, Some(k))
             if (!dry_run && preview_needs_approval) || (dry_run && accept_data_loss) =>
         {
-            Some(auto(k)?)
+            Some(AutoToken {
+                token: mint(k)?,
+                key_owner_uid: k.owner_uid,
+            })
         }
         _ => None,
     };
