@@ -3,10 +3,10 @@ import { escapeXml } from '../utils/xml';
 
 const site = 'https://git-agentic.com';
 const staticPages = [
-  { path: '/', lastmod: '2026-07-18', priority: '1.0' },
-  { path: '/git-agentic', lastmod: '2026-07-18', priority: '0.9' },
-  { path: '/src-control', lastmod: '2026-07-18', priority: '0.8' },
-  { path: '/sentinel', lastmod: '2026-07-18', priority: '0.8' },
+  { path: '/', lastmod: '2026-11-20', priority: '1.0' },
+  { path: '/git-agentic', lastmod: '2026-11-20', priority: '0.9' },
+  { path: '/src-control', lastmod: '2026-11-20', priority: '0.8' },
+  { path: '/sentinel', lastmod: '2026-11-20', priority: '0.8' },
   { path: '/learn', lastmod: '2026-07-18', priority: '0.8' },
 ];
 

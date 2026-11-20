@@ -58,7 +58,7 @@ const structuredData = [
 <Base
   title="AI Agent Version Control & Atomic Rollback | git.agentic"
   description="Version and roll back AI agent code, prompts, tools, models, memory, and schema atomically. Open-source Rust core, Python SDK, and LangGraph support."
-  modifiedTime="2026-07-18"
+  modifiedTime="2026-11-20"
   structuredData={structuredData}
 >
   <Header />
@@ -179,6 +179,35 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
     real deployments is the bar before we call it v1.0. In-progress
     workstreams: storage backends beyond the local store, ephemeral
     branches as an agent-run primitive, and hardening.
+  </p>
+
+  <h3>Security hardening, November 2026</h3>
+  <p class="mute">
+    On 20 November 2026 a security hardening round merged (PRs #145 to #153
+    and #156). The daemon already checks socket peers against a UID
+    allowlist (<a href={`${repo}/blob/main/docs/adr/0012-socket-peer-authentication.md`}>ADR-0012</a>).
+    Now any rollback that runs reverse schema migrations also needs an
+    operator approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>). Tokens are single-use per daemon
+    process and scoped, so a reverse-migration token cannot authorize a
+    data-loss rollback. The <code>agentic</code> CLI can attach the token
+    automatically when its preview shows approval is needed, it can read the
+    key, and the daemon's peer UID owns that key.
+  </p>
+  <ul class="plain">
+    <li>The object store keeps raw and typed objects at separate storage paths, so one can no longer occupy the other's address (<a href={`${repo}/blob/main/docs/adr/0018-separate-raw-object-namespace.md`}>ADR-0018</a>)</li>
+    <li>The sidecar deployment keeps daemon state on a volume only the daemon writes, checks state-directory ownership at startup, reads credentials from files, and redacts the GCS token and the Postgres URL in the store and memory-backend debug output. The Cloud Run layout is not yet verified, and full credential isolation needs separate service identities</li>
+    <li>Rollback validates the prompt tree before any database change and refuses symlinked prompt directories</li>
+    <li>The LangGraph checkpointer only deserializes allow-listed types</li>
+    <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests; the open Rust advisories were fixed and the website's production dependencies report zero npm audit findings</li>
+    <li>The threat model is reconciled (TM-001 to TM-013) and documents the remaining risks</li>
+  </ul>
+  <p class="mute">
+    Still open: the rollback target of under 5 seconds at 1M-row pgvector
+    scale is under verification
+    (<a href={`${repo}/issues/132`}>issue #132</a>); demo-scale rollback takes
+    about 1 second. Per-operation authorization is still open (TM-001):
+    for example, a rollback without a schema change can restore memory
+    without an approval token.
   </p>
 
   <h2>Design partners</h2>
