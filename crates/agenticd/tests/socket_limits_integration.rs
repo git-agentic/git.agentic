@@ -69,7 +69,10 @@ async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
     loop {
         match UnixStream::connect(sock).await {
             Ok(conn) => return conn,
-            Err(_) if tokio::time::Instant::now() < deadline => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ConnectionRefused
+                    && tokio::time::Instant::now() < deadline =>
+            {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(e) => panic!("daemon never accepted a connection: {e}"),
@@ -78,8 +81,14 @@ async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
 }
 
 /// Open a connection and prove it is live with a Ping/Pong round trip.
-async fn connect_and_ping(sock: &std::path::Path, tag: &str) -> UnixStream {
-    let mut conn = connect_when_ready(sock).await;
+/// `first`: only the first connection of a test waits for the daemon to start
+/// accepting; later ones must connect on the first attempt.
+async fn connect_and_ping(sock: &std::path::Path, tag: &str, first: bool) -> UnixStream {
+    let mut conn = if first {
+        connect_when_ready(sock).await
+    } else {
+        UnixStream::connect(sock).await.expect("connect")
+    };
     write_frame(&mut conn, &Envelope::new(tag.to_string(), Request::Ping))
         .await
         .expect("write ping");
@@ -122,8 +131,8 @@ async fn global_connection_cap_drops_excess_and_spares_existing() {
     let dir = private_dir();
     let (_daemon, sock) = spawn_daemon(&dir, &["--max-connections", "2"]).await;
 
-    let mut c1 = connect_and_ping(&sock, "c1").await;
-    let _c2 = connect_and_ping(&sock, "c2").await;
+    let mut c1 = connect_and_ping(&sock, "c1", true).await;
+    let _c2 = connect_and_ping(&sock, "c2", false).await;
 
     // Third connection is over the global cap: dropped at accept.
     assert_dropped(&sock).await;
@@ -150,7 +159,7 @@ async fn per_uid_connection_cap_drops_excess() {
     )
     .await;
 
-    let _c1 = connect_and_ping(&sock, "c1").await;
+    let _c1 = connect_and_ping(&sock, "c1", true).await;
     assert_dropped(&sock).await;
 }
 
