@@ -91,7 +91,9 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
         super().__init__()
         self.client = client or AgenticClient.default()
         self.repo = Path(repo)
-        self.serde = JsonPlusSerializer()
+        # Strict: checkpoints are on-disk, branch-writable input, so only
+        # langgraph's built-in safe types may be reconstructed from msgpack.
+        self.serde = JsonPlusSerializer(allowed_msgpack_modules=None)
 
     # ------------------------------------------------------------------ put
 
@@ -105,7 +107,9 @@ class AgenticCheckpointer(BaseCheckpointSaver):  # type: ignore[type-arg]
         thread_id = _require_thread_id(config)
         branch = _branch_for_thread(thread_id)
 
-        envelope = _serialise_envelope(cast(JsonPlusSerializer, self.serde), checkpoint, metadata, thread_id)
+        envelope = _serialise_envelope(
+            cast(JsonPlusSerializer, self.serde), checkpoint, metadata, thread_id
+        )
         blob_path = _checkpoint_blob_path(thread_id)
         envelope_json = json.dumps(envelope, separators=(",", ":"))
 
@@ -349,6 +353,17 @@ def _serialise_envelope(
     }
 
 
+# The only ``type`` tags ``JsonPlusSerializer.dumps_typed`` emits without
+# ``pickle_fallback``. Anything else (``pickle``, ``json``) is attacker-chosen.
+_ALLOWED_ENVELOPE_TYPES = frozenset({"msgpack", "null", "bytes", "bytearray"})
+
+
+def _loads_typed(serde: JsonPlusSerializer, part: dict[str, Any]) -> Any:
+    if part["type"] not in _ALLOWED_ENVELOPE_TYPES:
+        raise ValueError(f"unsupported checkpoint serialisation type: {part['type']!r}")
+    return serde.loads_typed((part["type"], base64.b64decode(part["data_b64"])))
+
+
 def _deserialise_envelope(
     serde: JsonPlusSerializer,
     envelope: dict[str, Any],
@@ -358,12 +373,7 @@ def _deserialise_envelope(
             f"unsupported langgraph envelope version: {envelope.get('v')!r} "
             f"(expected {ENVELOPE_VERSION})"
         )
-    ckpt = envelope["checkpoint"]
-    meta = envelope["metadata"]
-    checkpoint = serde.loads_typed(
-        (ckpt["type"], base64.b64decode(ckpt["data_b64"]))
+    return (
+        _loads_typed(serde, envelope["checkpoint"]),
+        _loads_typed(serde, envelope["metadata"]),
     )
-    metadata = serde.loads_typed(
-        (meta["type"], base64.b64decode(meta["data_b64"]))
-    )
-    return checkpoint, metadata

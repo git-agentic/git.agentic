@@ -11,6 +11,7 @@ Three layers:
   same thread, asserts the second sees the first's state.
 """
 
+import base64
 import os
 import shutil
 import subprocess
@@ -19,8 +20,11 @@ import time
 from operator import add
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
+from unittest.mock import MagicMock
 
+import ormsgpack
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from agentic import AgenticClient
@@ -93,6 +97,73 @@ def test_envelope_rejects_unknown_version():
     }
     with pytest.raises(ValueError, match="unsupported langgraph envelope"):
         _deserialise_envelope(serde, bogus)
+
+
+class _Marker:
+    """Harmless stand-in for an attacker-chosen importable type."""
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+def _strict_serde() -> JsonPlusSerializer:
+    return AgenticCheckpointer(client=MagicMock()).serde  # type: ignore[return-value]
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _envelope(ckpt: tuple[str, bytes], meta: tuple[str, bytes]) -> dict[str, Any]:
+    return {
+        "v": 1,
+        "thread_id": "x",
+        "checkpoint": {"type": ckpt[0], "data_b64": _b64(ckpt[1])},
+        "metadata": {"type": meta[0], "data_b64": _b64(meta[1])},
+    }
+
+
+@pytest.mark.parametrize("bad_type", ["pickle", "json"])
+def test_envelope_rejects_unsafe_serialisation_type(bad_type: str):
+    env = _envelope((bad_type, b"{}"), ("null", b""))
+    with pytest.raises(ValueError, match="unsupported checkpoint serialisation type"):
+        _deserialise_envelope(_strict_serde(), env)
+    env = _envelope(("null", b""), (bad_type, b"{}"))
+    with pytest.raises(ValueError, match="unsupported checkpoint serialisation type"):
+        _deserialise_envelope(_strict_serde(), env)
+
+
+def test_checkpointer_does_not_reconstruct_unlisted_types():
+    # msgpack ext 0 = constructor(module, name, arg): importable type naming
+    # a class outside langgraph's safe-type allowlist.
+    ext = ormsgpack.Ext(0, ormsgpack.packb((__name__, _Marker.__name__, "payload")))
+    payload = ormsgpack.packb({"x": ext}, option=ormsgpack.OPT_NON_STR_KEYS)
+    env = _envelope(("msgpack", payload), ("null", b""))
+
+    ckpt, _ = _deserialise_envelope(_strict_serde(), env)
+    assert not isinstance(ckpt["x"], _Marker)
+    assert ckpt["x"] == "payload"  # strict mode degrades to the raw argument
+
+    # Control: the library's permissive default would have built the object.
+    permissive, _ = _deserialise_envelope(JsonPlusSerializer(allowed_msgpack_modules=True), env)
+    assert isinstance(permissive["x"], _Marker)
+
+
+def test_envelope_roundtrip_langchain_messages():
+    serde = _strict_serde()
+    ckpt = {
+        "v": 4,
+        "id": "c0",
+        "ts": "2026-05-20T00:00:00Z",
+        "channel_values": {"messages": [HumanMessage(content="hi"), AIMessage(content="hello")]},
+        "channel_versions": {"messages": "1"},
+        "versions_seen": {},
+        "updated_channels": ["messages"],
+    }
+    env = _serialise_envelope(serde, ckpt, {"step": 0}, "u1")
+    ckpt2, meta2 = _deserialise_envelope(serde, env)
+    assert ckpt2["channel_values"]["messages"] == ckpt["channel_values"]["messages"]
+    assert meta2 == {"step": 0}
 
 
 # ===================================================== integration: daemon
