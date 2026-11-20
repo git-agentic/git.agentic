@@ -176,7 +176,6 @@ const serializeStructuredData = (item: Record<string, unknown>) =>
         --text-xl: clamp(1.15rem, 1.05rem + 0.5vw, 1.3rem);
         --text-2xl: clamp(1.5rem, 1.3rem + 0.9vw, 1.9rem);
         --text-3xl: clamp(2rem, 1.35rem + 2.8vw, 3.1rem);
-        --text-4xl: clamp(2.2rem, 1.2rem + 4.4vw, 4rem);
 
         --s-1: 0.25rem;
         --s-2: 0.5rem;
@@ -348,7 +347,7 @@ const serializeStructuredData = (item: Record<string, unknown>) =>
 
       /* Code */
       code, pre { font-family: var(--mono); }
-      :not(pre) > code { padding: 0.1em 0.35em; border: 1px solid var(--border); border-radius: 4px; background: var(--sunken); color: var(--text); font-size: 0.875em; overflow-wrap: anywhere; }
+      :not(pre) > code { padding: 0.1em 0.35em; border: 1px solid var(--border); border-radius: 4px; background: var(--sunken); color: var(--text); font-size: 0.875em; overflow-wrap: anywhere; -webkit-box-decoration-break: clone; box-decoration-break: clone; }
       pre { margin: 0 0 var(--s-5); padding: var(--s-4) var(--s-5); overflow-x: auto; border: 1px solid var(--code-line); border-radius: var(--radius); background: var(--code-bg); color: var(--code-text); font-size: var(--text-xs); line-height: 1.65; tab-size: 2; }
       h1 code, h2 code, h3 code { padding: 0; border: 0; background: none; font-size: 0.92em; }
       .panel { margin: 0 0 var(--s-5); border: 1px solid var(--code-line); border-radius: var(--radius); background: var(--code-bg); overflow: hidden; box-shadow: var(--shadow); min-width: 0; }

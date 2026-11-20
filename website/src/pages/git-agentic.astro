@@ -63,7 +63,7 @@ const docs = [
     <div><dt>License</dt><dd>Apache 2.0</dd></div>
   </Fragment>
 
-  <Section id="quickstart" title="Quickstart" note="Needs Docker and a Rust toolchain.">
+  <Section id="quickstart" title="Quickstart" note="Needs Podman or Docker with compose, cargo, Python 3.10 or later, and psql.">
     <p>
       One clone, one <code>docker-compose up</code>, one script. The script
       builds the daemon, runs the agent, breaks it and rolls it back. CI
@@ -254,7 +254,7 @@ $ ./scripts/ask "I'm thinking about cancelling."
       <ul>
         <li>Rollbacks that run reverse schema migrations now need an operator approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>).</li>
         <li>The object store keeps raw and typed objects at separate storage paths, so one can no longer occupy the other's address (<a href={`${repo}/blob/main/docs/adr/0018-separate-raw-object-namespace.md`}>ADR-0018</a>).</li>
-        <li>The sidecar deployment isolates daemon state and credentials from the worker.</li>
+        <li>The sidecar deployment keeps daemon state on a volume only the daemon writes and reads credentials from files. Full credential isolation still needs separate service identities, as the security section above says.</li>
         <li>Rollback validates the prompt tree before any database change and refuses symlinked prompt directories.</li>
         <li>The LangGraph checkpointer only deserializes allow-listed types.</li>
         <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests. The open Rust advisories were fixed, and the website's production dependencies report zero npm audit findings.</li>
