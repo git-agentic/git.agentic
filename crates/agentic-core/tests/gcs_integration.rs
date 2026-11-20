@@ -165,9 +165,9 @@ fn corrupt_download_is_rejected_and_not_cached() {
     // Overwrite the bucket object at its exact key with zstd of DIFFERENT
     // bytes — the shape of a bucket writer tampering in place. The object
     // name mirrors GcsObjectStore::object_name for raw objects:
-    // `<prefix>/raw/<ab>/<rest>.zst`.
+    // `<prefix>/raw/<ab>/<rest>.raw.zst`.
     let hex = hash.to_hex();
-    let object_name = format!("{prefix}/raw/{}/{}.zst", &hex[..2], &hex[2..]);
+    let object_name = format!("{prefix}/raw/{}/{}.raw.zst", &hex[..2], &hex[2..]);
     let corrupt = zstd::stream::encode_all(&b"CORRUPTED"[..], 3).unwrap();
     let upload_url = format!(
         "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
@@ -210,12 +210,12 @@ fn corrupt_download_is_rejected_and_not_cached() {
     }
     // Never cache a failed verification: the corrupt bytes must not have
     // been persisted to the cold cache. Cache layout mirrors
-    // GcsObjectStore::cache_path for raw objects: `<cache_dir>/raw/<ab>/<rest>.zst`.
+    // GcsObjectStore::cache_path for raw objects: `<cache_dir>/raw/<ab>/<rest>.raw.zst`.
     let cache_file = cache2
         .path()
         .join("raw")
         .join(&hex[..2])
-        .join(format!("{}.zst", &hex[2..]));
+        .join(format!("{}.raw.zst", &hex[2..]));
     assert!(
         !cache_file.exists(),
         "corrupt download must not be written to the cache at {cache_file:?}"

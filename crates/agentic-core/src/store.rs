@@ -79,6 +79,25 @@ pub(crate) fn decode_typed(hash: &Hash, stored: Vec<u8>) -> Result<Object> {
     Ok(object)
 }
 
+/// Read a raw object found at a legacy (typed) address. Besides bare
+/// `put_raw` bytes, that address may hold a blob envelope written by a
+/// `put` of the same bytes; both carry the same content, so both are valid.
+pub(crate) fn decode_legacy_raw(hash: &Hash, stored: Vec<u8>) -> Result<Vec<u8>> {
+    let computed = Hash::of(&stored);
+    if computed == *hash {
+        return Ok(stored);
+    }
+    if let Ok(Object::Blob(blob)) = serde_json::from_slice::<Object>(&stored) {
+        if blob.hash() == *hash {
+            return Ok(blob.bytes);
+        }
+    }
+    Err(Error::IntegrityError {
+        declared: *hash,
+        computed,
+    })
+}
+
 /// The store contract. MVP implementer is `FsObjectStore`; future
 /// implementers include S3, GCS, and a network-replicated store.
 pub trait ObjectStore: Send + Sync {
@@ -141,6 +160,24 @@ impl FsObjectStore {
             .join(format!("{rest}.zst"))
     }
 
+    /// Write `bytes` at `path` unless the path already holds the same
+    /// content. `is_same` judges whatever is stored there exactly as the
+    /// matching read would; a missing, unreadable or different occupant
+    /// (a legacy squatter or corruption) is replaced atomically.
+    fn write_unless_same(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        is_same: impl FnOnce(Vec<u8>) -> bool,
+    ) -> Result<()> {
+        if let Ok(stored) = self.read_at(path) {
+            if is_same(stored) {
+                return Ok(());
+            }
+        }
+        self.write_at(path, bytes)
+    }
+
     fn write_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -186,9 +223,9 @@ impl ObjectStore for FsObjectStore {
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let path = self.path_for(&hash);
-        if !path.exists() {
-            self.write_at(&path, &bytes)?;
-        }
+        self.write_unless_same(&path, &bytes, |stored| {
+            decode_typed(&hash, stored).is_ok_and(|existing| existing == *object)
+        })?;
         Ok(hash)
     }
 
@@ -207,9 +244,7 @@ impl ObjectStore for FsObjectStore {
 
         let hash = Hash::of(bytes);
         let path = self.raw_path_for(&hash);
-        if !path.exists() {
-            self.write_at(&path, bytes)?;
-        }
+        self.write_unless_same(&path, bytes, |stored| Hash::of(&stored) == hash)?;
         Ok(hash)
     }
 
@@ -224,15 +259,16 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
-        let mut path = self.raw_path_for(hash);
-        if !path.exists() {
+        let raw_path = self.raw_path_for(hash);
+        if !raw_path.exists() {
             // Legacy layout: raw objects used to share the typed path.
-            path = self.path_for(hash);
+            let legacy = self.path_for(hash);
+            if !legacy.exists() {
+                return Err(Error::NotFound(*hash));
+            }
+            return decode_legacy_raw(hash, self.read_at(&legacy)?);
         }
-        if !path.exists() {
-            return Err(Error::NotFound(*hash));
-        }
-        let bytes = self.read_at(&path)?;
+        let bytes = self.read_at(&raw_path)?;
         // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
         // contract). Verify before returning so a tampered segment or
         // manifest on disk is rejected, not parsed. Audit finding #3.
@@ -539,5 +575,58 @@ mod tests {
             Object::Blob(got) => assert_eq!(got.bytes, bytes),
             other => panic!("expected Blob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn typed_put_heals_a_wrong_occupant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"some prompt".to_vec();
+        let hash = Hash::of(&b);
+        store.write_at(&store.path_for(&hash), b"squatter").unwrap();
+
+        store.put(&Object::Blob(Blob::new(b.clone()))).unwrap();
+        match store.get(&hash).unwrap() {
+            Object::Blob(got) => assert_eq!(got.bytes, b),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_put_heals_a_wrong_occupant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"segment bytes".to_vec();
+        let hash = Hash::of(&b);
+        store
+            .write_at(&store.raw_path_for(&hash), b"corrupted")
+            .unwrap();
+
+        store.put_raw(ObjectKind::Segment, &b).unwrap();
+        assert_eq!(store.get_raw(&hash).unwrap(), b);
+    }
+
+    #[test]
+    fn blob_put_does_not_destroy_a_legacy_raw_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"legacy segment bytes".to_vec();
+        let hash = Hash::of(&b);
+        store.write_at(&store.path_for(&hash), &b).unwrap();
+
+        store.put(&Object::Blob(Blob::new(b.clone()))).unwrap();
+        assert_eq!(store.get_raw(&hash).unwrap(), b);
+    }
+
+    #[test]
+    fn legacy_raw_read_tolerates_a_blob_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"legacy segment bytes".to_vec();
+        let hash = Hash::of(&b);
+        let envelope = serde_json::to_vec(&Object::Blob(Blob::new(b.clone()))).unwrap();
+        store.write_at(&store.path_for(&hash), &envelope).unwrap();
+
+        assert_eq!(store.get_raw(&hash).unwrap(), b);
     }
 }

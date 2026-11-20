@@ -44,7 +44,9 @@ use std::time::Duration;
 use crate::hash::Hash;
 use crate::object::{Object, ObjectKind};
 use crate::scanner::{Allowlist, ScanPolicy, Scanner};
-use crate::store::{check_blob_unambiguous, check_integrity, decode_typed, ObjectStore};
+use crate::store::{
+    check_blob_unambiguous, check_integrity, decode_legacy_raw, decode_typed, ObjectStore,
+};
 use crate::{Error, Result};
 
 /// Default upstream — GCS's public JSON API host.
@@ -66,6 +68,31 @@ const STORAGE_CLASS: &str = "STANDARD";
 enum Ns {
     Typed,
     Raw,
+}
+
+impl Ns {
+    /// (directory prefix, file extension) of this namespace's objects.
+    fn layout(self) -> (&'static str, &'static str) {
+        match self {
+            Ns::Typed => ("", "zst"),
+            Ns::Raw => ("raw/", "raw.zst"),
+        }
+    }
+}
+
+/// What a conditional upload did.
+#[derive(Debug, PartialEq, Eq)]
+enum Upload {
+    Stored,
+    /// HTTP 412: the object exists (or, for a generation match, changed).
+    PreconditionFailed,
+}
+
+/// A downloaded object: the stored (compressed) bytes and the GCS
+/// generation they were read at, when the server reported one.
+struct Downloaded {
+    compressed: Vec<u8>,
+    generation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,27 +146,26 @@ impl GcsObjectStore {
 
     /// GCS object name for a given hash. Sharded by the first two hex
     /// chars (matches the on-disk layout) so a ``gsutil ls gs://b/<p>``
-    /// looks familiar. Raw objects (`put_raw`) live under a `raw/`
-    /// sub-namespace so they can never share a name with a typed object.
+    /// looks familiar. Raw objects (`put_raw`) live under `raw/` with a
+    /// distinct `.raw.zst` suffix, so they can never share a name with a
+    /// typed object, even for a store whose prefix is `<p>/raw`.
     fn object_name(&self, hash: &Hash, ns: Ns) -> String {
         let (a, b) = hash.shard();
         let p = self.prefix.trim_matches('/');
-        let raw = if ns == Ns::Raw { "raw/" } else { "" };
+        let (dir, ext) = ns.layout();
         if p.is_empty() {
-            format!("{raw}{a}/{b}.zst")
+            format!("{dir}{a}/{b}.{ext}")
         } else {
-            format!("{p}/{raw}{a}/{b}.zst")
+            format!("{p}/{dir}{a}/{b}.{ext}")
         }
     }
 
     fn cache_path(&self, hash: &Hash, ns: Ns) -> PathBuf {
         let (a, b) = hash.shard();
-        let base = if ns == Ns::Raw {
-            self.cache_dir.join("raw")
-        } else {
-            self.cache_dir.clone()
-        };
-        base.join(a).join(format!("{b}.zst"))
+        let (dir, ext) = ns.layout();
+        self.cache_dir
+            .join(format!("{dir}{a}"))
+            .join(format!("{b}.{ext}"))
     }
 
     fn cache_read(&self, hash: &Hash, ns: Ns) -> Option<Vec<u8>> {
@@ -175,12 +201,15 @@ impl GcsObjectStore {
 
     // ---------- HTTP plumbing ----------------------------------------------
 
-    fn upload_url(&self, name: &str) -> String {
+    /// `if_generation` is the `ifGenerationMatch` precondition: `0` means
+    /// "only if the object does not exist yet".
+    fn upload_url(&self, name: &str, if_generation: &str) -> String {
         let encoded = urlencode(name);
         format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&ifGenerationMatch=0&name={}",
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&ifGenerationMatch={}&name={}",
             self.endpoint.trim_end_matches('/'),
             self.bucket,
+            if_generation,
             encoded,
         )
     }
@@ -220,11 +249,18 @@ impl GcsObjectStore {
         Error::Other(anyhow::anyhow!("{context}: HTTP {status}: {body}"))
     }
 
-    /// Upload with `ifGenerationMatch=0`: an existing object is never
-    /// overwritten, and HTTP 412 (already exists) counts as a dedup hit.
-    fn upload_compressed(&self, hash: &Hash, ns: Ns, compressed: &[u8]) -> Result<()> {
+    /// Conditional upload (`ifGenerationMatch=<if_generation>`): an existing
+    /// object is never overwritten blindly. HTTP 412 is reported to the
+    /// caller, which must decide what the existing object means.
+    fn upload_compressed(
+        &self,
+        hash: &Hash,
+        ns: Ns,
+        compressed: &[u8],
+        if_generation: &str,
+    ) -> Result<Upload> {
         let name = self.object_name(hash, ns);
-        let url = self.upload_url(&name);
+        let url = self.upload_url(&name, if_generation);
         let resp = self
             .with_auth(
                 self.client
@@ -236,20 +272,20 @@ impl GcsObjectStore {
             .send()
             .map_err(|e| Error::Other(anyhow::anyhow!("upload {url}: {e}")))?;
         if resp.status() == reqwest::StatusCode::PRECONDITION_FAILED {
-            return Ok(());
+            return Ok(Upload::PreconditionFailed);
         }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
             return Err(Self::http_err("uploading object", status, &body));
         }
-        Ok(())
+        Ok(Upload::Stored)
     }
 
-    /// Returns ``Some((decompressed_bytes, raw_compressed_bytes))`` if
-    /// the object exists in GCS. The raw bytes are returned so the
-    /// caller can populate the local cache without re-compressing.
-    fn download_compressed(&self, hash: &Hash, ns: Ns) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// Returns the stored object if it exists in GCS. The compressed bytes
+    /// are returned as stored so the caller can populate the local cache
+    /// without re-compressing; decoding is left to the caller.
+    fn download_compressed(&self, hash: &Hash, ns: Ns) -> Result<Option<Downloaded>> {
         let name = self.object_name(hash, ns);
         let url = self.download_url(&name);
         let resp = self
@@ -264,12 +300,44 @@ impl GcsObjectStore {
             let body = resp.text().unwrap_or_default();
             return Err(Self::http_err("downloading object", status, &body));
         }
+        let generation = resp
+            .headers()
+            .get("x-goog-generation")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let compressed = resp
             .bytes()
             .map_err(|e| Error::Other(anyhow::anyhow!("reading body: {e}")))?
             .to_vec();
-        let bytes = zstd::stream::decode_all(&compressed[..])?;
-        Ok(Some((bytes, compressed)))
+        Ok(Some(Downloaded {
+            compressed,
+            generation,
+        }))
+    }
+
+    /// Current generation of an object, from the metadata endpoint. Only
+    /// used when a download did not report one.
+    fn remote_generation(&self, hash: &Hash, ns: Ns) -> Result<String> {
+        let url = self.metadata_url(&self.object_name(hash, ns));
+        let resp = self
+            .with_auth(self.client.get(&url))
+            .send()
+            .map_err(|e| Error::Other(anyhow::anyhow!("GET {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            return Err(Self::http_err("reading object metadata", status, &body));
+        }
+        let meta: serde_json::Value = resp
+            .json()
+            .map_err(|e| Error::Other(anyhow::anyhow!("parsing object metadata: {e}")))?;
+        meta.get("generation")
+            .and_then(|g| {
+                g.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| g.as_u64().map(|n| n.to_string()))
+            })
+            .ok_or_else(|| Error::Other(anyhow::anyhow!("object metadata has no generation")))
     }
 
     /// Fetch the bytes for `hash` and map them to `T`, where `map` also
@@ -292,34 +360,55 @@ impl GcsObjectStore {
     ///   bad object is never written to the local cache ("never cache a
     ///   failed verification").
     fn fetch_map<T>(&self, hash: &Hash, ns: Ns, map: impl Fn(Vec<u8>) -> Result<T>) -> Result<T> {
+        if let Some(value) = self.try_cache(hash, ns, &map) {
+            return Ok(value);
+        }
+        self.fetch_remote(hash, ns, &map)
+    }
+
+    /// The cache half of [`Self::fetch_map`]: a hit that passes `map`, or
+    /// `None` (evicting a poisoned or unreadable entry on the way).
+    fn try_cache<T>(&self, hash: &Hash, ns: Ns, map: &impl Fn(Vec<u8>) -> Result<T>) -> Option<T> {
         let cache_path = self.cache_path(hash, ns);
-        if cache_path.exists() {
-            match self.cache_read(hash, ns) {
-                Some(cached) => match map(cached) {
-                    Ok(value) => return Ok(value),
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "agentic-core::gcs_store",
-                            hash = %hash.to_hex(),
-                            error = %err,
-                            "cached object failed integrity check; evicting and refetching from GCS",
-                        );
-                        // Evict the poisoned entry so `has`/subsequent reads
-                        // don't keep trusting it.
-                        self.evict_cache_entry(hash, &cache_path);
-                    }
-                },
-                None => {
-                    // Cache file exists but is unreadable/corrupt (e.g. torn
-                    // write or zstd decode failure). Evict so `has` stays
-                    // consistent and future reads can heal from GCS.
+        if !cache_path.exists() {
+            return None;
+        }
+        match self.cache_read(hash, ns) {
+            Some(cached) => match map(cached) {
+                Ok(value) => return Some(value),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "agentic-core::gcs_store",
+                        hash = %hash.to_hex(),
+                        error = %err,
+                        "cached object failed integrity check; evicting and refetching from GCS",
+                    );
+                    // Evict the poisoned entry so `has`/subsequent reads
+                    // don't keep trusting it.
                     self.evict_cache_entry(hash, &cache_path);
                 }
+            },
+            None => {
+                // Cache file exists but is unreadable/corrupt (e.g. torn
+                // write or zstd decode failure). Evict so `has` stays
+                // consistent and future reads can heal from GCS.
+                self.evict_cache_entry(hash, &cache_path);
             }
         }
+        None
+    }
+
+    /// The network half of [`Self::fetch_map`].
+    fn fetch_remote<T>(
+        &self,
+        hash: &Hash,
+        ns: Ns,
+        map: &impl Fn(Vec<u8>) -> Result<T>,
+    ) -> Result<T> {
         match self.download_compressed(hash, ns)? {
             None => Err(Error::NotFound(*hash)),
-            Some((bytes, compressed)) => {
+            Some(Downloaded { compressed, .. }) => {
+                let bytes = zstd::stream::decode_all(&compressed[..])?;
                 // Map (which verifies) BEFORE caching: a corrupt GCS object
                 // must not be persisted to the local cache.
                 let value = map(bytes)?;
@@ -367,11 +456,53 @@ impl GcsObjectStore {
 }
 
 impl GcsObjectStore {
-    /// Upload first, cache second: the cache only ever holds objects that
-    /// are (or already were) in the bucket, so a failed upload leaves
-    /// nothing to roll back. Cache write is a best-effort hint.
-    fn store_compressed(&self, hash: &Hash, ns: Ns, compressed: &[u8]) -> Result<()> {
-        self.upload_compressed(hash, ns, compressed)?;
+    /// Put `compressed` at `hash`, never replacing a *verified* object.
+    ///
+    /// The upload is conditional on the name being free. On HTTP 412 the
+    /// occupant is downloaded and judged by `is_same` (it must decode as
+    /// the content being written, exactly as the matching read would). If
+    /// it is the same, this is a dedup hit. If not (a pre-fix squatter or
+    /// corruption) it is replaced, conditional on the generation just
+    /// observed; losing that race is an error, not success. The local
+    /// cache is written only once the bucket is known to hold the verified
+    /// object, so a failed or refused put never leaves a cache entry.
+    ///
+    /// Network cost: 1 request for a new object; 2 (upload, download) for a
+    /// dedup hit; 3 when a bad occupant is replaced (4 if the download
+    /// carried no generation header).
+    fn store_compressed(
+        &self,
+        hash: &Hash,
+        ns: Ns,
+        compressed: &[u8],
+        is_same: impl FnOnce(Vec<u8>) -> bool,
+    ) -> Result<()> {
+        if self.upload_compressed(hash, ns, compressed, "0")? == Upload::PreconditionFailed {
+            let existing = self.download_compressed(hash, ns)?.ok_or_else(|| {
+                Error::Other(anyhow::anyhow!("object {hash} vanished during put"))
+            })?;
+            let same = zstd::stream::decode_all(&existing.compressed[..])
+                .ok()
+                .is_some_and(is_same);
+            if !same {
+                let generation = match existing.generation {
+                    Some(g) => g,
+                    None => self.remote_generation(hash, ns)?,
+                };
+                tracing::warn!(
+                    target: "agentic-core::gcs_store",
+                    hash = %hash,
+                    "replacing unverifiable object at content address",
+                );
+                if self.upload_compressed(hash, ns, compressed, &generation)?
+                    == Upload::PreconditionFailed
+                {
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "object {hash} changed while replacing an unverifiable occupant"
+                    )));
+                }
+            }
+        }
         if let Err(e) = self.cache_write_compressed(hash, ns, compressed) {
             tracing::warn!(
                 target: "agentic-core::gcs_store",
@@ -408,7 +539,9 @@ impl ObjectStore for GcsObjectStore {
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let compressed = zstd::stream::encode_all(&bytes[..], 3)?;
-        self.store_compressed(&hash, Ns::Typed, &compressed)?;
+        self.store_compressed(&hash, Ns::Typed, &compressed, |stored| {
+            decode_typed(&hash, stored).is_ok_and(|existing| existing == *object)
+        })?;
         Ok(hash)
     }
 
@@ -426,7 +559,9 @@ impl ObjectStore for GcsObjectStore {
 
         let hash = Hash::of(bytes);
         let compressed = zstd::stream::encode_all(bytes, 3)?;
-        self.store_compressed(&hash, Ns::Raw, &compressed)?;
+        self.store_compressed(&hash, Ns::Raw, &compressed, |stored| {
+            Hash::of(&stored) == hash
+        })?;
         Ok(hash)
     }
 
@@ -440,13 +575,23 @@ impl ObjectStore for GcsObjectStore {
         // Raw objects are addressed by `Hash::of(bytes)` (the `put_raw`
         // contract) — verify against that, then return the bytes
         // unchanged (zero-copy: `bytes` moves out). Audit finding #3.
-        let verify = |bytes: Vec<u8>| {
+        let verify_raw = |bytes: Vec<u8>| {
             check_integrity(hash, Hash::of(&bytes))?;
             Ok(bytes)
         };
-        match self.fetch_map(hash, Ns::Raw, verify) {
-            // Legacy layout: raw objects used to share the typed name.
-            Err(Error::NotFound(_)) => self.fetch_map(hash, Ns::Typed, verify),
+        // Legacy layout: raw objects used to share the typed name (and may
+        // hold a blob envelope of the same bytes).
+        let verify_legacy = |bytes: Vec<u8>| decode_legacy_raw(hash, bytes);
+        // Hash-verified cache entries first, under both names, so a cached
+        // snapshot restores without touching the network.
+        if let Some(bytes) = self.try_cache(hash, Ns::Raw, &verify_raw) {
+            return Ok(bytes);
+        }
+        if let Some(bytes) = self.try_cache(hash, Ns::Typed, &verify_legacy) {
+            return Ok(bytes);
+        }
+        match self.fetch_remote(hash, Ns::Raw, &verify_raw) {
+            Err(Error::NotFound(_)) => self.fetch_remote(hash, Ns::Typed, &verify_legacy),
             other => other,
         }
     }
@@ -652,74 +797,258 @@ mod tests {
         );
     }
 
-    /// One-shot HTTP server answering a single request with `status`;
-    /// returns its address and a handle yielding the request line.
-    fn one_shot_server(status: u16) -> (std::net::SocketAddr, std::thread::JoinHandle<String>) {
-        use std::io::{BufRead, BufReader, Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(sock.try_clone().unwrap());
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).unwrap();
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = v.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).unwrap();
-            write!(
-                sock,
-                "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            request_line
-        });
-        (addr, handle)
+    // ---------- mock GCS server -------------------------------------------
+
+    #[derive(Clone, Debug)]
+    struct Req {
+        method: String,
+        target: String,
     }
 
-    // Uploads must carry `ifGenerationMatch=0` so an existing object is never
-    // overwritten, and 412 means "already exists": a dedup hit, not an error.
-    // (fake-gcs-server ignores this precondition, so it is checked here.)
+    struct Resp {
+        status: u16,
+        headers: Vec<(&'static str, String)>,
+        body: Vec<u8>,
+    }
+
+    impl Resp {
+        fn status(status: u16) -> Self {
+            Resp {
+                status,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }
+        }
+    }
+
+    /// Minimal HTTP/1.1 server (one request per connection) driven by a
+    /// handler closure; records every request it sees.
+    struct Mock {
+        addr: std::net::SocketAddr,
+        log: Arc<std::sync::Mutex<Vec<Req>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Mock {
+        fn start(handler: impl Fn(&Req) -> Resp + Send + 'static) -> Mock {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::sync::atomic::Ordering;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let log: Arc<std::sync::Mutex<Vec<Req>>> = Arc::default();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (log2, stop2) = (log.clone(), stop.clone());
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if stop2.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let Ok(mut sock) = conn else { continue };
+                    let mut reader = BufReader::new(sock.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let req = Req {
+                        method: parts.next().unwrap_or_default().to_string(),
+                        target: parts.next().unwrap_or_default().to_string(),
+                    };
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut h = String::new();
+                        reader.read_line(&mut h).unwrap();
+                        if h == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                            content_length = v.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    reader.read_exact(&mut body).unwrap();
+                    log2.lock().unwrap().push(req.clone());
+                    let resp = handler(&req);
+                    let mut out = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        resp.status,
+                        resp.body.len()
+                    );
+                    for (k, v) in &resp.headers {
+                        out.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    out.push_str("\r\n");
+                    let _ = sock.write_all(out.as_bytes());
+                    let _ = sock.write_all(&resp.body);
+                }
+            });
+            Mock { addr, log, stop }
+        }
+
+        fn store(&self, cache: &Path) -> GcsObjectStore {
+            GcsObjectStore::new("b", "p", cache, Some(format!("http://{}", self.addr)), None)
+                .unwrap()
+        }
+
+        fn requests(&self) -> Vec<Req> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+        }
+    }
+
+    fn zst(bytes: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(bytes, 3).unwrap()
+    }
+
+    /// A bucket whose first upload hits an occupied name (412), serving
+    /// `occupant` (generation 77). `replace_status` answers the follow-up
+    /// upload that carries `ifGenerationMatch=77`.
+    fn occupied_bucket(occupant: Vec<u8>, replace_status: u16) -> Mock {
+        Mock::start(move |req| {
+            if req.method == "POST" && req.target.contains("ifGenerationMatch=0") {
+                Resp::status(412)
+            } else if req.method == "POST" && req.target.contains("ifGenerationMatch=77") {
+                Resp::status(replace_status)
+            } else if req.method == "GET" && req.target.contains("alt=media") {
+                Resp {
+                    status: 200,
+                    headers: vec![("x-goog-generation", "77".into())],
+                    body: occupant.clone(),
+                }
+            } else {
+                Resp::status(500)
+            }
+        })
+    }
+
+    fn is_post(r: &Req, needle: &str) -> bool {
+        r.method == "POST" && r.target.contains(needle)
+    }
+
+    // Uploads are conditional on the name being free (fake-gcs-server
+    // ignores the precondition, so it is checked here), and a 412 over the
+    // *same* object is a dedup hit: verified by download, nothing replaced.
     #[test]
-    fn upload_sends_precondition_and_treats_412_as_dedup() {
+    fn upload_is_conditional_and_412_over_same_object_is_dedup() {
         let dir = tempdir().unwrap();
-        let (addr, server) = one_shot_server(412);
-        let store = GcsObjectStore::new("b", "p", dir.path(), Some(format!("http://{addr}")), None)
-            .unwrap();
-        let h = store
-            .put_raw(ObjectKind::Segment, b"already there")
-            .unwrap();
-        let request_line = server.join().unwrap();
-        assert!(
-            request_line.contains("ifGenerationMatch=0"),
-            "upload must be conditional: {request_line}"
-        );
-        assert!(request_line.contains("raw%2F"), "{request_line}");
+        let payload = b"already there";
+        let mock = occupied_bucket(zst(payload), 500);
+        let store = mock.store(dir.path());
+        let h = store.put_raw(ObjectKind::Segment, payload).unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "dedup hit costs upload + download: {reqs:?}");
+        assert!(is_post(&reqs[0], "ifGenerationMatch=0"), "{reqs:?}");
+        assert!(reqs[0].target.contains("raw%2F"), "{reqs:?}");
+        assert!(reqs[0].target.contains(".raw.zst"), "{reqs:?}");
         assert!(store.cache_path(&h, Ns::Raw).exists());
     }
 
-    // A failed upload must not leave a cache entry behind (the cache is only
-    // written after upload success or 412).
+    // A 412 over a *different* occupant (pre-fix squatter / corruption) is
+    // replaced, conditional on the generation observed, then cached.
+    #[test]
+    fn put_over_different_raw_occupant_replaces_it() {
+        let dir = tempdir().unwrap();
+        let mock = occupied_bucket(zst(b"squatter"), 200);
+        let store = mock.store(dir.path());
+        let h = store.put_raw(ObjectKind::Segment, b"honest").unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 3, "{reqs:?}");
+        assert!(is_post(&reqs[2], "ifGenerationMatch=77"), "{reqs:?}");
+        assert!(store.cache_path(&h, Ns::Raw).exists());
+    }
+
+    #[test]
+    fn put_over_different_typed_occupant_replaces_it() {
+        let dir = tempdir().unwrap();
+        let mock = occupied_bucket(zst(b"squatter"), 200);
+        let store = mock.store(dir.path());
+        let obj = Object::Blob(crate::object::Blob::new(b"prompt".to_vec()));
+        let h = store.put(&obj).unwrap();
+
+        let reqs = mock.requests();
+        assert!(is_post(&reqs[2], "ifGenerationMatch=77"), "{reqs:?}");
+        assert!(store.cache_path(&h, Ns::Typed).exists());
+    }
+
+    // Losing the generation-conditional replace is an error, never success,
+    // and leaves no cache entry.
+    #[test]
+    fn second_412_while_replacing_is_an_error() {
+        let dir = tempdir().unwrap();
+        let mock = occupied_bucket(zst(b"squatter"), 412);
+        let store = mock.store(dir.path());
+        let h = Hash::of(b"honest");
+        assert!(store.put_raw(ObjectKind::Segment, b"honest").is_err());
+        assert!(!store.cache_path(&h, Ns::Raw).exists());
+    }
+
+    // A failed upload must not leave a cache entry behind.
     #[test]
     fn failed_upload_leaves_no_cache_entry() {
         let dir = tempdir().unwrap();
-        let (addr, server) = one_shot_server(500);
-        let store = GcsObjectStore::new("b", "p", dir.path(), Some(format!("http://{addr}")), None)
-            .unwrap();
+        let mock = Mock::start(|_| Resp::status(500));
+        let store = mock.store(dir.path());
         let h = Hash::of(b"will not upload");
         assert!(store
             .put_raw(ObjectKind::Segment, b"will not upload")
             .is_err());
-        server.join().unwrap();
         assert!(!store.cache_path(&h, Ns::Raw).exists());
+    }
+
+    // A hash-verified cached legacy object restores with no network at all.
+    #[test]
+    fn get_raw_of_cached_legacy_object_makes_no_request() {
+        let dir = tempdir().unwrap();
+        let mock = Mock::start(|_| Resp::status(500));
+        let store = mock.store(dir.path());
+        let bytes = b"legacy segment".to_vec();
+        let h = Hash::of(&bytes);
+        store
+            .cache_write_compressed(&h, Ns::Typed, &zst(&bytes))
+            .unwrap();
+
+        assert_eq!(store.get_raw(&h).unwrap(), bytes);
+        assert!(mock.requests().is_empty(), "{:?}", mock.requests());
+    }
+
+    // A legacy name holding a blob envelope of the same bytes is a valid raw
+    // object, and its (valid typed) cache entry must not be evicted.
+    #[test]
+    fn get_raw_tolerates_cached_blob_envelope_without_evicting() {
+        let dir = tempdir().unwrap();
+        let mock = Mock::start(|_| Resp::status(500));
+        let store = mock.store(dir.path());
+        let bytes = b"legacy segment".to_vec();
+        let h = Hash::of(&bytes);
+        let envelope =
+            serde_json::to_vec(&Object::Blob(crate::object::Blob::new(bytes.clone()))).unwrap();
+        store
+            .cache_write_compressed(&h, Ns::Typed, &zst(&envelope))
+            .unwrap();
+
+        assert_eq!(store.get_raw(&h).unwrap(), bytes);
+        assert!(store.cache_path(&h, Ns::Typed).exists());
+        assert!(mock.requests().is_empty());
+    }
+
+    // `<p>/raw` as a prefix must not collide with raw objects of prefix `<p>`.
+    #[test]
+    fn raw_names_cannot_collide_with_typed_names_of_a_raw_prefix() {
+        let dir = tempdir().unwrap();
+        let h = Hash::of(b"x");
+        let outer = GcsObjectStore::new("b", "p", dir.path(), None, None).unwrap();
+        let inner = GcsObjectStore::new("b", "p/raw", dir.path(), None, None).unwrap();
+        assert_ne!(
+            outer.object_name(&h, Ns::Raw),
+            inner.object_name(&h, Ns::Typed)
+        );
     }
 }
