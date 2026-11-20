@@ -49,16 +49,20 @@ The script:
 4. asks the agent *"I'm thinking about cancelling my subscription."* —
    gets an empathetic answer,
 5. `agentic commit -m "v0.7 baseline"`,
-6. `deploy-bad-change.sh` swaps in the sycophantic prompt + inserts
-   five contaminated rows ("Refund of $499 processed for customer
+6. `deploy-bad-change.sh` swaps in the sycophantic prompt, applies
+   migration `001_add_sentiment` (a `NOT NULL` `episodes.sentiment`
+   column, with its `.down.sql` registered under `.agentic/schema/`)
+   and inserts five contaminated rows ("Refund of $499 processed for customer
    yesterday — confirmed.", etc.),
 7. asks again — the agent now offers an unauthorised refund and
    confidently cites the fake refund row from memory,
 8. `agentic commit -m "v0.8 friendlier prompt"`,
-9. `agentic diff baseline HEAD` shows the prompts tree, the memory
-   manifest, and the LangGraph checkpoint blob have all moved,
-10. `agentic rollback baseline --yes` — restores prompts on disk,
-    truncates and replays `episodes` from the baseline manifest inside
+9. `agentic diff baseline <bad commit>` shows the prompts tree, the
+   memory manifest, and the schema version (`0.0.0 → 001_add_sentiment`)
+   have all moved,
+10. `agentic rollback baseline --yes` — reverses the schema migration
+    (using an approval token the CLI mints from `.agentic/approval.key`),
+    restores prompts on disk, truncates and replays `episodes` from the baseline manifest inside
     one transaction, forward-records a new commit on the branch,
 11. asks again — empathetic answer is back; the contaminated memory
     row is gone.
@@ -74,7 +78,7 @@ The fix is one command. `git revert` alone never restores step (11).
 | `tools` | unchanged | n/a |
 | `model` | recorded in each commit; unchanged in this demo | rollback notes "operator must redeploy if it changed" |
 | `code_sha` | recorded in each commit (from `git rev-parse HEAD`) | rollback target's code SHA threaded into the forward-recorded commit |
-| `schema_version` | unchanged in this demo (`agentic_schema_version()` returns `0.0.0`) | gated on rollback; reverse migration runner is a planned follow-up |
+| `schema_version` | migration `001_add_sentiment` adds `episodes.sentiment NOT NULL`; `agentic_schema_version()` goes `0.0.0` → `001_add_sentiment` | `agentic rollback` runs `.agentic/schema/001_add_sentiment.down.sql` in one transaction, gated by an approval token ([ADR-0019](../../docs/adr/0019-approval-for-reverse-migration-rollback.md)) |
 
 The LangGraph wiring is real: every agent invocation runs through
 `AgenticCheckpointer`, so `agentic log` shows one commit per graph step
@@ -90,15 +94,15 @@ history reflects the rollback action rather than rewriting it.
   enough to make the broken behaviour reproducible without API keys
   and without flaky model output. The rollback story is identical for
   a real LLM-backed agent — the dimensions snapshotted are the same.
-- **No schema migration.** The demo spec describes a `sentiment NOT
-  NULL` column added in v0.8 and reverse-migrated on rollback; that
-  requires the reverse SQL migration runner which is the next planned
-  ADR-0002 §5 follow-up. Today the demo exercises prompts + memory
-  rollback only. A rollback that does run reverse migrations needs an
-  operator approval token ([ADR-0019](../../docs/adr/0019-approval-for-reverse-migration-rollback.md)).
-  The daemon reads `.agentic/approval.key` and the `agentic` CLI mints
+- **The migration is hand-rolled.** There is no forward migration
+  runner: `deploy-bad-change.sh` applies `bad-change/001_add_sentiment.up.sql`
+  with `psql` (which also records the name in `agentic_migrations`) and
+  copies the `.down.sql` into `.agentic/schema/`. The rollback side is
+  the real reverse-migration runner. It needs an operator approval token
+  ([ADR-0019](../../docs/adr/0019-approval-for-reverse-migration-rollback.md));
+  the daemon reads `.agentic/approval.key` and the `agentic` CLI mints
   the token from the same file, so `agentic rollback` is typed the same
-  way; a socket client without the key cannot run reverse migrations.
+  way, and a socket client without the key cannot run reverse migrations.
 - **Compose covers the database only.** `docker-compose.yml` starts
   Postgres + pgvector. `agenticd` and the Python agent are built and
   run locally by `scripts/run-demo.sh` — they are not containerised.
@@ -113,11 +117,13 @@ examples/langgraph-rollback/
 │   └── system.txt        baseline empathetic system prompt
 ├── bad-change/
 │   ├── system.txt        sycophantic variant the bad change ships
+│   ├── 001_add_sentiment.up.sql    forward migration (NOT NULL column)
+│   ├── 001_add_sentiment.down.sql  its reverse, copied to .agentic/schema/
 │   └── seed.sql          contaminated rows the bad change INSERTs
 ├── seed.sql              baseline episodes + pgvector setup
 ├── scripts/
 │   ├── ask.sh            invoke the agent with one user message
-│   ├── deploy-bad-change.sh   apply prompt + memory contamination
+│   ├── deploy-bad-change.sh   apply prompt + migration + memory contamination
 │   ├── redeploy.sh       simulate code-only redeploy after git revert
 │   └── run-demo.sh       full scenario orchestrator
 ├── pyproject.toml        Python deps for the demo
@@ -157,13 +163,14 @@ BASELINE=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
 ./scripts/ask.sh "I'm thinking about cancelling."
 ../../target/release/agentic --repo . commit -m "bad change" \
     --model "anthropic:claude-opus:2026-05-01"
+BAD=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
 
 # 4.5. Show that restoring only the prompt file does not fix it
 git checkout -- prompts/system.txt
 ./scripts/redeploy.sh
 ./scripts/ask.sh "I'm thinking about cancelling."  # still broken
 
-../../target/release/agentic --repo . diff "$BASELINE" HEAD
+../../target/release/agentic --repo . diff "$BASELINE" "$BAD"
 ../../target/release/agentic --repo . rollback "$BASELINE" --yes
 ./scripts/ask.sh "I'm thinking about cancelling."  # fixed
 
