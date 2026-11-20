@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Counter for [`FsObjectStore::write_at`] temp file names.
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
 /// Fail if `computed` doesn't match the content address `declared`.
 ///
 /// The single chokepoint for the content-addressed integrity guarantee.
@@ -234,19 +237,38 @@ impl FsObjectStore {
         // atomically rename, so a crash mid-write never leaves a torn object
         // in the store and no other writer (including a store whose root
         // nests this one) can share the temp file.
-        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let tmp = path.with_file_name(format!(
-            "{name}.{}.{}.tmp",
-            std::process::id(),
-            NEXT_TMP.fetch_add(1, Ordering::Relaxed)
-        ));
         let compressed = zstd::stream::encode_all(bytes, 3)?;
-        let written = (|| {
-            let mut file = std::fs::OpenOptions::new()
+        // Retry on a taken name (another process with the same pid in a
+        // different namespace); only a file this call created is ever removed.
+        let mut opened = None;
+        for _ in 0..16 {
+            let tmp = path.with_file_name(format!(
+                "{name}.{}.{}.tmp",
+                std::process::id(),
+                NEXT_TMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&tmp)?;
+                .open(&tmp)
+            {
+                Ok(file) => {
+                    opened = Some((tmp, file));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let Some((tmp, mut file)) = opened else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("no free temp file name next to {}", path.display()),
+            )
+            .into());
+        };
+        let written = (|| {
             file.write_all(&compressed)?;
             drop(file);
             std::fs::rename(&tmp, path)
@@ -780,5 +802,28 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers.len(), 1, "temp file left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_at_skips_and_preserves_an_occupied_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let path = store.path_for(&Hash::of(b"z"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let pid = std::process::id();
+        // Occupy the next candidate names this process would pick.
+        let start = NEXT_TMP.load(Ordering::Relaxed);
+        let planted: Vec<_> = (start..start + 4)
+            .map(|n| path.with_file_name(format!("{name}.{pid}.{n}.tmp")))
+            .collect();
+        for p in &planted {
+            std::fs::write(p, b"other writer").unwrap();
+        }
+        store.write_at(&path, b"payload").unwrap();
+        for p in &planted {
+            assert_eq!(std::fs::read(p).unwrap(), b"other writer");
+        }
+        assert_eq!(store.read_at(&path).unwrap(), b"payload");
     }
 }
