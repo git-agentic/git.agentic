@@ -14,7 +14,6 @@ use agentic_memory::MemoryAdapter;
 use anyhow::Context;
 
 /// Which memory backend to attach.
-#[derive(Debug)]
 pub enum MemoryBackendSpec {
     /// No memory backend; commits skip the memory-snapshot dimension.
     None,
@@ -23,6 +22,20 @@ pub enum MemoryBackendSpec {
         url: String,
         tables: Vec<TrackedTable>,
     },
+}
+
+/// Manual `Debug`: the URL carries the database password.
+impl std::fmt::Debug for MemoryBackendSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Postgres { tables, .. } => f
+                .debug_struct("Postgres")
+                .field("url", &"<redacted>")
+                .field("tables", tables)
+                .finish(),
+        }
+    }
 }
 
 impl MemoryBackendSpec {
@@ -87,6 +100,23 @@ mod tests {
             MemoryBackendSpec::from_flags(None, Vec::new()).unwrap(),
             MemoryBackendSpec::None
         ));
+    }
+
+    #[test]
+    fn debug_redacts_url() {
+        let spec = MemoryBackendSpec::from_flags(
+            Some("postgres://u:hunter2@h/db"),
+            vec![TrackedTable {
+                name: "t".into(),
+                pk: "id".into(),
+            }],
+        )
+        .unwrap();
+        let dbg = format!("{spec:?}");
+        assert!(
+            !dbg.contains("hunter2") && !dbg.contains("postgres://"),
+            "{dbg}"
+        );
     }
 
     #[test]

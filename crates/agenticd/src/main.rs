@@ -74,6 +74,11 @@ struct Args {
     #[arg(long)]
     postgres: Option<String>,
 
+    /// File holding the Postgres URL (trailing newline trimmed). Keeps
+    /// the password off argv. Alternative to `--postgres`.
+    #[arg(long, conflicts_with = "postgres")]
+    postgres_url_file: Option<PathBuf>,
+
     /// Comma-separated `table:pk` pairs to track. Required when
     /// `--postgres` is set. Example: `episodes:id,user_facts:id`.
     #[arg(long, value_delimiter = ',')]
@@ -91,7 +96,8 @@ struct Args {
     /// pushes every object through to Google Cloud Storage with a
     /// write-through local cache (ADR-0004 Decision 5). For GCS, set
     /// `AGENTIC_GCS_ENDPOINT` to override the host (e.g. fake-gcs-server)
-    /// and `AGENTIC_GCS_TOKEN` for bearer auth.
+    /// and `AGENTIC_GCS_TOKEN` (or `AGENTIC_GCS_TOKEN_FILE`, a path to a
+    /// file holding the token) for bearer auth.
     #[arg(long, default_value = "fs")]
     object_store: String,
 
@@ -316,6 +322,16 @@ async fn main() -> anyhow::Result<()> {
         "socket limits in force"
     );
 
+    // Before anything reads or writes state: the daemon must own the repo
+    // and `.agentic` (see state_dir.rs). Runs before the object store opens
+    // so no state is created under a directory we then refuse.
+    agenticd::state_dir::secure_state_dir(&args.repo)?;
+
+    let postgres_url = agenticd::secrets::resolve_postgres_url(
+        args.postgres.as_deref(),
+        args.postgres_url_file.as_deref(),
+    )?;
+
     let agentic_dir = args.repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
@@ -392,7 +408,7 @@ async fn main() -> anyhow::Result<()> {
             args.repo.clone(),
             agentic_dir.clone(),
             store,
-            args.postgres.as_deref(),
+            postgres_url.as_deref(),
             tables,
             mcp_servers,
             Arc::clone(&peer_auth),
@@ -405,6 +421,16 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
+
+    // Connecting to a Unix socket needs write permission on the file, and
+    // the worker runs as another uid. Access control is the SO_PEERCRED
+    // allowlist (ADR-0012), so open the file mode when one is enforced.
+    #[cfg(unix)]
+    if matches!(*peer_auth, PeerAuthPolicy::Allowlist(_)) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666))
+            .with_context(|| format!("setting mode on {}", socket_path.display()))?;
+    }
 
     tracing::info!(
         socket = %socket_path.display(),

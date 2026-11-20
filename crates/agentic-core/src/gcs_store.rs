@@ -96,7 +96,7 @@ struct Downloaded {
     generation: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GcsObjectStore {
     bucket: String,
     /// Object-name prefix inside the bucket. Lets a single bucket host
@@ -108,6 +108,22 @@ pub struct GcsObjectStore {
     client: reqwest::blocking::Client,
     scanner: Arc<Scanner>,
     allowlist: Arc<Allowlist>,
+}
+
+/// Manual `Debug`: never print the bearer token.
+impl std::fmt::Debug for GcsObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GcsObjectStore")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("cache_dir", &self.cache_dir)
+            .field("endpoint", &self.endpoint)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl GcsObjectStore {
