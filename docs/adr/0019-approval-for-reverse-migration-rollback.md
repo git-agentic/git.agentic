@@ -120,7 +120,9 @@ The CLI also checks who it is talking to.
 In a flow that may auto-sign, every request (resolving the target, the preview, the applied request) goes over a connection whose peer uid, read from the kernel, is the uid that owns the key file.
 If a check fails, the CLI gives up on signing: it warns on stderr and carries on without a token, and the daemon's gate refuses if one was needed.
 With `--accept-data-loss` the applied request is signed after a successful preview even if the reply omits `approval_required`, as an older daemon's would.
-Both sides open the key file with `O_NOFOLLOW` and `O_NONBLOCK`, so a symlink swapped in after the default-path check is never followed, and a symlinked key path is refused whether it is the default or named explicitly.
+Both sides open the key file with `O_NONBLOCK`, and check that the opened handle is a regular file.
+The auto-discovered default path is also opened with `O_NOFOLLOW`, so a symlink swapped in after the discovery check is never followed, and a symlink at the default path is skipped (CLI, with a warning) or treated as no key (daemon).
+A key named explicitly (`--approval-key-file`, `--key-file`, the issuer) is an operator choice and follows symlinks, because Kubernetes and Cloud Run secret volumes expose files through them.
 The CLI skips a default key path that is a symlink, FIFO or other special file, with a warning, and the daemon treats such a default path as no key, so a special file cannot block either.
 A key named explicitly must be a regular file (the CLI fails; the daemon warns and runs without a key, as for an unreadable file).
 It reads at most 33 bytes of the key file, as the daemon does.

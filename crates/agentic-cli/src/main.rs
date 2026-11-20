@@ -261,15 +261,22 @@ fn read_capped(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn read_key(key_file: &Path) -> anyhow::Result<LoadedKey> {
+/// Read an approval key. `nofollow` is set for the auto-discovered default
+/// path, so a symlink swapped in after discovery is never followed. A path the
+/// operator named (`--key-file`, the issuer) follows symlinks, because secret
+/// volumes expose files through them.
+fn read_key(key_file: &Path, nofollow: bool) -> anyhow::Result<LoadedKey> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let ctx = || format!("reading approval key {}", key_file.display());
     // O_NONBLOCK so opening a FIFO returns at once instead of waiting for a
-    // writer; the regular-file check below then refuses it. O_NOFOLLOW so a
-    // symlink swapped in after the default-path check is never followed.
+    // writer; the regular-file check below then refuses it.
+    let mut flags = libc::O_NONBLOCK;
+    if nofollow {
+        flags |= libc::O_NOFOLLOW;
+    }
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .custom_flags(flags)
         .open(key_file)
         .with_context(ctx)?;
     let meta = file.metadata().with_context(ctx)?;
@@ -326,7 +333,7 @@ fn mint_token(
     commit_hash: &str,
     uid: u32,
 ) -> anyhow::Result<String> {
-    mint_with_key(&read_key(key_file)?.key, scope, commit_hash, uid)
+    mint_with_key(&read_key(key_file, false)?.key, scope, commit_hash, uid)
 }
 
 /// ADR-0014 operator token issuer. Prints a token to stdout. Does not
@@ -390,7 +397,7 @@ fn load_rollback_key(repo: &Path, key_file: Option<PathBuf>) -> anyhow::Result<O
     let Some(path) = rollback_key_path(repo, key_file) else {
         return Ok(None);
     };
-    match read_key(&path) {
+    match read_key(&path, !explicit) {
         Ok(key) => Ok(Some(key)),
         Err(e) if !explicit => {
             eprintln!("warning: not attaching an approval token: {e:#}");
@@ -914,6 +921,17 @@ mod tests {
     }
 
     #[test]
+    fn nofollow_applies_only_to_the_default_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.key");
+        write_key_0600(&real, &[7u8; 32]);
+        let link = dir.path().join("link.key");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_key(&link, true).is_err());
+        assert!(read_key(&link, false).is_ok());
+    }
+
+    #[test]
     fn a_group_or_other_accessible_key_is_refused_with_a_chmod_hint() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -921,7 +939,7 @@ mod tests {
         write_key_0600(&path, &[7u8; 32]);
         for mode in [0o644, 0o640, 0o604, 0o660, 0o666] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let err = read_key(&path)
+            let err = read_key(&path, false)
                 .err()
                 .unwrap_or_else(|| panic!("{mode:o} accepted"));
             assert!(
@@ -931,7 +949,7 @@ mod tests {
         }
         for mode in [0o600, 0o400] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(read_key(&path).is_ok(), "{mode:o}");
+            assert!(read_key(&path, false).is_ok(), "{mode:o}");
         }
     }
 

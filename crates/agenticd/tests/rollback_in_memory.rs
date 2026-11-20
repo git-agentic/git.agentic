@@ -1365,7 +1365,11 @@ async fn accepted_audit_event_names_the_scope_the_token_verified_under() {
     ] {
         let (state, adapter, baseline, _dir) = setup_gate_state(true).await;
         contaminate(&state, &adapter).await;
-        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs());
+        // A timestamp no other test uses (they mint at now_secs()), still
+        // inside the TTL: tokens are deterministic in (key, scope, commit,
+        // uid, timestamp), so another test sharing the baseline hash and the
+        // second would otherwise mint a byte-identical token.
+        let tok = generate_token_scoped(&test_key(), scope, &baseline, 1000, now_secs() - 37);
         // The audited token_prefix is the first 8 hex chars of the tag: unique
         // to this scope's token, even if another test shares the commit hash.
         let prefix = tok.split_once(':').unwrap().1[..8].to_string();
@@ -1380,7 +1384,11 @@ async fn accepted_audit_event_names_the_scope_the_token_verified_under() {
         let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line = log
             .lines()
-            .find(|l| l.contains("RollbackForcedDataLoss") && l.contains(&prefix))
+            .find(|l| {
+                l.contains("RollbackForcedDataLoss")
+                    && l.contains(&prefix)
+                    && l.contains("reason=\"reverse_migration\"")
+            })
             .unwrap_or_else(|| panic!("no audit event for {prefix} in: {log}"));
         assert!(line.contains("decision=\"accepted\""), "{line}");
         assert!(line.contains(expect), "{expect}: {line}");

@@ -206,7 +206,7 @@ async fn a_fifo_named_with_the_flag_does_not_block_startup_either() {
 }
 
 #[tokio::test]
-async fn a_symlink_to_a_valid_key_is_not_followed_default_or_explicit() {
+async fn a_symlink_is_refused_as_the_default_key_but_followed_when_named() {
     // Default path: treated as no key.
     let repo = tempfile::tempdir().unwrap();
     let state = state_dir(repo.path());
@@ -219,7 +219,8 @@ async fn a_symlink_to_a_valid_key_is_not_followed_default_or_explicit() {
         "approval_key_not_configured"
     );
 
-    // Explicit flag: O_NOFOLLOW makes it unreadable, so fail closed.
+    // Explicit flag: an operator choice, so the symlink is followed (secret
+    // volumes are mounted that way) and the key loads.
     let repo = tempfile::tempdir().unwrap();
     let state = state_dir(repo.path());
     let real = state.join("real.key");
@@ -230,6 +231,6 @@ async fn a_symlink_to_a_valid_key_is_not_followed_default_or_explicit() {
     let flag = std::ffi::OsString::from("--approval-key-file");
     assert_eq!(
         rollback_error_code_with(repo.path(), &[flag.as_os_str(), link.as_os_str()]).await,
-        "approval_key_not_configured"
+        "approval_required"
     );
 }

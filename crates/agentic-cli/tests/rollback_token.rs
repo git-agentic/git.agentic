@@ -527,20 +527,17 @@ fn issuer_scope_flag_selects_the_token_scope_and_defaults_to_data_loss() {
 }
 
 #[test]
-fn a_symlink_at_the_key_path_is_never_followed() {
-    // O_NOFOLLOW: a symlink to a valid key is refused even when the path is
-    // named explicitly, so a swap after any earlier check cannot be followed.
+fn an_explicitly_named_symlinked_key_is_followed() {
+    // A path the operator names follows symlinks: secret volumes are mounted
+    // that way. Only the auto-discovered default is opened with O_NOFOLLOW.
     let f = fixture();
     let real = f.repo.path().join("real.key");
     write_key(&real, &KEY);
     let link = f.repo.path().join("link.key");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let out = rollback_cmd(&f, &["--key-file", link.to_str().unwrap()]);
-    assert!(
-        !out.status.success(),
-        "an explicit symlinked key is an error"
-    );
-    assert!(f.seen.lock().unwrap().is_empty());
+    run_rollback(&f, &["--key-file", link.to_str().unwrap()]);
+    let seen = f.seen.lock().unwrap();
+    assert!(seen.last().unwrap().token.is_some(), "{seen:?}");
 }
 
 #[test]
