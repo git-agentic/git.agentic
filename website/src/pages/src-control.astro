@@ -63,13 +63,13 @@ const structuredData = [
 <Base
   title="In-Memory Git Worktrees for Parallel AI Agents | src-control"
   description="Fork in-memory worktrees for parallel AI agents, collaborate through encrypted branches, sync with Git, and inspect native history in a read-only desktop app."
-  modifiedTime="2026-07-18"
+  modifiedTime="2026-11-20"
   structuredData={structuredData}
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Phases 1–35 built</span>
+    <span class="badge"><span class="pulse"></span>Phases 1–36 and 37a–37d built</span>
     <span class="badge">Rust · Tauri v2 · TypeScript</span>
     <span class="badge">Builds on Git, not against it</span>
   </div>
@@ -185,7 +185,7 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
 
   <h2>Status</h2>
   <p class="mute">
-    Phases 1–35 are built and tested. The arc so far: in-RAM virtual
+    Phases 1–36 and the P37a–37d partial-clone series are built and tested. The arc so far: in-RAM virtual
     worktrees and committed secrets (P1–2); persistent repos, merge,
     secret scanning, remotes, encrypted paths, packfiles/GC, Git
     export (P3–9); bidirectional Git sync, secret/permission lifecycle
@@ -200,15 +200,40 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
     recipient set, with O(1) grant, plaintext-free revocation, and
     atomic publish (P34); and a native Tauri v2 browser over the <code>.sc</code>
     object model, with refs, all-parent history, provenance, public trees, and
-    first-parent diffs while protected and private states stay safe (P35).
-    Feature phases ship with runnable proofs and tests — see <code>demo/</code>
-    and <code>apps/desktop/</code> in the repo. Pre-1.0 and design-partner alpha:
+    first-parent diffs while protected and private states stay safe (P35);
+    bucket WAL remotes over <code>sc+wal://</code> and <code>sc+s3://</code>
+    (P36); and lazy partial clones, with want-by-id fetch, presence-based
+    partial clones, and merge, cherry-pick, rebase and agent sessions on a
+    partial clone (P37a–37d).
+    Feature phases ship with runnable proofs and tests; the repo has 28
+    end-to-end demo proofs in <code>demo/</code>, and the desktop app lives in
+    <code>apps/desktop/</code>. Pre-1.0 and design-partner alpha:
     the cryptography has not had an independent audit,
     <code>sc+https://</code> trust is first-connection (TOFU) pinning,
     and revoking a private-branch recipient protects what is sealed
     afterwards — it cannot erase what they already fetched. The
     near-term promise is parallel agent workspaces and provenance,
     not production secret management.
+  </p>
+
+  <p class="mute">
+    Recent changes: named and concurrent <code>sc ws</code> sessions, TLS pin
+    management (<code>sc tls</code>) and CA validation for
+    <code>sc+https://</code>, token expiry and rotation,
+    <code>sc rewrap --rotate</code>, a blob-size clone filter, and owner-only
+    key ACLs on Windows. On 20 November 2026 a security fix round merged
+    (#360 to #368): fuzzing of untrusted decoders, serve hardening, and fixes
+    for a checkout escape, recipient sealing, and secret environment
+    injection.
+  </p>
+
+  <p class="mute">
+    Next, P38 is sc-forge, a configurable self-hosted Git host: bare Git over
+    smart HTTP, a recorded Gitea API subset, protected merges, and ops
+    tooling. It passes all 24 recorded scenarios and six first-consumer
+    acceptance scenarios locally. That is local acceptance only; a
+    production migration is a separate step, and its design
+    (ADR-0058) is still Proposed.
   </p>
 
   <p class="mute">

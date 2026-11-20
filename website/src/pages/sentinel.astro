@@ -19,7 +19,7 @@ const faqs = [
   },
   {
     question: 'Is Sentinel production ready?',
-    answer: 'Sentinel is pre-1.0 and published as an alpha. Its product page documents current capabilities and limitations; production adoption should follow that status.',
+    answer: 'Sentinel is pre-1.0 and published as an alpha (currently 0.1.0-alpha.2). Its product page documents current capabilities and limitations; production adoption should follow that status.',
   },
 ];
 const structuredData = [
@@ -58,13 +58,13 @@ const structuredData = [
 <Base
   title="npm Supply-Chain Security for AI Agents | Sentinel"
   description="Audit npm packages before install-time code runs. Sentinel gives AI agents deterministic risk verdicts, sandbox enforcement, and human approval gates."
-  modifiedTime="2026-07-18"
+  modifiedTime="2026-11-20"
   structuredData={structuredData}
 >
   <Header />
 
   <div class="badges">
-    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · v0.1.0-alpha.1 on npm</span>
+    <span class="badge"><span class="pulse"></span>Security layer + registry built · pre-1.0 · v0.1.0-alpha.2 on npm</span>
     <span class="badge">Apache 2.0</span>
     <span class="badge">TypeScript</span>
   </div>
@@ -201,10 +201,13 @@ $ sentinel audit is-odd 3.0.1
     2026-07-13: audit-gated publishes, verified namespace claims,
     time-locked retraction, and an npm/pnpm/Yarn/bun-compatible surface
     with a safe exit path. Sentinel is pre-1.0 and not yet
-    production-hardened, but it is now installable: the first alpha,
-    v0.1.0-alpha.1, is published to npm — all seven
-    <code>@git-agentic/sentinel-*</code> packages, under the
-    <code>alpha</code> dist-tag. The next milestone is design-partner
+    production-hardened and its APIs may change, but it is installable: the
+    current alpha, v0.1.0-alpha.2 (released 14 July 2026), is on npm: all
+    seven <code>@git-agentic/sentinel-*</code> packages, under the
+    <code>alpha</code> dist-tag, and the <code>latest</code> tag points to it
+    as well. Since July: obfuscation false-positive fixes, approval identity
+    coverage, dependency updates, and on 20 November 2026 a security-audit
+    fix round (#84) and install-hook script following (#89). The next milestone is design-partner
     evidence — blocked incidents, false-positive rate, audit latency. The
     long arc is policy and install-time permissions for the whole
     ecosystem.

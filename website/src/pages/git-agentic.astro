@@ -58,7 +58,7 @@ const structuredData = [
 <Base
   title="AI Agent Version Control & Atomic Rollback | git.agentic"
   description="Version and roll back AI agent code, prompts, tools, models, memory, and schema atomically. Open-source Rust core, Python SDK, and LangGraph support."
-  modifiedTime="2026-07-18"
+  modifiedTime="2026-11-20"
   structuredData={structuredData}
 >
   <Header />
@@ -179,6 +179,33 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
     real deployments is the bar before we call it v1.0. In-progress
     workstreams: storage backends beyond the local store, ephemeral
     branches as an agent-run primitive, and hardening.
+  </p>
+
+  <h3>Security hardening, November 2026</h3>
+  <p class="mute">
+    On 20 November 2026 a security hardening round merged (PRs #145 to #153
+    and #156). The daemon already checks socket peers against a UID
+    allowlist (<a href={`${repo}/blob/main/docs/adr/0012-socket-peer-authentication.md`}>ADR-0012</a>).
+    Now any rollback that runs reverse schema migrations also needs an
+    operator approval token (<a href={`${repo}/blob/main/docs/adr/0019-approval-for-reverse-migration-rollback.md`}>ADR-0019</a>). Tokens are single-use per daemon
+    process and scoped, so a reverse-migration token cannot authorize a
+    data-loss rollback. The <code>agentic</code> CLI attaches the token
+    automatically when it can read the key.
+  </p>
+  <ul class="plain">
+    <li>The object store keeps raw and typed objects at separate addresses, so a landed commit stays restorable (<a href={`${repo}/blob/main/docs/adr/0018-separate-raw-object-namespace.md`}>ADR-0018</a>)</li>
+    <li>The sidecar deployment isolates daemon state and credentials from the worker: state-directory ownership checks, credential files, redacted logs</li>
+    <li>Rollback prompt write-back cannot escape the prompts directory, and it validates the tree before it touches the database</li>
+    <li>The LangGraph checkpointer only deserializes allow-listed types</li>
+    <li>CI actions and container base images are pinned to immutable references, and known dependency advisories are cleared</li>
+    <li>The threat model is reconciled (TM-001 to TM-013), with residual risks stated openly</li>
+  </ul>
+  <p class="mute">
+    Still open: the rollback target of under 5 seconds at 1M-row pgvector
+    scale is under verification
+    (<a href={`${repo}/issues/132`}>issue #132</a>); demo-scale rollback takes
+    about 1 second. Authorization of operations beyond rollback is not
+    done yet (TM-001).
   </p>
 
   <h2>Design partners</h2>
