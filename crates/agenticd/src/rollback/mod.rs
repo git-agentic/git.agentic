@@ -50,7 +50,7 @@ use crate::server::DaemonState;
 use agentic_proto::RollbackOutput;
 
 use loaders::{load_commit, load_manifest};
-use writeback::{read_model_text, read_text_blobs, restore_prompts};
+use writeback::{preflight_prompts, read_model_text, read_text_blobs, restore_prompts};
 
 pub struct RollbackArgs {
     pub target: String,
@@ -255,6 +255,13 @@ pub async fn execute(
 
     let target = load_commit(&state, &target_hash)?;
     validate_target_shape(&target, &target_hash)?;
+
+    // Reject an unwritable prompts tree (bad entry name, symlinked prompts
+    // directory) before any migration or memory restore, and on dry runs,
+    // so a refusal can't leave a half-applied rollback.
+    if let Some(prompts_hash) = target.prompts {
+        preflight_prompts(&state, &args.repo, &prompts_hash)?;
+    }
 
     let mut plan: Vec<String> = Vec::new();
 

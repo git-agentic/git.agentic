@@ -664,3 +664,113 @@ fn commit_input_no_memory(message: &str) -> CommitInput {
     input.no_memory = true;
     input
 }
+
+// ---------------------------------------------------------------------------
+// Prompt write-back preflight: an unwritable prompts tree must be rejected
+// before any reverse migration or memory restore (and on dry runs).
+// ---------------------------------------------------------------------------
+
+/// Commit a target whose prompts tree contains `prompt_name`, then dirty the
+/// schema and memory, so a rollback to the target would have real work to
+/// undo. Returns the target ref.
+async fn commit_target_then_contaminate(
+    state: &Arc<DaemonState>,
+    adapter: &InMemoryAdapter,
+    agentic_dir: &std::path::Path,
+    prompt_name: &str,
+) -> String {
+    let mut input = commit_input_with_memory("target");
+    input
+        .prompts
+        .insert(prompt_name.to_string(), b"payload".to_vec());
+    let target = commit::execute(Arc::clone(state), input, Some(1000))
+        .await
+        .expect("target commit")
+        .commit_hash;
+
+    adapter.apply_migration("002_bump").await;
+    adapter
+        .insert_rows(
+            "messages",
+            vec![serde_json::json!({"id": 99, "body": "bad"})],
+        )
+        .await;
+    let schema_dir = agentic_dir.join("schema");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(schema_dir.join("002_bump.down.sql"), "-- no-op\n").unwrap();
+    target
+}
+
+async fn assert_rollback_refused_before_side_effects(
+    state: &Arc<DaemonState>,
+    adapter: &InMemoryAdapter,
+    repo: &std::path::Path,
+    target: &str,
+    expect: &str,
+) {
+    let tip = state.refs.read_branch("main").unwrap();
+    let rows_before = adapter.rows_of("messages").await;
+    for dry_run in [true, false] {
+        let err = rollback::execute(
+            Arc::clone(state),
+            RollbackArgs {
+                target: target.to_string(),
+                dry_run,
+                accept_data_loss: false,
+                approval_token: None,
+                repo: repo.to_path_buf(),
+            },
+            None,
+        )
+        .await
+        .expect_err("unwritable prompts tree must be refused");
+        assert!(
+            format!("{err:#}").contains(expect),
+            "dry_run={dry_run}: {err:#}"
+        );
+        assert_eq!(
+            adapter.current_schema_version().await.unwrap(),
+            "002_bump",
+            "schema must not be reversed (dry_run={dry_run})"
+        );
+        assert_eq!(
+            adapter.rows_of("messages").await,
+            rows_before,
+            "memory must not be restored (dry_run={dry_run})"
+        );
+        assert_eq!(state.refs.read_branch("main").unwrap(), tip);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_refuses_symlinked_prompts_parent_before_side_effects() {
+    let (state, adapter, _baseline, dir) = setup_gate_state(false).await;
+    let agentic_dir = dir.path().join(".agentic");
+    let target = commit_target_then_contaminate(&state, &adapter, &agentic_dir, "sub/x").await;
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("keep.txt"), b"outside").unwrap();
+    std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("prompts/sub")).unwrap();
+
+    assert_rollback_refused_before_side_effects(&state, &adapter, dir.path(), &target, "symlink")
+        .await;
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn rollback_refuses_invalid_prompt_name_before_side_effects() {
+    let (state, adapter, _baseline, dir) = setup_gate_state(false).await;
+    let agentic_dir = dir.path().join(".agentic");
+    let target = commit_target_then_contaminate(&state, &adapter, &agentic_dir, "../escape").await;
+
+    assert_rollback_refused_before_side_effects(
+        &state,
+        &adapter,
+        dir.path(),
+        &target,
+        "unsafe path component",
+    )
+    .await;
+}
