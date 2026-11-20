@@ -63,16 +63,15 @@ fn reject_file_dir_conflicts(names: &[&String]) -> anyhow::Result<()> {
             .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
             .collect()
     };
-    let keys: Vec<Vec<String>> = names.iter().map(|n| key(n)).collect();
-    for (i, file) in keys.iter().enumerate() {
-        if let Some(j) = keys
-            .iter()
-            .position(|dir| dir.len() > file.len() && dir.starts_with(file))
-        {
+    // Sorted component vectors put every extension of a key directly after
+    // it, so comparing neighbours finds any conflict in O(n log n).
+    let mut keys: Vec<(Vec<String>, &String)> = names.iter().map(|n| (key(n), *n)).collect();
+    keys.sort();
+    for pair in keys.windows(2) {
+        let ((file, file_name), (dir, dir_name)) = (&pair[0], &pair[1]);
+        if dir.len() > file.len() && dir.starts_with(file) {
             return Err(anyhow!(
-                "prompt tree entry {:?} is both a file and the directory of {:?}",
-                names[i],
-                names[j]
+                "prompt tree entry {file_name:?} is both a file and the directory of {dir_name:?}"
             ));
         }
     }
