@@ -37,6 +37,8 @@ pub(super) fn preflight_prompts(
 ) -> anyhow::Result<()> {
     let dir = repo.join("prompts");
     reject_symlinked_dirs(repo, &dir)?;
+    let tmp_dir = ensure_tmp_dir(state.refs.agentic_dir())?;
+    reject_other_device(&tmp_dir, &dir)?;
     let tree = load_tree(state, prompts_hash)?;
     let names: Vec<&String> = tree.entries.keys().collect();
     reject_file_dir_conflicts(&names)?;
@@ -44,6 +46,7 @@ pub(super) fn preflight_prompts(
         validate_tree_entry_name(name)?;
         if let Some(parent) = dir.join(name).parent() {
             reject_symlinked_dirs(repo, parent)?;
+            reject_other_device(&tmp_dir, parent)?;
         }
     }
     Ok(())
@@ -97,10 +100,10 @@ fn reject_file_dir_conflicts(names: &[&String]) -> anyhow::Result<()> {
 /// existing directory between it and a write target must not be a symlink
 /// ([`reject_symlinked_dirs`]), checked before and after `create_dir_all`.
 /// This covers links that exist before the call. A concurrent swap during
-/// the call is a residual race for a same-uid worker sharing the volume. It
-/// is accepted because the daemon's state directory must not be reachable by
-/// the worker (see docs/integration/executor-sidecar.md and the state-dir
-/// startup check); a full fix needs an openat-style walk.
+/// the call is a residual race for a worker that can write the repo. It is
+/// accepted because the deployment must not let the worker write the
+/// daemon's repo or state directory (docs/integration/executor-sidecar.md);
+/// a full fix needs an openat-style walk.
 pub(super) fn restore_prompts(
     state: &DaemonState,
     repo: &Path,
@@ -164,14 +167,67 @@ const TMP_ATTEMPTS: usize = 16;
 /// temp name.
 fn ensure_tmp_dir(agentic_dir: &Path) -> anyhow::Result<PathBuf> {
     let dir = agentic_dir.join("tmp");
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-        .create(&dir)
-        .with_context(|| format!("creating temp directory {}", dir.display()))?;
+    match std::fs::symlink_metadata(&dir) {
+        // An existing entry must be a real directory (never a symlink), and is
+        // tightened to 0700 in case an older run or another tool loosened it.
+        Ok(meta) if meta.file_type().is_dir() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("restricting temp directory {}", dir.display()))?;
+            }
+        }
+        Ok(_) => {
+            return Err(anyhow!(
+                "temp directory {} exists but is not a directory (symlink or file); refusing to use it",
+                dir.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(&dir)
+                .with_context(|| format!("creating temp directory {}", dir.display()))?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("inspecting temp directory {}", dir.display()));
+        }
+    }
     Ok(dir)
+}
+
+/// Refuse a target whose nearest existing ancestor is on a different
+/// filesystem than the temp directory: the final `rename` would fail with
+/// EXDEV after the database changed.
+#[cfg(unix)]
+fn reject_other_device(tmp_dir: &Path, target: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let tmp_dev = std::fs::metadata(tmp_dir)
+        .with_context(|| format!("inspecting {}", tmp_dir.display()))?
+        .dev();
+    let Some(existing) = target.ancestors().find(|p| p.exists()) else {
+        return Ok(());
+    };
+    let dev = std::fs::metadata(existing)
+        .with_context(|| format!("inspecting {}", existing.display()))?
+        .dev();
+    if dev != tmp_dev {
+        return Err(anyhow!(
+            "{} is on a different filesystem than {}; .agentic and prompts must share one filesystem",
+            existing.display(),
+            tmp_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn reject_other_device(_tmp_dir: &Path, _target: &Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// Exclusively create a temp file in `tmp_dir` (`.agentic-tmp-<pid>-<n>`,
@@ -811,5 +867,33 @@ mod tests {
             0o700
         );
         ensure_tmp_dir(agentic.path()).unwrap(); // idempotent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_tmp_dir_refuses_symlink_and_tightens_existing() {
+        use std::os::unix::fs::PermissionsExt;
+        let outside = tempfile::tempdir().unwrap();
+        let linked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked.path().join("tmp")).unwrap();
+        assert!(ensure_tmp_dir(linked.path()).is_err());
+
+        let loose = tempfile::tempdir().unwrap();
+        let tmp = loose.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_tmp_dir(loose.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_device_target_passes_the_device_check() {
+        let agentic = tempfile::tempdir().unwrap();
+        let tmp = ensure_tmp_dir(agentic.path()).unwrap();
+        reject_other_device(&tmp, &agentic.path().join("prompts/a/b")).unwrap();
     }
 }
