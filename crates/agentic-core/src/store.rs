@@ -11,7 +11,7 @@
 //! where additional backends (e.g. S3, network-replicated) will plug in.
 
 use crate::hash::Hash;
-use crate::object::{Object, ObjectKind};
+use crate::object::{Blob, Commit, Object, ObjectKind, Tree};
 use crate::scanner::{Allowlist, ScanPolicy, Scanner};
 use crate::{Error, Result};
 
@@ -37,6 +37,46 @@ pub(crate) fn check_integrity(declared: &Hash, computed: Hash) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Reject a blob whose bytes are exactly the canonical JSON of a `Tree` or
+/// `Commit`. Those objects hash `json(inner)`, so such a blob would share a
+/// content address with the typed object while being stored under a
+/// different envelope; whichever write came first would win the address.
+pub(crate) fn check_blob_unambiguous(bytes: &[u8]) -> Result<()> {
+    let canonical_tree = serde_json::from_slice::<Tree>(bytes)
+        .ok()
+        .is_some_and(|t| serde_json::to_vec(&t).is_ok_and(|c| c == bytes));
+    let canonical_commit = serde_json::from_slice::<Commit>(bytes)
+        .ok()
+        .is_some_and(|c| serde_json::to_vec(&c).is_ok_and(|c| c == bytes));
+    if canonical_tree || canonical_commit {
+        return Err(Error::AmbiguousBlob {
+            hash: Hash::of(bytes),
+        });
+    }
+    Ok(())
+}
+
+/// Decode the bytes stored at a typed address and verify them against it.
+///
+/// Stores written before raw objects got their own namespace may hold bare
+/// `put_raw` bytes at a typed address. If the stored bytes do not decode to
+/// an object with the requested hash but hash to it directly, they are a
+/// legacy raw object, and a blob with the same content is the right answer.
+pub(crate) fn decode_typed(hash: &Hash, stored: Vec<u8>) -> Result<Object> {
+    let parsed = serde_json::from_slice::<Object>(&stored);
+    if let Ok(object) = &parsed {
+        if object.hash() == *hash {
+            return parsed.map_err(Error::from);
+        }
+    }
+    if Hash::of(&stored) == *hash {
+        return Ok(Object::Blob(Blob::new(stored)));
+    }
+    let object = parsed?;
+    check_integrity(hash, object.hash())?;
+    Ok(object)
 }
 
 /// The store contract. MVP implementer is `FsObjectStore`; future
@@ -84,9 +124,21 @@ impl FsObjectStore {
         self
     }
 
+    /// Typed objects (`put_with_policy`): `<root>/<ab>/<rest>.zst`.
     fn path_for(&self, hash: &Hash) -> PathBuf {
         let (prefix, rest) = hash.shard();
         self.root.join(prefix).join(format!("{rest}.zst"))
+    }
+
+    /// Raw objects (`put_raw`): `<root>/raw/<ab>/<rest>.zst`. A separate
+    /// namespace so bare bytes and typed envelopes can never claim the
+    /// same file.
+    fn raw_path_for(&self, hash: &Hash) -> PathBuf {
+        let (prefix, rest) = hash.shard();
+        self.root
+            .join("raw")
+            .join(prefix)
+            .join(format!("{rest}.zst"))
     }
 
     fn write_at(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -127,6 +179,10 @@ impl ObjectStore for FsObjectStore {
             }
         }
 
+        if let Object::Blob(blob) = object {
+            check_blob_unambiguous(&blob.bytes)?;
+        }
+
         let bytes = serde_json::to_vec(object)?;
         let hash = object.hash();
         let path = self.path_for(&hash);
@@ -150,7 +206,7 @@ impl ObjectStore for FsObjectStore {
         }
 
         let hash = Hash::of(bytes);
-        let path = self.path_for(&hash);
+        let path = self.raw_path_for(&hash);
         if !path.exists() {
             self.write_at(&path, bytes)?;
         }
@@ -163,15 +219,16 @@ impl ObjectStore for FsObjectStore {
             return Err(Error::NotFound(*hash));
         }
         let bytes = self.read_at(&path)?;
-        let object: Object = serde_json::from_slice(&bytes)?;
-
         // Integrity check: did we get back what the address says we should?
-        check_integrity(hash, object.hash())?;
-        Ok(object)
+        decode_typed(hash, bytes)
     }
 
     fn get_raw(&self, hash: &Hash) -> Result<Vec<u8>> {
-        let path = self.path_for(hash);
+        let mut path = self.raw_path_for(hash);
+        if !path.exists() {
+            // Legacy layout: raw objects used to share the typed path.
+            path = self.path_for(hash);
+        }
         if !path.exists() {
             return Err(Error::NotFound(*hash));
         }
@@ -184,7 +241,7 @@ impl ObjectStore for FsObjectStore {
     }
 
     fn has(&self, hash: &Hash) -> bool {
-        self.path_for(hash).exists()
+        self.path_for(hash).exists() || self.raw_path_for(hash).exists()
     }
 }
 
@@ -335,7 +392,7 @@ mod tests {
         // Overwrite the stored object with different bytes at the same
         // path (same content address) — the exact shape of a corrupted
         // disk or a store writer that altered an object in place.
-        let path = store.path_for(&hash);
+        let path = store.raw_path_for(&hash);
         store.write_at(&path, b"tampered bytes").unwrap();
 
         match store.get_raw(&hash) {
@@ -396,6 +453,91 @@ mod tests {
                 )));
             }
             other => panic!("expected SecretDetected, got {other:?}"),
+        }
+    }
+
+    fn sample_commit() -> Commit {
+        Commit {
+            parent: None,
+            author: "a".into(),
+            timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            message: "m".into(),
+            code_sha: None,
+            prompts: None,
+            tools: None,
+            model: None,
+            memory_snapshot: None,
+            schema_version: None,
+            intent: None,
+            plan: None,
+            transcript: None,
+            evals: None,
+            cost_cents: 0,
+            signatures: Vec::new(),
+            peer_uid: None,
+        }
+    }
+
+    #[test]
+    fn blob_put_does_not_shadow_later_put_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"segment-like bytes".to_vec();
+        store.put(&Object::Blob(Blob::new(b.clone()))).unwrap();
+        let h = store.put_raw(ObjectKind::Segment, &b).unwrap();
+        assert_eq!(store.get_raw(&h).unwrap(), b);
+    }
+
+    #[test]
+    fn put_raw_does_not_shadow_later_blob_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let b = b"segment-like bytes".to_vec();
+        let h = store.put_raw(ObjectKind::Segment, &b).unwrap();
+        store.put(&Object::Blob(Blob::new(b.clone()))).unwrap();
+        match store.get(&h).unwrap() {
+            Object::Blob(got) => assert_eq!(got.bytes, b),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+        assert_eq!(store.get_raw(&h).unwrap(), b);
+    }
+
+    #[test]
+    fn blob_equal_to_canonical_tree_or_commit_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+
+        let tree_json = serde_json::to_vec(&Tree::new()).unwrap();
+        let commit_json = serde_json::to_vec(&sample_commit()).unwrap();
+        for bytes in [tree_json, commit_json] {
+            match store.put(&Object::Blob(Blob::new(bytes.clone()))) {
+                Err(Error::AmbiguousBlob { hash }) => assert_eq!(hash, Hash::of(&bytes)),
+                other => panic!("expected AmbiguousBlob, got {other:?}"),
+            }
+        }
+
+        // Ordinary JSON, including a non-canonical spelling of a tree, is fine.
+        store
+            .put(&Object::Blob(Blob::new(br#"{"prompt":"hi"}"#.to_vec())))
+            .unwrap();
+        store
+            .put(&Object::Blob(Blob::new(br#"{ "entries": {} }"#.to_vec())))
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_raw_layout_is_still_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsObjectStore::open(dir.path()).unwrap();
+        let bytes = b"written by an older version".to_vec();
+        let hash = Hash::of(&bytes);
+        store.write_at(&store.path_for(&hash), &bytes).unwrap();
+
+        assert!(store.has(&hash));
+        assert_eq!(store.get_raw(&hash).unwrap(), bytes);
+        match store.get(&hash).unwrap() {
+            Object::Blob(got) => assert_eq!(got.bytes, bytes),
+            other => panic!("expected Blob, got {other:?}"),
         }
     }
 }

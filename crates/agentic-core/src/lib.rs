@@ -52,6 +52,12 @@ pub enum Error {
     #[error("blob rejected by secret scanner: {hits:?}")]
     SecretDetected { hits: Vec<scanner::Hit> },
 
+    #[error(
+        "blob rejected: its bytes are the canonical encoding of a tree or commit \
+         and would share address {hash} with that object"
+    )]
+    AmbiguousBlob { hash: Hash },
+
     #[error("invalid branch name {name:?}: {reason}")]
     InvalidBranchName { name: String, reason: String },
 

@@ -164,9 +164,10 @@ fn corrupt_download_is_rejected_and_not_cached() {
 
     // Overwrite the bucket object at its exact key with zstd of DIFFERENT
     // bytes — the shape of a bucket writer tampering in place. The object
-    // name mirrors GcsObjectStore::object_name: `<prefix>/<ab>/<rest>.zst`.
+    // name mirrors GcsObjectStore::object_name for raw objects:
+    // `<prefix>/raw/<ab>/<rest>.zst`.
     let hex = hash.to_hex();
-    let object_name = format!("{prefix}/{}/{}.zst", &hex[..2], &hex[2..]);
+    let object_name = format!("{prefix}/raw/{}/{}.zst", &hex[..2], &hex[2..]);
     let corrupt = zstd::stream::encode_all(&b"CORRUPTED"[..], 3).unwrap();
     let upload_url = format!(
         "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
@@ -209,9 +210,10 @@ fn corrupt_download_is_rejected_and_not_cached() {
     }
     // Never cache a failed verification: the corrupt bytes must not have
     // been persisted to the cold cache. Cache layout mirrors
-    // GcsObjectStore::cache_path: `<cache_dir>/<ab>/<rest>.zst`.
+    // GcsObjectStore::cache_path for raw objects: `<cache_dir>/raw/<ab>/<rest>.zst`.
     let cache_file = cache2
         .path()
+        .join("raw")
         .join(&hex[..2])
         .join(format!("{}.zst", &hex[2..]));
     assert!(
@@ -233,5 +235,45 @@ fn missing_object_returns_not_found() {
     match err {
         agentic_core::Error::NotFound(h) => assert_eq!(h, nope),
         other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+// An existing object is never overwritten: a typed put at an address that
+// already holds a raw object must leave the raw object intact (they live in
+// different namespaces), and repeat puts of the same object are dedup hits.
+#[test]
+#[ignore]
+fn second_upload_never_overwrites_and_dedup_succeeds() {
+    let prefix = fresh_prefix();
+    let Some((store, _cache)) = make_store(&prefix) else {
+        eprintln!("GCS_BUCKET not set — skipping");
+        return;
+    };
+
+    let payload = b"honest segment bytes".to_vec();
+    let h = store.put_raw(ObjectKind::Segment, &payload).unwrap();
+    // Same-address typed put, then dedup re-puts of both kinds.
+    store
+        .put(&Object::Blob(Blob::new(payload.clone())))
+        .unwrap();
+    assert_eq!(store.put_raw(ObjectKind::Segment, &payload).unwrap(), h);
+    store
+        .put(&Object::Blob(Blob::new(payload.clone())))
+        .unwrap();
+
+    // Cold cache so reads go to the bucket.
+    let cache2 = tempfile::tempdir().unwrap();
+    let cold = GcsObjectStore::new(
+        bucket().unwrap(),
+        prefix.clone(),
+        cache2.path(),
+        endpoint(),
+        bearer(),
+    )
+    .unwrap();
+    assert_eq!(cold.get_raw(&h).unwrap(), payload);
+    match cold.get(&h).unwrap() {
+        Object::Blob(b) => assert_eq!(b.bytes, payload),
+        other => panic!("expected Blob, got {other:?}"),
     }
 }
