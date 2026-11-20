@@ -201,7 +201,12 @@ fn load_approval_key(
         }
     };
     let mut bytes = Vec::new();
-    if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
+    // Cap the read: one byte past the key length is enough to reject a wrong-length
+    // file, and a misconfigured path to an endless source cannot exhaust memory.
+    let limit = (agentic_core::approval::APPROVAL_KEY_LEN + 1) as u64;
+    if let Err(e) =
+        std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, limit), &mut bytes)
+    {
         unreadable(e);
         return Ok(None);
     }

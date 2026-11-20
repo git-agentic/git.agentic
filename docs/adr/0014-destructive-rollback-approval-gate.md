@@ -139,7 +139,7 @@ The `token_prefix` (first 8 hex chars of the supplied token) is included in reje
 
 ### Decision 6 — Operator-managed key in v1.0; KMS in v1.1
 
-The key is read once at daemon startup from `--approval-key-file <path>`. The file contains exactly 32 bytes (256 bits) — any deviation aborts daemon startup. The file is read once at startup with `std::fs` (not memory-mapped) into an `ApprovalKey`, which is zeroized on drop; the temporary read buffer is not zeroized.
+The key is read once at daemon startup from `--approval-key-file <path>`. The file contains exactly 32 bytes (256 bits). A non-empty file of any other length aborts daemon startup; a missing, unreadable or empty file disables destructive rollback instead (Decision 4). The file is read once at startup with `std::fs` (not memory-mapped) into an `ApprovalKey`, which is zeroized on drop; the temporary read buffer is not zeroized.
 
 Rotation is operator-driven: stop the daemon, write a new key file, restart. There is no in-process rotation in v1.0 — the operational complexity isn't worth the small reduction in key-lifetime risk for a sidecar that restarts on every Cloud Run instance boot anyway.
 
