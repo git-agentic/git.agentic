@@ -2,7 +2,7 @@
 # Build (from repo root):
 #   docker build -f crates/agenticd/Dockerfile.sidecar -t agenticd:sidecar .
 
-FROM rust:1.95-slim-bookworm AS builder
+FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS builder
 WORKDIR /src
 # rustls-tls only — no OpenSSL anywhere in the workspace (workspace
 # Cargo.toml pins reqwest with default-features=false + rustls-tls;
@@ -13,9 +13,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --release -p agenticd && strip target/release/agenticd
+RUN cargo build --locked --release -p agenticd && strip target/release/agenticd
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 # No libssl runtime — the whole stack is rustls. ca-certificates is
 # still required so rustls' webpki resolver can validate the GCS
 # endpoint's cert chain via the system trust store.
