@@ -157,8 +157,8 @@ Verification:
 
 The CLI mints a `DataLoss` token for `--accept-data-loss` requests and a `ReverseMigration` token otherwise.
 The `agentic rollback --approval` issuance mode takes `--scope reverse-migration|data-loss`.
-The default is `data-loss`, so existing callers keep getting the tokens they got before.
-An operator who hands a worker a token for an ordinary rollback should use `--scope reverse-migration`, because a `data-loss` token also authorizes `accept_data_loss`.
+The default is `reverse-migration`, the narrower scope, because a `data-loss` token also authorizes `accept_data_loss`.
+An operator who needs a token for `--accept-data-loss` passes `--scope data-loss` explicitly. Scripts that relied on the old default now get a narrower token, and an `accept_data_loss` request with it fails with an error that names `--scope data-loss`.
 The daemon's missing-token error says so: for a reverse-migration rollback it recommends `--scope reverse-migration`, and for `accept_data_loss` it recommends `--scope data-loss`.
 Both errors keep the wire code `approval_required`.
 

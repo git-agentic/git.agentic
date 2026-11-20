@@ -149,8 +149,10 @@ v1.1 may introduce KMS-backed signing where the operator holds a KMS key referen
 The operator's CLI for issuing tokens is a separate concern, handled by the `agentic` command:
 
 ```
-agentic rollback --approval <commit-hash> --uid <worker-uid> --key-file <path>
+agentic rollback --approval <commit-hash> --uid <worker-uid> --key-file <path> --scope data-loss
 ```
+
+(`--scope data-loss` since ADR-0019; the default scope only authorizes a rollback that runs reverse migrations.)
 
 This prints a token to stdout that the operator hands to the worker (or pastes into a CI variable, or whatever the deployment shape requires). The token-issuing path lives in `agentic-cli` and does not require the daemon to be running.
 

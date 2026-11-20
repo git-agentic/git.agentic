@@ -171,9 +171,9 @@ enum Command {
         #[arg(long)]
         uid: Option<u32>,
         /// Scope of the minted token (issuance mode). `reverse-migration`
-        /// authorizes only a rollback that runs reverse migrations;
-        /// `data-loss` (the default, as before) also authorizes
-        /// `--accept-data-loss`. Hand a worker the narrowest scope.
+        /// (the default) authorizes only a rollback that runs reverse
+        /// migrations; `data-loss` also authorizes `--accept-data-loss` and
+        /// must be asked for explicitly.
         #[arg(long, value_enum, requires = "approval")]
         scope: Option<IssueScope>,
         /// Path to the 32-byte approval key. Used by the issuance mode and
@@ -221,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             if let Some(commit_hash) = approval {
                 // Issuance mode: mint a token, no daemon contact.
-                let scope = scope.unwrap_or(IssueScope::DataLoss);
+                let scope = scope.unwrap_or(IssueScope::ReverseMigration);
                 return cmd_mint_approval(&commit_hash, uid, key_file, scope.into());
             }
             let target = target

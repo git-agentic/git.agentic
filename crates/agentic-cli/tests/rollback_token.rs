@@ -496,34 +496,35 @@ fn issue(extra: &[&str]) -> String {
 }
 
 #[test]
-fn issuer_scope_flag_selects_the_token_scope_and_defaults_to_data_loss() {
+fn issuer_scope_flag_selects_the_token_scope_and_defaults_to_reverse_migration() {
     let key = ApprovalKey::from_bytes(&KEY).unwrap();
     let h = target_hash();
-    let rm = issue(&["--scope", "reverse-migration"]);
-    // Verifies for a plain reverse-migration rollback, not for accept_data_loss.
-    verify_token_any(
-        &key,
-        &[ApprovalScope::ReverseMigration],
-        &h,
-        1000,
-        &rm,
-        now(),
-    )
-    .unwrap();
-    assert!(verify_token(&key, &h, 1000, &rm, now()).is_err());
-    // No flag, or data-loss: the data-loss scope, as before.
-    for dl in [issue(&[]), issue(&["--scope", "data-loss"])] {
-        verify_token(&key, &h, 1000, &dl, now()).unwrap();
-        assert!(verify_token_any(
+    // No flag, or reverse-migration: verifies for a plain reverse-migration
+    // rollback, not for accept_data_loss.
+    for rm in [issue(&[]), issue(&["--scope", "reverse-migration"])] {
+        verify_token_any(
             &key,
             &[ApprovalScope::ReverseMigration],
             &h,
             1000,
-            &dl,
-            now()
+            &rm,
+            now(),
         )
-        .is_err());
+        .unwrap();
+        assert!(verify_token(&key, &h, 1000, &rm, now()).is_err());
     }
+    // data-loss only when asked for.
+    let dl = issue(&["--scope", "data-loss"]);
+    verify_token(&key, &h, 1000, &dl, now()).unwrap();
+    assert!(verify_token_any(
+        &key,
+        &[ApprovalScope::ReverseMigration],
+        &h,
+        1000,
+        &dl,
+        now()
+    )
+    .is_err());
 }
 
 #[test]
