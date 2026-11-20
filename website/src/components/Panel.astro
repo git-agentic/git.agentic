@@ -1,6 +1,7 @@
 ---
 // Code panel. The page keeps its own <pre><code> so whitespace survives;
 // this only wraps it. `copy` lets the inline script in Base add a copy button.
+// The body is a focusable region so keyboard users can scroll wide code.
 interface Props {
   title: string;
   copy?: boolean;
@@ -9,5 +10,7 @@ const { title, copy = false } = Astro.props;
 ---
 <div class="panel" data-copy={copy ? '' : undefined}>
   <div class="panel__bar"><span class="panel__title">{title}</span></div>
-  <slot />
+  <div class="panel__body" tabindex="0" role="region" aria-label={`Code: ${title}`}>
+    <slot />
+  </div>
 </div>
