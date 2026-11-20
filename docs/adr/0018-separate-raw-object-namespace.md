@@ -68,7 +68,8 @@ Rollback therefore loads everything it will re-stage right after validating the 
 - A dedup hit on GCS costs two requests (the conditional upload and a download) where it used to cost one. A new object still costs one.
 - Existing stores keep working without migration. New raw objects land in the new namespace, and old ones are read through the legacy fallback.
 - Legacy ambiguous blobs stay in the store. They are readable, but a rollback to a commit that references one is refused with a clear error before anything changes.
-- A legacy bare raw object whose bytes equal canonical Tree or Commit JSON could still block a later put of that Tree or Commit. This is not realistic for segments and manifests.
+- A legacy occupant that is a valid object of another kind blocks a later put at its address with a non-retryable `address_occupied`. The realistic case is a pre-upgrade prompt or tool blob whose bytes are the canonical JSON of a predictable Tree: every later commit that produces that Tree fails until the occupant is removed. A bare raw segment or manifest cannot equal Tree or Commit JSON, so it does not cause this.
+- Repair: the error names the address. An operator who confirms the occupant is not referenced by a commit they need deletes that one object file (or GCS object) and retries the commit.
 
 ## Alternatives considered
 
