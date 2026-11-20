@@ -97,9 +97,10 @@ fn reject_file_dir_conflicts(names: &[&String]) -> anyhow::Result<()> {
 /// existing directory between it and a write target must not be a symlink
 /// ([`reject_symlinked_dirs`]), checked before and after `create_dir_all`.
 /// This covers links that exist before the call. A concurrent swap during
-/// the call is out of scope: the daemon's state directory must not be
-/// writable by other uids (see the isolate-sidecar-state change), so no
-/// other uid can plant links under the prompts directory.
+/// the call is a residual race for a same-uid worker sharing the volume. It
+/// is accepted because the daemon's state directory must not be reachable by
+/// the worker (see docs/integration/executor-sidecar.md and the state-dir
+/// startup check); a full fix needs an openat-style walk.
 pub(super) fn restore_prompts(
     state: &DaemonState,
     repo: &Path,
@@ -109,6 +110,7 @@ pub(super) fn restore_prompts(
     reject_symlinked_dirs(repo, &dir)?;
     std::fs::create_dir_all(&dir)?;
     reject_symlinked_dirs(repo, &dir)?;
+    let tmp_dir = ensure_tmp_dir(state.refs.agentic_dir())?;
 
     let tree = load_tree(state, prompts_hash)?;
     let mut wanted: BTreeSet<PathBuf> = BTreeSet::new();
@@ -121,7 +123,7 @@ pub(super) fn restore_prompts(
             reject_symlinked_dirs(repo, parent)?;
         }
         let blob = load_blob(state, &r.hash)?;
-        write_blob_safely(&path, &blob.bytes)?;
+        write_blob_safely(&tmp_dir, &path, &blob.bytes)?;
         wanted.insert(path);
     }
 
@@ -157,25 +159,32 @@ fn reject_symlinked_dirs(base: &Path, target: &Path) -> anyhow::Result<()> {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TMP_ATTEMPTS: usize = 16;
 
-/// Exclusively create a temp file next to `path`, named independently of
-/// the prompt name (`.agentic-tmp-<pid>-<n>`, `n` from `next`). `create_new`
-/// (`O_EXCL`) fails on anything already there, including a planted symlink,
-/// and never follows one; on `AlreadyExists` we try the next `n`, up to
-/// [`TMP_ATTEMPTS`] times. The returned path is ours alone, so callers may
-/// remove it on failure.
+/// `<agentic_dir>/tmp`, created (mode 0700 on unix) if missing. Temp files
+/// live here, outside the prompts tree, so no prompt entry can occupy a
+/// temp name.
+fn ensure_tmp_dir(agentic_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = agentic_dir.join("tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .with_context(|| format!("creating temp directory {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Exclusively create a temp file in `tmp_dir` (`.agentic-tmp-<pid>-<n>`,
+/// `n` from `next`). `create_new` (`O_EXCL`) fails on anything already
+/// there, including a planted symlink, and never follows one; on
+/// `AlreadyExists` we try the next `n`, up to [`TMP_ATTEMPTS`] times. The
+/// returned path is ours alone, so callers may remove it on failure.
 fn create_temp(
-    path: &Path,
+    tmp_dir: &Path,
     mut next: impl FnMut() -> u64,
 ) -> anyhow::Result<(PathBuf, std::fs::File)> {
-    let dest = path.file_name().map(|n| n.to_string_lossy().to_lowercase());
     for _ in 0..TMP_ATTEMPTS {
-        let name = format!(".agentic-tmp-{}-{}", std::process::id(), next());
-        // A candidate equal to the destination (also case-insensitively, for
-        // case-folding filesystems) would expose a partial write at `path`.
-        if dest.as_deref() == Some(name.to_lowercase().as_str()) {
-            continue;
-        }
-        let tmp = path.with_file_name(name);
+        let tmp = tmp_dir.join(format!(".agentic-tmp-{}-{}", std::process::id(), next()));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -189,8 +198,8 @@ fn create_temp(
         }
     }
     Err(anyhow!(
-        "no free temp file name next to {} after {TMP_ATTEMPTS} attempts",
-        path.display()
+        "no free temp file name in {} after {TMP_ATTEMPTS} attempts",
+        tmp_dir.display()
     ))
 }
 
@@ -202,8 +211,9 @@ fn create_temp(
 ///    of the destination, since the attack we're defending against
 ///    is a redirected write. Only `NotFound` is benign (the file
 ///    doesn't exist yet, which is the common case).
-/// 2. Write the new bytes to a uniquely named sibling temp file (created
-///    exclusively, so a pre-planted symlink is never followed), then atomically
+/// 2. Write the new bytes to a uniquely named temp file in `tmp_dir`
+///    (created exclusively, so a pre-planted symlink is never followed;
+///    `tmp_dir` must be on the same filesystem as `path`), then atomically
 ///    `rename(2)` it over `path`. This closes the TOCTOU window
 ///    between the symlink unlink and the regular file write: even if
 ///    an attacker re-plants a symlink at `path` between steps, the
@@ -211,11 +221,18 @@ fn create_temp(
 ///
 /// Mirrors `agentic-core::store::FsObjectStore::write_at`'s
 /// temp-then-rename pattern. (Copilot review on PR #51, second pass.)
-fn write_blob_safely(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    write_blob_with(path, bytes, || TMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+fn write_blob_safely(tmp_dir: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    write_blob_with(tmp_dir, path, bytes, || {
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    })
 }
 
-fn write_blob_with(path: &Path, bytes: &[u8], next: impl FnMut() -> u64) -> anyhow::Result<()> {
+fn write_blob_with(
+    tmp_dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    next: impl FnMut() -> u64,
+) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
             std::fs::remove_file(path)
@@ -232,13 +249,27 @@ fn write_blob_with(path: &Path, bytes: &[u8], next: impl FnMut() -> u64) -> anyh
             });
         }
     }
-    let (tmp, mut file) = create_temp(path, next)?;
+    let (tmp, mut file) = create_temp(tmp_dir, next)?;
     // The temp is ours from here on, so it is safe to remove on failure.
     let result = std::io::Write::write_all(&mut file, bytes)
         .with_context(|| format!("writing temp file {}", tmp.display()))
         .and_then(|()| {
-            std::fs::rename(&tmp, path)
-                .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))
+            std::fs::rename(&tmp, path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::CrossesDevices {
+                    anyhow!(
+                        "cannot rename {} into {}: `.agentic` and `prompts` must be on \
+                         the same filesystem",
+                        tmp.display(),
+                        path.display()
+                    )
+                } else {
+                    anyhow::Error::new(e).context(format!(
+                        "renaming {} → {}",
+                        tmp.display(),
+                        path.display()
+                    ))
+                }
+            })
         });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -385,19 +416,10 @@ mod tests {
         assert!(reject_file_dir_conflicts(&[&upper, &pab]).is_err());
     }
 
-    #[test]
-    fn temp_name_never_equals_the_destination() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir
-            .path()
-            .join(format!(".AGENTIC-TMP-{}-0", std::process::id()));
-        let mut n = 0;
-        let (tmp, _f) = create_temp(&dest, || {
-            n += 1;
-            n - 1
-        })
-        .unwrap();
-        assert!(tmp.file_name().unwrap().to_string_lossy().ends_with("-1"));
+    // Test helper: write through a fresh temp dir outside `path`'s directory.
+    fn wb(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir().unwrap();
+        write_blob_safely(tmp.path(), path, bytes)
     }
 
     #[test]
@@ -495,7 +517,7 @@ mod tests {
         );
 
         // Write the new blob.
-        write_blob_safely(&dest, b"restored prompt content").unwrap();
+        wb(&dest, b"restored prompt content").unwrap();
 
         // The symlink is gone; dest is now a regular file with the new
         // bytes.
@@ -532,7 +554,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("new.md");
         assert!(!dest.exists());
-        write_blob_safely(&dest, b"hello").unwrap();
+        wb(&dest, b"hello").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
     }
 
@@ -541,7 +563,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dest = tmp.path().join("existing.md");
         std::fs::write(&dest, b"old content").unwrap();
-        write_blob_safely(&dest, b"new content").unwrap();
+        wb(&dest, b"new content").unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
         // Regular file (not turned into anything weird).
         assert!(std::fs::symlink_metadata(&dest)
@@ -657,15 +679,18 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("a.md")).unwrap(), b"markdown");
         assert_eq!(std::fs::read(dir.join("a.tmp")).unwrap(), b"tmpfile");
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"text");
-        let leftovers: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains("agentic-tmp"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temp files left behind: {leftovers:?}"
-        );
+        // Temp files live outside prompts/ and are renamed away.
+        for d in [dir.clone(), repo.path().join(".agentic/tmp")] {
+            let leftovers: Vec<_> = std::fs::read_dir(&d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("agentic-tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temp files left in {d:?}: {leftovers:?}"
+            );
+        }
     }
 
     // A symlink planted at the old temp name (`a.tmp` for `a.md`) must not
@@ -678,34 +703,44 @@ mod tests {
         let victim = outside.path().join("keep.txt");
         std::os::unix::fs::symlink(&victim, dir.path().join("a.tmp")).unwrap();
 
-        write_blob_safely(&dir.path().join("a.md"), b"restored").unwrap();
+        wb(&dir.path().join("a.md"), b"restored").unwrap();
 
         assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"restored");
         assert_outside_untouched(outside.path());
     }
 
     // O_EXCL + retry: files or symlinks already sitting at the first
-    // candidate temp names are left untouched and the write still succeeds
-    // on the next free name. A fixed counter makes the candidates known.
+    // candidate temp names in the tmp dir are left untouched and the write
+    // still succeeds on the next free name. A fixed counter makes the
+    // candidates known.
     #[cfg(unix)]
     #[test]
     fn write_blob_safely_skips_pre_planted_temp_names() {
-        let dir = tempfile::tempdir().unwrap();
+        let prompts = tempfile::tempdir().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
         let outside = outside_dir();
         let pid = std::process::id();
-        let planted_file = dir.path().join(format!(".agentic-tmp-{pid}-0"));
+        let planted_file = tmp_dir.path().join(format!(".agentic-tmp-{pid}-0"));
         std::fs::write(&planted_file, b"planted").unwrap();
-        let planted_link = dir.path().join(format!(".agentic-tmp-{pid}-1"));
+        let planted_link = tmp_dir.path().join(format!(".agentic-tmp-{pid}-1"));
         std::os::unix::fs::symlink(outside.path().join("keep.txt"), &planted_link).unwrap();
 
         let mut n = 0;
-        write_blob_with(&dir.path().join("a.md"), b"restored", || {
-            n += 1;
-            n - 1
-        })
+        write_blob_with(
+            tmp_dir.path(),
+            &prompts.path().join("a.md"),
+            b"restored",
+            || {
+                n += 1;
+                n - 1
+            },
+        )
         .unwrap();
 
-        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"restored");
+        assert_eq!(
+            std::fs::read(prompts.path().join("a.md")).unwrap(),
+            b"restored"
+        );
         assert_eq!(std::fs::read(&planted_file).unwrap(), b"planted");
         assert!(std::fs::symlink_metadata(&planted_link)
             .unwrap()
@@ -716,22 +751,65 @@ mod tests {
 
     #[test]
     fn write_blob_safely_gives_up_after_bounded_attempts() {
-        let dir = tempfile::tempdir().unwrap();
+        let prompts = tempfile::tempdir().unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         for i in 0..TMP_ATTEMPTS {
-            std::fs::write(dir.path().join(format!(".agentic-tmp-{pid}-{i}")), b"x").unwrap();
+            std::fs::write(tmp_dir.path().join(format!(".agentic-tmp-{pid}-{i}")), b"x").unwrap();
         }
         let mut n = 0;
-        let err = write_blob_with(&dir.path().join("a.md"), b"y", || {
+        let err = write_blob_with(tmp_dir.path(), &prompts.path().join("a.md"), b"y", || {
             n += 1;
             n - 1
         })
         .unwrap_err();
         assert!(err.to_string().contains("no free temp file name"), "{err}");
-        assert!(!dir.path().join("a.md").exists());
+        assert!(!prompts.path().join("a.md").exists());
         // Planted files must not have been removed by the error path.
         for i in 0..TMP_ATTEMPTS {
-            assert!(dir.path().join(format!(".agentic-tmp-{pid}-{i}")).exists());
+            assert!(tmp_dir
+                .path()
+                .join(format!(".agentic-tmp-{pid}-{i}"))
+                .exists());
         }
+    }
+
+    // A committed tree can name entries `.agentic-tmp-<pid>-<n>`; since temp
+    // files live outside prompts/, restore still succeeds and keeps them.
+    #[tokio::test]
+    async fn restore_prompts_succeeds_when_tree_names_temp_candidates() {
+        let pid = std::process::id();
+        let names: Vec<String> = (0..300)
+            .map(|i| format!(".agentic-tmp-{pid}-{i}"))
+            .collect();
+        let files: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|n| (n.as_str(), b"entry".as_slice()))
+            .chain(std::iter::once(("a.md", b"markdown".as_slice())))
+            .collect();
+        let (state, tree, repo) = state_with_prompts(&files).await;
+        // Twice: the second run finds the entries already on disk, which is
+        // what used to exhaust the in-tree temp candidates.
+        restore_prompts(&state, repo.path(), &tree).unwrap();
+        restore_prompts(&state, repo.path(), &tree).unwrap();
+        let dir = repo.path().join("prompts");
+        for n in &names {
+            assert_eq!(std::fs::read(dir.join(n)).unwrap(), b"entry");
+        }
+        assert_eq!(std::fs::read(dir.join("a.md")).unwrap(), b"markdown");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_tmp_dir_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let agentic = tempfile::tempdir().unwrap();
+        let dir = ensure_tmp_dir(agentic.path()).unwrap();
+        assert_eq!(dir, agentic.path().join("tmp"));
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_tmp_dir(agentic.path()).unwrap(); // idempotent
     }
 }
