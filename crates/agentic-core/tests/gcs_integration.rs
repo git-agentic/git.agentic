@@ -39,7 +39,11 @@ fn fresh_prefix() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("test-{nanos}")
+    // Clock ticks can coincide across parallel tests; the counter keeps
+    // prefixes (and so objects) unique per call.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("test-{nanos}-{n}")
 }
 
 fn make_store(prefix: &str) -> Option<(GcsObjectStore, tempfile::TempDir)> {
