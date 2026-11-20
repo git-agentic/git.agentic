@@ -29,7 +29,8 @@ const structuredData = {
       <p class="eyebrow">Three open source projects, Apache 2.0</p>
       <h1>Open source infrastructure for software written and run by AI agents.</h1>
       <p class="lead">
-        git.agentic versions and rolls back agent behavior. src-control is
+        git.agentic versions agent behavior and rolls back prompts, memory
+        and schema. src-control is
         version control and a Git forge for agent fleets. Sentinel audits npm
         packages before install-time code runs.
       </p>
@@ -70,7 +71,7 @@ const structuredData = {
       <h2 id="projects-title">Projects</h2>
       <ul class="project-cards">
         {projects.map((item) => (
-          <li class="card project-card">
+          <li class="card project-card" id={item.href.slice(1)}>
             <h3><a href={item.href}>{item.name}</a></h3>
             <p class="project-card__purpose">{item.purpose}</p>
             <div class="badges">
@@ -144,14 +145,24 @@ const structuredData = {
   </Section>
 
   <Section id="examples" title="What it looks like" note="One sample from each project. The project pages have the full walkthroughs.">
-    <h3>git.agentic rolls back all six dimensions</h3>
-    <Panel title="agentic rollback">
-<pre><code>$ agentic rollback v0.7
-<span class="accent">  ✓ Schema reverted          in 0.4s
-  ✓ Memory restored          in 2.1s
-  ✓ Prompts restored         in 0.0s
-  ✓ HEAD now at i7j8k9l (rollback of v0.8 → v0.7)</span></code></pre>
+    <h3>git.agentic rolls back prompts, memory and schema</h3>
+    <Panel title="./scripts/run-demo.sh, step 10 from demo.cast">
+<pre><code><span class="dim">=== 10. rollback to baseline ===</span>
+live schema / sentiment columns before rollback: 001_add_sentiment/1
+<span class="accent">  - target commit 20eb9cf (v0.7 baseline)
+  - current branch tip c4794d5 → forward-record over it
+  - reverse schema migrations: 001_add_sentiment → 0.0.0
+  - restore memory from manifest d9f76eb
+  - rewrite ~/git.agentic/examples/langgraph-rollback/prompts from target prompts tree 2e6a8d6
+  - model version captured in target — operator must redeploy if it changed
+  - forward-recorded rollback as 2a2893a on langgraph/abbbd1ad6698ea81
+✓ rollback complete; HEAD now at 2a2893a</span>
+live schema / sentiment columns after rollback: 0.0.0/0</code></pre>
     </Panel>
+    <p class="note">
+      Rollback records the target's code, tools and model. The operator
+      redeploys those.
+    </p>
 
     <h3>src-control forks worktrees in memory</h3>
     <Panel title="sc">
@@ -174,9 +185,14 @@ $ sc work --agents 4 -- cargo test</code></pre>
 
   HTTP 403  x-sentinel-verdict: block</code></pre>
     </Panel>
+    <p class="note">
+      The 403 is what the proxy returns under the <code>block</code> policy.
+      Under <code>observe</code>, the default, it reports the verdict and
+      still serves the tarball.
+    </p>
   </Section>
 
-  <Section id="guides" title="Guides" note="Technical articles on versioning and rolling back AI agents.">
+  <Section id="learn" title="Guides" note="Technical articles on versioning and rolling back AI agents.">
     <ul class="article-list">
       {articles.map((article) => (
         <li>

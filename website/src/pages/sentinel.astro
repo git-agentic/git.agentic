@@ -76,7 +76,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
     </Panel>
   </Section>
 
-  <Section id="features" title="Features" note="npm cannot retract bad releases, has no install-time permissions and lets attackers squat names. Agents install with no risk signal.">
+  <Section id="features" title="Features" note="Sentinel audits each tarball before it installs, and runs lifecycle scripts in a capability sandbox.">
     <div class="grid-2">
       <div class="card feature feature--wide">
         <div class="badges"><Badge kind="prod" /></div>
@@ -84,8 +84,10 @@ $ sentinel audit is-odd 3.0.1</code></pre>
         <p>
           The proxy resolves and serves real npm packages unchanged. It
           intercepts every tarball, scores it and returns the verdict in
-          response headers. Under a <code>block</code> policy a bad tarball
-          becomes a 403 at install time.
+          response headers. Under the <code>block</code> policy a tarball
+          with a block verdict gets a 403. Under <code>observe</code>, the
+          default, the proxy reports the verdict and still serves the
+          tarball.
         </p>
         <p>
           Codento Engine runs this proxy in its build stack in observe mode.
@@ -95,7 +97,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
       </div>
       <div class="card feature">
         <h3>Deterministic scoring</h3>
-        <p>A score starts at 100 and loses a weighted penalty per finding. Any critical finding forces a block. The result is reproducible in CI.</p>
+        <p>A score starts at 100 and loses a weighted penalty per finding. An unwaived critical finding produces a block verdict under the default scoring policy. The result is reproducible in CI.</p>
       </div>
       <div class="card feature">
         <h3>Policy and human approval</h3>
@@ -103,7 +105,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
       </div>
       <div class="card feature">
         <h3>Deny-by-default sandbox</h3>
-        <p>Lifecycle scripts run with no network, no credential environment variables and no writes outside a fixed floor, on macOS Seatbelt or Linux bubblewrap and Landlock.</p>
+        <p>In runs that Sentinel enforces, lifecycle scripts get no network, no credential environment variables and no writes outside a fixed floor unless a capability is approved. It uses macOS Seatbelt or Linux bubblewrap.</p>
       </div>
       <div class="card feature">
         <h3>Audit-gated publish</h3>
@@ -115,7 +117,7 @@ $ sentinel audit is-odd 3.0.1</code></pre>
       </div>
       <div class="card feature">
         <h3>Time-locked retraction</h3>
-        <p>A publisher can pull a bad release only while it is younger than 72 hours and under 1,000 cumulative downloads.</p>
+        <p>For native or claimed packages, a publisher can retract a release while it is under both policy limits. The defaults are 72 hours and 1,000 cumulative downloads.</p>
       </div>
       <div class="card feature">
         <h3>Whole-tree audits</h3>
@@ -133,9 +135,9 @@ $ sentinel audit is-odd 3.0.1</code></pre>
     <p>
       A previously clean package ships a patch release with a
       <code>postinstall</code> script that harvests secrets. This is the
-      event-stream pattern, and it still works against plain npm. Below is
-      Sentinel's verdict, and what <code>npm install</code> sees when it
-      fetches the bad tarball under a block policy.
+      event-stream pattern. Below is Sentinel's verdict, and what
+      <code>npm install</code> sees when it fetches the bad tarball under the
+      <code>block</code> policy.
     </p>
     <Panel title="sentinel audit">
 <pre><code>$ sentinel audit color-stream 1.4.1
@@ -161,8 +163,10 @@ $ sentinel audit is-odd 3.0.1
 <span class="ok">  is-odd@3.0.1  → score 100/100  ALLOW  (signed, no install scripts)</span></code></pre>
     </Panel>
     <p class="note">
-      This transcript shows a block policy. The production deployment at
-      Codento Engine runs in observe mode and blocks nothing yet.
+      This transcript shows the <code>block</code> policy. Under
+      <code>observe</code> the verdict is the same and the tarball is still
+      served. The production deployment at Codento Engine runs in observe
+      mode and blocks nothing yet.
     </p>
 
     <h3>The parts</h3>
@@ -170,8 +174,12 @@ $ sentinel audit is-odd 3.0.1
       <div>
         <dt>Scoring</dt>
         <dd>
-          The audit engine starts at 100, subtracts a weighted penalty per
-          finding and forces a block on any critical finding. An LLM adapter
+          The audit engine starts at 100 and subtracts a weighted penalty
+          per finding. Under the default scoring policy an unwaived critical
+          finding produces a block verdict. The verdict is separate from
+          HTTP enforcement: under <code>block</code> the proxy answers a
+          block verdict with a 403, and under <code>observe</code> it
+          reports the verdict and still serves the tarball. An LLM adapter
           can add context to a verdict. It never changes the score.
         </dd>
       </div>
@@ -188,12 +196,23 @@ $ sentinel audit is-odd 3.0.1
       <div>
         <dt>Sandbox</dt>
         <dd>
-          Lifecycle scripts get no network, no credential environment
-          variables, no writes outside a fixed floor, no <code>$HOME</code>
-          reads, and cannot execute binaries outside an approved floor. Each
-          denial is lifted only by an approved capability. A detected
-          violation can quarantine that exact tarball fleet-wide.
-          <code>sentinel exec</code> runs any command under the same sandbox,
+          The sandbox covers only runs that Sentinel starts:
+          <code>sentinel run-scripts</code>, an enforced
+          <code>sentinel install</code> and <code>sentinel exec</code>. A
+          plain <code>npm install</code> or <code>npx</code> outside those
+          commands is not contained. Inside the sandbox, lifecycle scripts
+          get no network, no credential environment variables and no writes
+          outside a fixed floor. <code>$HOME</code> reads are denied by
+          default, except what a script needs: system paths, the Node
+          install prefix, the project root and the build caches. Each denial
+          is lifted only by an approved capability. On macOS, executing a
+          binary outside an approved floor is denied. On Linux that
+          restriction needs Landlock and the compiled
+          <code>landlock-exec</code> helper. Without them the run stays
+          filesystem and network confined, and only the listed exfiltration
+          tools such as curl and wget are blocked. A detected violation can
+          quarantine that exact tarball fleet-wide.
+          <code>sentinel exec</code> runs one command under the same sandbox,
           without a shell and with argument boundaries preserved.
         </dd>
       </div>
@@ -220,19 +239,24 @@ $ sentinel audit is-odd 3.0.1
       <div>
         <dt>Retraction</dt>
         <dd>
-          Past 72 hours or 1,000 cumulative downloads, a release is
-          immutable. A retracted version leaves a 410 tombstone, its
-          identifier is permanently spent, and a retraction advisory flags
-          any lockfile that still pins it.
+          Retraction applies to native and claimed packages, the ones
+          Sentinel serves from its own store. It succeeds only while a
+          release is under both policy limits, by default 72 hours and 1,000
+          cumulative downloads. Past either limit the release cannot be
+          retracted. A retracted version leaves a 410 tombstone and its
+          identifier is permanently spent. A local retraction takes effect
+          at once on that installation. Other installations get the
+          retraction advisory when they load the next signed corpus release,
+          and from then on it flags a lockfile that still pins the version.
         </dd>
       </div>
       <div>
         <dt>Release cooldown</dt>
         <dd>
-          Policy can hold freshly published versions for a wall-clock window
-          before installers see them. This counters attacks that ship a
-          trojaned release and rely on installs within hours. Last-known-good
-          suggestions respect the hold.
+          Policy can give a freshly published version a block verdict for a
+          wall-clock window. This counters attacks that ship a trojaned
+          release and rely on installs within hours. Last-known-good
+          suggestions respect the window.
         </dd>
       </div>
       <div>

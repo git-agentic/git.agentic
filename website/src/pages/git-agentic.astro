@@ -12,7 +12,7 @@ const faqs = [
   },
   {
     question: 'Why is Git alone not enough to roll back an AI agent?',
-    answer: 'Git restores code, but an agent can remain broken because its prompts, model, tool interfaces, database memory, or schema moved independently. git.agentic restores all six dimensions together.',
+    answer: 'Git restores code, but an agent can remain broken because its prompts, model, tool interfaces, database memory, or schema moved independently. A git.agentic commit versions all six dimensions. Rollback restores prompts, tracked memory and schema directly, and records the code, tools and model that the operator must redeploy.',
   },
   {
     question: 'Which AI agent frameworks does git.agentic support?',
@@ -41,7 +41,7 @@ const docs = [
 <Project
   project={p}
   title="AI Agent Version Control & Atomic Rollback | git.agentic"
-  description="Version and roll back AI agent code, prompts, tools, models, memory, and schema atomically. Open-source Rust core, Python SDK, and LangGraph support."
+  description="Version AI agent code, prompts, tools, model, memory and schema as one commit. Rollback restores prompts, memory and schema and records what to redeploy."
   heading="Version control and atomic rollback for AI agent behavior."
   softwareDescription="Open-source version control and atomic rollback for AI agent behavior."
   programmingLanguage={['Rust', 'Python']}
@@ -50,8 +50,9 @@ const docs = [
 >
   <Fragment slot="lead">
     Six things determine how an agent acts: code, prompts, tools, model,
-    memory and schema. git.agentic snapshots all six as one version and rolls
-    them back together.
+    memory and schema. A git.agentic commit versions all six. Rollback
+    restores prompts, tracked memory and schema directly, and records the
+    code, tools and model that the operator must redeploy.
   </Fragment>
 
   <Fragment slot="status">
@@ -65,15 +66,16 @@ const docs = [
 
   <Section id="quickstart" title="Quickstart" note="Needs Podman or Docker with compose, cargo, Python 3.10 or later, and psql.">
     <p>
-      One clone, one <code>docker-compose up</code>, one script. The script
-      builds the daemon, runs the agent, breaks it and rolls it back. CI
-      replays the same demo end to end on every pull request.
+      One clone and one script. <code>run-demo.sh</code> starts Postgres and
+      pgvector with Podman or Docker compose, builds the daemon and the CLI,
+      runs the agent, deploys the bad change, rolls it back and tears the
+      database down again. CI replays the same demo end to end on every pull
+      request.
     </p>
     <Panel title="shell" copy>
 <pre><code>$ git clone https://github.com/git-agentic/git.agentic
 $ cd git.agentic/examples/langgraph-rollback
-$ docker-compose up -d              <span class="comment"># Postgres + pgvector</span>
-$ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks, rolls back</span></code></pre>
+$ ./scripts/run-demo.sh             <span class="comment"># starts Postgres, builds, runs, breaks, rolls back</span></code></pre>
     </Panel>
   </Section>
 
@@ -84,8 +86,8 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
         <p>A commit captures code, prompts, tools, model, memory and schema atomically.</p>
       </div>
       <div class="card feature">
-        <h3>Atomic rollback</h3>
-        <p><code>agentic rollback</code> restores all six dimensions in one operation, including reverse schema migrations and memory state.</p>
+        <h3>Rollback</h3>
+        <p><code>agentic rollback</code> restores prompts, tracked memory and schema, including reverse schema migrations. It records the target's code, tools and model, which the operator redeploys.</p>
       </div>
       <div class="card feature">
         <h3>Six-dimension diff</h3>
@@ -93,11 +95,11 @@ $ ./scripts/run-demo.sh             <span class="comment"># builds, runs, breaks
       </div>
       <div class="card feature">
         <h3>Memory snapshots</h3>
-        <p>Postgres and pgvector state is captured at commit time and restored on rollback. It is the one memory backend in the MVP.</p>
+        <p>The state of the tracked Postgres and pgvector tables is captured at commit time and restored on rollback. It is the one memory backend in the MVP.</p>
       </div>
       <div class="card feature">
         <h3>MCP tool fingerprints</h3>
-        <p>The tools dimension records MCP server fingerprints, so a version knows which tools the agent saw.</p>
+        <p>The tools dimension records MCP server fingerprints, so a version knows which tools the agent saw. Rollback records them and does not apply them.</p>
       </div>
       <div class="card feature">
         <h3>Python SDK and LangGraph</h3>
@@ -140,55 +142,95 @@ AgentVersion = (
     schema_version,
 )</code></pre>
     </Panel>
-    <div class="table-wrap">
+    <div class="table-wrap" tabindex="0" role="region" aria-label="The six dimensions and what rollback does with each">
       <table>
         <thead>
-          <tr><th scope="col">Dimension</th><th scope="col">What it is</th></tr>
+          <tr><th scope="col">Dimension</th><th scope="col">What it is</th><th scope="col">On rollback</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>code_sha</code></td><td>The git commit. The part you already version.</td></tr>
-          <tr><td><code>prompts</code></td><td>System prompts, role prompts and few-shot templates, content-hashed.</td></tr>
-          <tr><td><code>tools</code></td><td>MCP server fingerprints. The tools the agent saw.</td></tr>
-          <tr><td><code>model</code></td><td>Provider, model id and decoding parameters. Pinned, not floated.</td></tr>
-          <tr><td><code>memory_snapshot</code></td><td>Postgres and pgvector state at commit time. Restored on rollback.</td></tr>
-          <tr><td><code>schema_version</code></td><td>The memory schema, with forward and reverse migrations.</td></tr>
+          <tr><td><code>code_sha</code></td><td>The git commit. The part you already version.</td><td>Recorded, not checked out. The operator redeploys that commit.</td></tr>
+          <tr><td><code>prompts</code></td><td>System prompts, role prompts and few-shot templates, content-hashed.</td><td>Restored. The prompts directory is rewritten from the target.</td></tr>
+          <tr><td><code>tools</code></td><td>MCP server fingerprints. The tools the agent saw.</td><td>Recorded, not applied.</td></tr>
+          <tr><td><code>model</code></td><td>Provider, model id and decoding parameters. Pinned, not floated.</td><td>Recorded. The operator redeploys if it changed.</td></tr>
+          <tr><td><code>memory_snapshot</code></td><td>State of the tracked Postgres and pgvector tables at commit time.</td><td>Restored.</td></tr>
+          <tr><td><code>schema_version</code></td><td>The memory schema, with forward and reverse migrations.</td><td>Restored by running the reverse migrations.</td></tr>
         </tbody>
       </table>
     </div>
 
     <h3>The broken-prompt demo</h3>
     <p>
-      A small prompt change ships together with a memory schema bump and
-      breaks the agent. <code>git revert</code> alone cannot fix it, because
-      the schema is still bumped and the memory has accumulated contaminated
-      rows. <code>agentic rollback</code> restores all six dimensions. The
-      scenario is written up in
+      A prompt change ships together with a schema migration and contaminated
+      memory rows, and breaks the agent. Restoring the prompt file, which is
+      what <code>git revert</code> achieves, does not fix it: the schema is
+      still migrated and the contaminated rows are still in Postgres.
+      <code>agentic rollback</code> runs the reverse migration, restores the
+      tracked memory and rewrites the prompts. The scenario is written up in
       <a href={`${repo}/blob/main/docs/product/demo-scenario.md`}>the demo scenario</a>.
     </p>
-    <Panel title="the broken prompt">
-<pre><code><span class="comment"># baseline: agent works</span>
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="ok">&gt; "I understand. Could you tell me a bit more..."</span>
+    <p>
+      The excerpt below is from the recorded run in
+      <a href={`${repo}/blob/main/examples/langgraph-rollback/demo.cast`}><code>demo.cast</code></a>.
+      Setup, the build, a few progress lines and the final log are left out.
+    </p>
+    <Panel title="./scripts/run-demo.sh, excerpt from demo.cast">
+<pre><code><span class="dim">=== 4. baseline ask ===</span>
+<span class="ok">&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
 
-<span class="comment"># developer ships a "small" prompt + schema change</span>
-$ ./scripts/deploy-bad-change.sh
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="bad">&gt; "Absolutely! I'll cancel and refund the full amount. Done!"   # hallucinated</span>
+Looking at your account history, I see: Customer thanked support for the quick reply.</span>
 
-<span class="comment"># git can't fix this: schema is bumped, memory is contaminated</span>
-$ git revert HEAD &amp;&amp; ./scripts/redeploy.sh
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="bad">&gt; "Looking at your account, I see your refund processed yesterday..."   # still wrong</span>
+<span class="dim">=== 5. commit baseline ===</span>
+[20eb9cf] committed to langgraph/abbbd1ad6698ea81 as 20eb9cf892835ed7c37574075a51d2a04482ffe36596a9f6ff16c793af3a7bea
+baseline = 20eb9cf892835ed7c37574075a51d2a04482ffe36596a9f6ff16c793af3a7bea
 
-<span class="comment"># the agentic way</span>
-$ agentic rollback v0.7
-<span class="accent">  ✓ Schema reverted          in 0.4s
-  ✓ Memory restored          in 2.1s
-  ✓ Prompts restored         in 0.0s
-  ✓ HEAD now at i7j8k9l (rollback of v0.8 → v0.7)</span>
+<span class="dim">=== 6. deploy bad change ===</span>
+→ swapping prompts/system.txt for the sycophantic variant
+→ applying migration 001_add_sentiment (episodes.sentiment NOT NULL)
+→ INSERTing 5 contaminated rows into episodes
+✓ bad change deployed
 
-$ ./scripts/ask "I'm thinking about cancelling."
-<span class="ok">&gt; "I understand. Could you tell me a bit more..."   # baseline restored</span></code></pre>
+<span class="dim">=== 7. bad ask  (hallucinated refund + contaminated memory) ===</span>
+<span class="bad">&gt; Absolutely! I'll cancel your subscription and refund the full amount you've paid this year. Done!
+
+Looking at your account history, I see: Refund queue cleared; all open tickets resolved as refunded.</span>
+
+<span class="dim">=== 8.5. simulate git revert — shows code-only revert is insufficient ===</span>
+→ prompts/system.txt after git revert:
+   You are a helpful, empathetic customer support agent. Your job is to
+   understand the customer's situation, ask clarifying questions when the
+→ (memory rows in Postgres are untouched by git revert)
+✓ 'redeploy' complete — agent reads the reverted prompt on next ask
+&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
+
+<span class="bad">Looking at your account history, I see: Refund queue cleared; all open tickets resolved as refunded.</span>
+
+<span class="dim">=== 9. diff baseline → bad ===</span>
+diff 20eb9cf → 0a15e20
+
+prompts:
+  ~ __langgraph__/abbbd1ad6698ea81/checkpoint.json
+  ~ system.txt
+
+memory:   memory snapshot d9f76eb → d97dae0
+
+schema:   schema_version 0.0.0 → 001_add_sentiment
+
+<span class="dim">=== 10. rollback to baseline ===</span>
+live schema / sentiment columns before rollback: 001_add_sentiment/1
+<span class="accent">  - target commit 20eb9cf (v0.7 baseline)
+  - current branch tip c4794d5 → forward-record over it
+  - reverse schema migrations: 001_add_sentiment → 0.0.0
+  - restore memory from manifest d9f76eb
+  - rewrite ~/git.agentic/examples/langgraph-rollback/prompts from target prompts tree 2e6a8d6
+  - model version captured in target — operator must redeploy if it changed
+  - forward-recorded rollback as 2a2893a on langgraph/abbbd1ad6698ea81
+✓ rollback complete; HEAD now at 2a2893a</span>
+live schema / sentiment columns after rollback: 0.0.0/0
+
+<span class="dim">=== 11. ask again — empathetic answer + clean memory ===</span>
+<span class="ok">&gt; I understand. Could you tell me a bit more about why? I'd like to help find the right outcome for you.
+
+Looking at your account history, I see: Customer thanked support for the quick reply.</span></code></pre>
     </Panel>
   </Section>
 
@@ -257,7 +299,7 @@ $ ./scripts/ask "I'm thinking about cancelling."
         <li>The sidecar deployment keeps daemon state on a volume only the daemon writes and reads credentials from files. Full credential isolation still needs separate service identities, as the security section above says.</li>
         <li>Rollback validates the prompt tree before any database change and refuses symlinked prompt directories.</li>
         <li>The LangGraph checkpointer only deserializes allow-listed types.</li>
-        <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests. The open Rust advisories were fixed, and the website's production dependencies report zero npm audit findings.</li>
+        <li>CI actions are pinned to commit SHAs and the sidecar's base images to digests. The open Rust advisories were fixed.</li>
         <li>The threat model was reconciled, TM-001 to TM-013.</li>
       </ul>
     </div>

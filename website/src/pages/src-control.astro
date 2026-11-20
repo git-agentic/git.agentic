@@ -19,7 +19,7 @@ const faqs = [
   },
   {
     question: 'Does src-control write agent worktrees to disk?',
-    answer: 'Virtual worktrees stay in memory. A tool that requires real files can receive an explicitly materialized temporary checkout, which src-control cleans up automatically.',
+    answer: 'With spill disabled, virtual worktrees stay in memory. With spill enabled, the coldest blobs go to a temporary directory on disk that src-control removes afterwards. A tool that requires real files can receive an explicitly materialized temporary checkout, which src-control also cleans up.',
   },
   {
     question: 'Does src-control replace Git?',
@@ -76,9 +76,12 @@ const docs = [
     <p>
       Clone <a href={repo}>the repository</a> and run these from its root. The
       demo forks parallel worktrees off one snapshot, runs against each and
-      tears them down. The last command proves that nothing touched disk, with
-      an independent filesystem diff from before and after. The repository
-      has 28 end-to-end demo proofs in <code>demo/</code>.
+      tears them down. The last command is a check for leftover artifacts. It
+      lists the <code>scl-*</code> entries in the temp directory and the
+      project's files before and after a demo run, and fails if either list
+      changed. That run has spill enabled, so blobs can reach a temporary
+      spill directory while it runs. The repository has 28 end-to-end demos
+      in <code>demo/</code>.
     </p>
     <Panel title="shell" copy>
 <pre><code><span class="comment"># fork 4 parallel in-RAM worktrees, run and check out against each</span>
@@ -87,7 +90,7 @@ $ cargo run --bin sc -- demo --agents 4
 <span class="comment"># force the bounded budget: LRU eviction + spill, auto-cleaned</span>
 $ cargo run --bin sc -- demo --agents 6 --budget-mb 4 --spill
 
-<span class="comment"># independent zero-residue proof (snapshots the filesystem before/after)</span>
+<span class="comment"># leftover-artifact check (compares temp dir entries and project files before/after)</span>
 $ bash demo/run_demo.sh</code></pre>
     </Panel>
   </Section>
@@ -111,7 +114,7 @@ $ bash demo/run_demo.sh</code></pre>
       </div>
       <div class="card feature">
         <h3>In-memory worktrees</h3>
-        <p>Fork N copy-on-write worktrees off one snapshot. Content stays in RAM and reaches disk only on an explicit checkout.</p>
+        <p>Fork N copy-on-write worktrees off one snapshot. With spill disabled, content stays in RAM and reaches disk only on an explicit checkout.</p>
       </div>
       <div class="card feature">
         <h3>Agent workspaces</h3>
@@ -127,7 +130,7 @@ $ bash demo/run_demo.sh</code></pre>
       </div>
       <div class="card feature">
         <h3>Signed provenance</h3>
-        <p>Ed25519-signed commits, and sealed agent-session transcripts attached to commits.</p>
+        <p>Ed25519 commit signing with verification of trusted signatures, and sealed agent-session transcripts attached to commits.</p>
       </div>
       <div class="card feature">
         <h3>Git interoperability</h3>
@@ -176,16 +179,16 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
       <div>
         <dt>Disk only on request</dt>
         <dd>
-          Content lives in RAM and touches disk only on an explicit checkout.
-          There is no FUSE mount and no kernel extension, so the demo can
-          prove zero residual artifacts with a filesystem diff. Tools that
-          need real files, such as compilers and test runners, get a
-          materialized temporary checkout that src-control cleans up.
+          With spill disabled, content lives in RAM and touches disk only on
+          an explicit checkout. There is no FUSE mount and no kernel
+          extension. Tools that need real files, such as compilers and test
+          runners, get a materialized temporary checkout that src-control
+          cleans up.
         </dd>
       </div>
       <div>
         <dt>Bounded memory</dt>
-        <dd>A blob budget with LRU eviction bounds memory use. Optional spill goes to a content-addressed temporary directory that is cleaned up automatically, which keeps the zero-residue guarantee.</dd>
+        <dd>A blob budget with LRU eviction bounds memory use. Without spill, an insert over the budget fails. With spill, the coldest blobs go to a content-addressed temporary directory on disk, which src-control removes afterwards.</dd>
       </div>
       <div>
         <dt>Durable repositories</dt>
@@ -213,9 +216,10 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
       <div>
         <dt>Provenance</dt>
         <dd>
-          Commits are signed with Ed25519, and
-          <code>sc verify --require</code> fails when history has been
-          rewritten. Sealed agent-session transcripts attach to commits.
+          src-control supports Ed25519 signing of commits and verification
+          of trusted signatures with <code>sc verify</code>. The results of
+          amend, rebase and merge start unsigned. Sealed
+          agent-session transcripts attach to commits.
           Plaintext never enters the object store, and a keyless clone gets
           ciphertext only.
         </dd>
