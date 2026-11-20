@@ -11,8 +11,8 @@
 //!   (useful for shared-volume tests).
 //! - `gcs://bucket[/prefix]` — GCS-backed store (ADR-0004 Decision 5),
 //!   with a write-through local cache. Endpoint and bearer token come
-//!   from `AGENTIC_GCS_ENDPOINT` and `AGENTIC_GCS_TOKEN` so the URL
-//!   itself stays free of credentials.
+//!   from `AGENTIC_GCS_ENDPOINT` and `AGENTIC_GCS_TOKEN` (or
+//!   `AGENTIC_GCS_TOKEN_FILE`) so the URL itself stays free of credentials.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,7 +104,10 @@ impl ObjectStoreSpec {
                 cache_dir,
             } => {
                 let endpoint = std::env::var(ENDPOINT_ENV).ok();
-                let bearer = std::env::var(TOKEN_ENV).ok();
+                let bearer = crate::secrets::resolve_gcs_token(
+                    std::env::var(TOKEN_ENV).ok(),
+                    std::env::var(crate::secrets::GCS_TOKEN_FILE_ENV).ok(),
+                )?;
                 let store =
                     GcsObjectStore::new(bucket.clone(), prefix, &cache_dir, endpoint, bearer)
                         .with_context(|| format!("opening gcs object store {bucket}"))?
@@ -121,6 +124,21 @@ mod tests {
 
     fn agentic() -> PathBuf {
         PathBuf::from("/tmp/repo/.agentic")
+    }
+
+    #[test]
+    fn gcs_debug_redacts_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GcsObjectStore::new(
+            "b",
+            "p",
+            dir.path(),
+            None,
+            Some("s3cret-bearer".to_string()),
+        )
+        .unwrap();
+        let dbg = format!("{store:?}");
+        assert!(!dbg.contains("s3cret-bearer"), "{dbg}");
     }
 
     #[test]

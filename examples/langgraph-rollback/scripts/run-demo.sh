@@ -105,6 +105,9 @@ step "3. building + starting agenticd"
 ( cd "${REPO_ROOT}" && cargo build --release -p agenticd -p agentic-cli >/dev/null )
 rm -rf "${DEMO_DIR}/.agentic"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" init >/dev/null
+# agenticd refuses a repo or .agentic that is group- or world-writable.
+# A checkout or `init` under umask 002 creates them 0775.
+chmod go-w "${DEMO_DIR}" "${DEMO_DIR}/.agentic"
 "${AGENTICD_BIN}" --repo "${DEMO_DIR}" --postgres "${DATABASE_URL}" --tables episodes:id \
     --socket "${AGENTIC_SOCKET}" \
     --insecure-allow-any-uid \

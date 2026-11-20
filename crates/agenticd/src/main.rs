@@ -74,6 +74,11 @@ struct Args {
     #[arg(long)]
     postgres: Option<String>,
 
+    /// File holding the Postgres URL (trailing newline trimmed). Keeps
+    /// the password off argv. Alternative to `--postgres`.
+    #[arg(long, conflicts_with = "postgres")]
+    postgres_url_file: Option<PathBuf>,
+
     /// Comma-separated `table:pk` pairs to track. Required when
     /// `--postgres` is set. Example: `episodes:id,user_facts:id`.
     #[arg(long, value_delimiter = ',')]
@@ -86,12 +91,21 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     mcp: Vec<String>,
 
+    /// Canonical directory the operator asserts only agenticd can write
+    /// (for example a state volume root that only the daemon mounts). It is
+    /// exempt from the ancestor write check; the repo itself never is.
+    /// Without it, a world-writable volume root makes the daemon refuse
+    /// to start.
+    #[arg(long)]
+    trusted_volume_root: Option<PathBuf>,
+
     /// Object-store backend. `fs` (default) uses `<repo>/.agentic/objects`;
     /// `fs:///abs/path` uses an explicit on-disk root; `gcs://bucket[/prefix]`
     /// pushes every object through to Google Cloud Storage with a
     /// write-through local cache (ADR-0004 Decision 5). For GCS, set
     /// `AGENTIC_GCS_ENDPOINT` to override the host (e.g. fake-gcs-server)
-    /// and `AGENTIC_GCS_TOKEN` for bearer auth.
+    /// and `AGENTIC_GCS_TOKEN` (or `AGENTIC_GCS_TOKEN_FILE`, a path to a
+    /// file holding the token) for bearer auth.
     #[arg(long, default_value = "fs")]
     object_store: String,
 
@@ -252,6 +266,32 @@ fn load_approval_key(
     Ok(Some(key))
 }
 
+/// Bind the listener. Connecting to a Unix socket needs write permission
+/// on the file, so when the allowlist names a uid other than the daemon's
+/// (the sidecar worker) the socket is created 0666 by loosening the umask
+/// for the bind call only; the SO_PEERCRED allowlist (ADR-0012) is what
+/// gates access. Otherwise the default umask applies.
+///
+/// The umask is process-wide, but this runs after state is opened and
+/// before the accept loop, when no other thread creates files, and it is
+/// restored immediately.
+fn bind_socket(path: &std::path::Path, policy: &PeerAuthPolicy) -> std::io::Result<UnixListener> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if matches!(policy, PeerAuthPolicy::Allowlist(uids) if uids.iter().any(|u| *u != euid)) {
+            // SAFETY: umask cannot fail; the previous value is restored below.
+            let old = unsafe { libc::umask(0o111) };
+            let bound = UnixListener::bind(path);
+            unsafe { libc::umask(old) };
+            return bound;
+        }
+    }
+    let _ = policy;
+    UnixListener::bind(path)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -316,7 +356,21 @@ async fn main() -> anyhow::Result<()> {
         "socket limits in force"
     );
 
-    let agentic_dir = args.repo.join(".agentic");
+    // Before anything reads or writes state: the daemon must own the repo
+    // and `.agentic` (see state_dir.rs). Runs before the object store opens
+    // so no state is created under a directory we then refuse.
+    // `repo` is the canonical path and is used for all state and the default
+    // socket from here on, so the checked path cannot be redirected through
+    // a symlink afterwards. `args.repo` is only the operator's spelling.
+    let repo =
+        agenticd::state_dir::secure_state_dir(&args.repo, args.trusted_volume_root.as_deref())?;
+
+    let postgres_url = agenticd::secrets::resolve_postgres_url(
+        args.postgres.as_deref(),
+        args.postgres_url_file.as_deref(),
+    )?;
+
+    let agentic_dir = repo.join(".agentic");
 
     let tables = parse_tracked_tables(&args.tables)?;
     let mcp_servers = parse_mcp_spec(&args.mcp)?;
@@ -359,15 +413,40 @@ async fn main() -> anyhow::Result<()> {
     // failure, etc.) would leave a stale socket lying around and clients
     // / health checks would see ECONNREFUSED on connect instead of the
     // honest ENOENT. (Copilot review on PR #50, third pass.)
-    let socket_path = args
-        .socket
-        .clone()
-        .unwrap_or_else(|| agentic_dir.join("agenticd.sock"));
+    let socket_path = match args.socket.clone() {
+        Some(p) => p,
+        None => {
+            // The default socket sits inside the 0700 state directory, which
+            // another uid cannot traverse; an allowlist naming one needs an
+            // explicit socket outside it.
+            #[cfg(unix)]
+            {
+                // SAFETY: geteuid cannot fail.
+                let euid = unsafe { libc::geteuid() };
+                if matches!(&peer_auth, PeerAuthPolicy::Allowlist(uids) if uids.iter().any(|u| *u != euid))
+                {
+                    anyhow::bail!(
+                        "--allowed-uid names a uid other than the daemon's, but the default socket \
+                         lives in the private {} directory that uid cannot reach; pass --socket \
+                         <path outside .agentic>",
+                        agentic_dir.display()
+                    );
+                }
+            }
+            let p = agentic_dir.join("agenticd.sock");
+            // A deep canonical path can exceed sun_path; say how to fix it
+            // instead of failing later in bind.
+            agenticd::state_dir::check_default_socket_len(&p)?;
+            p
+        }
+    };
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket parent directory {}", parent.display()))?;
     }
-    if socket_path.exists() {
+    // symlink_metadata so a dangling symlink is removed too; remove_file
+    // unlinks the link, never its target.
+    if std::fs::symlink_metadata(&socket_path).is_ok() {
         std::fs::remove_file(&socket_path)
             .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
@@ -389,10 +468,10 @@ async fn main() -> anyhow::Result<()> {
     let peer_auth = Arc::new(peer_auth);
     let state = Arc::new(
         DaemonState::open(
-            args.repo.clone(),
+            repo.clone(),
             agentic_dir.clone(),
             store,
-            args.postgres.as_deref(),
+            postgres_url.as_deref(),
             tables,
             mcp_servers,
             Arc::clone(&peer_auth),
@@ -403,12 +482,12 @@ async fn main() -> anyhow::Result<()> {
         .with_exempt_entropy_prefixes(args.scanner_exempt_entropy_prefixes.clone()),
     );
 
-    let listener = UnixListener::bind(&socket_path)
+    let listener = bind_socket(&socket_path, &peer_auth)
         .with_context(|| format!("binding {}", socket_path.display()))?;
 
     tracing::info!(
         socket = %socket_path.display(),
-        repo = %args.repo.display(),
+        repo = %repo.display(),
         "agenticd listening"
     );
 

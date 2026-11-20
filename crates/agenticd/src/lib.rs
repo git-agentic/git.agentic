@@ -17,6 +17,8 @@ pub mod migrate;
 pub mod objstore;
 pub mod peer_auth;
 pub mod rollback;
+pub mod secrets;
 pub mod server;
+pub mod state_dir;
 pub(crate) mod store_async;
 pub mod wire_error;
