@@ -157,13 +157,13 @@ export DATABASE_URL='postgres://agentic:agentic@localhost:54322/agentic'
 ./scripts/ask.sh "I'm thinking about cancelling."
 ../../target/release/agentic --repo . commit -m "baseline" \
     --model "anthropic:claude-opus:2026-05-01"
-BASELINE=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
+BASELINE=$(../../target/release/agentic --repo . resolve HEAD)
 
 ./scripts/deploy-bad-change.sh
 ./scripts/ask.sh "I'm thinking about cancelling."
 ../../target/release/agentic --repo . commit -m "bad change" \
     --model "anthropic:claude-opus:2026-05-01"
-BAD=$(../../target/release/agentic --repo . status | sed 's/.*→ //')
+BAD=$(../../target/release/agentic --repo . resolve HEAD)
 
 # 4.5. Show that restoring only the prompt file does not fix it
 git checkout -- prompts/system.txt

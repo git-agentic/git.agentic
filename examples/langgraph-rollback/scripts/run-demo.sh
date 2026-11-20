@@ -155,7 +155,7 @@ step "4. baseline ask"
 step "5. commit baseline"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.7 baseline" \
     --model "anthropic:claude-opus:2026-05-01"
-BASELINE=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" status | sed -n 's/.*→ //p')
+BASELINE=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" resolve HEAD)
 echo "baseline = ${BASELINE}"
 
 step "6. deploy bad change"
@@ -167,7 +167,7 @@ step "7. bad ask  (hallucinated refund + contaminated memory)"
 step "8. commit bad change"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" commit -m "v0.8 friendlier prompt" \
     --model "anthropic:claude-opus:2026-05-01"
-BAD=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" status | sed -n 's/.*→ //p')
+BAD=$("${AGENTIC_BIN}" --repo "${DEMO_DIR}" resolve HEAD)
 
 step "8.5. simulate git revert — shows code-only revert is insufficient"
 # Restore the prompt file to baseline (simulating what a code-only rollback, e.g.
@@ -188,6 +188,14 @@ step "9. diff baseline → bad"
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" diff "${BASELINE}" "${BAD}"
 
 step "10. rollback to baseline"
+# The bad change must really have applied the migration, or the check
+# after rollback would pass without proving anything.
+before=$(psql "${DATABASE_URL}" -Atc "SELECT agentic_schema_version() || '/' || (SELECT count(*) FROM information_schema.columns WHERE table_name = 'episodes' AND column_name = 'sentiment')")
+echo "live schema / sentiment columns before rollback: ${before}"
+if [[ "${before}" != "001_add_sentiment/1" ]]; then
+    echo "error: expected 001_add_sentiment/1 before rollback (migration applied)" >&2
+    exit 1
+fi
 "${AGENTIC_BIN}" --repo "${DEMO_DIR}" rollback "${BASELINE}" --yes
 # The rollback must have really reversed the migration, not just said so.
 live=$(psql "${DATABASE_URL}" -Atc "SELECT agentic_schema_version() || '/' || (SELECT count(*) FROM information_schema.columns WHERE table_name = 'episodes' AND column_name = 'sentiment')")
