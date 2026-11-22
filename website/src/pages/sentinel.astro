@@ -21,7 +21,7 @@ const faqs = [
   },
   {
     question: 'Is Sentinel production ready?',
-    answer: 'Sentinel is a pre-1.0 alpha (currently 0.1.0-alpha.2), it is not production hardened, and its APIs may change. Codento Engine runs it in production as an auditing npm proxy in observe mode, where it scores every tarball and blocks none. Enforcement (block) mode is not yet proven in production.',
+    answer: 'Sentinel is a pre-1.0 alpha (currently 0.1.0-alpha.3), it is not production hardened, and its APIs may change. Codento Engine runs it in production as an auditing npm proxy in observe mode, where it scores every tarball and blocks none. Enforcement (block) mode is not yet proven in production.',
   },
 ];
 const docs = [
@@ -54,19 +54,18 @@ const docs = [
 
   <Fragment slot="status">
     <div><dt>Maturity</dt><dd>Pre-1.0 alpha. Not production hardened. APIs may change.</dd></div>
-    <div><dt>Latest release</dt><dd>0.1.0-alpha.2 on npm, released 14 July 2026.</dd></div>
+    <div><dt>Latest release</dt><dd>0.1.0-alpha.3 on npm, released 20 November 2026.</dd></div>
     <div><dt>Production use</dt><dd>The auditing npm proxy in Codento Engine's build stack, in observe mode. There are no other production users.</dd></div>
-    <div><dt>Not yet done</dt><dd>Enforcement (block) mode is not yet proven in production. The November 2026 fixes are on <code>main</code> and not in a release yet.</dd></div>
+    <div><dt>Not yet done</dt><dd>Enforcement (block) mode is not yet proven in production.</dd></div>
     <div><dt>Language</dt><dd>TypeScript</dd></div>
     <div><dt>License</dt><dd>Apache 2.0</dd></div>
   </Fragment>
 
   <Section id="quickstart" title="Quickstart" note="Installs from npm.">
     <p>
-      The current alpha is 0.1.0-alpha.2. All seven
+      The current alpha is 0.1.0-alpha.3. All seven
       <code>@git-agentic/sentinel-*</code> packages are published under the
-      <code>alpha</code> dist-tag, and the <code>latest</code> tag points to
-      the same version.
+      <code>alpha</code> dist-tag.
     </p>
     <Panel title="shell" copy>
 <pre><code>$ npm install -g @git-agentic/sentinel-cli@alpha @git-agentic/sentinel-proxy@alpha
@@ -323,14 +322,6 @@ $ sentinel audit is-odd 3.0.1
         </dd>
       </div>
       <div>
-        <dt>Unreleased fixes</dt>
-        <dd>
-          The November 2026 security-audit fix round (#84) and install-hook
-          script following (#89) are on <code>main</code>. Both came after
-          0.1.0-alpha.2 and are not in a release yet.
-        </dd>
-      </div>
-      <div>
         <dt>Evidence still to collect</dt>
         <dd>The next milestone is design-partner evidence: blocked incidents, false-positive rate and audit latency.</dd>
       </div>
@@ -354,10 +345,9 @@ $ sentinel audit is-odd 3.0.1
     <div class="changes">
       <h3>November 2026</h3>
       <ul>
+        <li>0.1.0-alpha.3 was released on 20 November 2026 under the <code>alpha</code> dist-tag.</li>
         <li>Sentinel runs in production at Codento Engine as the auditing npm proxy in the build stack, in observe mode.</li>
-        <li>On 20 November a security-audit fix round (#84) merged to <code>main</code>.</li>
-        <li>The audit now follows install hooks that run npm, pnpm, yarn or bun scripts (#89).</li>
-        <li>#84 and #89 came after 0.1.0-alpha.2 and are not in that release yet.</li>
+        <li>0.1.0-alpha.3 ships the security-audit fix round (#84) across the scanner, proxy, sandbox, steward, CLI and CI, plus install-script analysis fixes (#89 to #92) covering npm, pnpm, yarn and bun hooks, shell wrappers and bundled <code>node_modules</code>.</li>
       </ul>
       <h3>Since July 2026</h3>
       <ul>

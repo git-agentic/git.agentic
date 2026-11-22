@@ -8,6 +8,7 @@ const p = project('src-control');
 const repo = p.repo;
 const desktop = `${repo}/tree/main/apps/desktop`;
 const forgeAdr = `${repo}/blob/main/docs/adr/0058-sc-forge-gitea-compatible-git-forge.md`;
+const gitBucketAdr = `${repo}/blob/main/docs/adr/0060-git-carried-bucket-remotes.md`;
 const faqs = [
   {
     question: 'What is src-control?',
@@ -64,8 +65,8 @@ const docs = [
   </Fragment>
 
   <Fragment slot="status">
-    <div><dt>Maturity</dt><dd>Pre-1.0. 36 phases and the P37 partial-clone series (37a to 37d) are implemented and tested.</dd></div>
-    <div><dt>Latest phase</dt><dd>P38, sc-forge, a self-hosted Git host (<a href={forgeAdr}>ADR-0058</a>).</dd></div>
+    <div><dt>Maturity</dt><dd>Pre-1.0. Phases 1 to 39 (including the P37 partial-clone series, 37a to 37d) are implemented and tested.</dd></div>
+    <div><dt>Latest phase</dt><dd>P39, Git-carried bucket remotes (<code>sc+git::</code>, <a href={gitBucketAdr}>ADR-0060</a>).</dd></div>
     <div><dt>Production use</dt><dd>sc-forge is the Git host for Codento Engine's project repositories. There are no other production users.</dd></div>
     <div><dt>Not yet done</dt><dd>The cryptography has had no independent audit. Do not trust production secrets to it yet.</dd></div>
     <div><dt>Language</dt><dd>Rust. The desktop app uses Tauri v2 and TypeScript.</dd></div>
@@ -138,7 +139,7 @@ $ bash demo/run_demo.sh</code></pre>
       </div>
       <div class="card feature">
         <h3>Transports and partial clone</h3>
-        <p>SSH and HTTP(S) transports with in-binary TLS, bucket WAL remotes, and lazy partial clones.</p>
+        <p>SSH and HTTP(S) transports with in-binary TLS, bucket WAL remotes (including <code>sc+git::</code> over any Git host), and lazy partial clones.</p>
       </div>
       <div class="card feature">
         <h3>Desktop browser</h3>
@@ -231,7 +232,11 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
           (<code>sc+https://</code>), token-based access control with expiry
           and rotation, connection caps and session timeouts. Streaming packs
           move multi-GiB repositories in bounded RAM. Bucket WAL remotes work
-          over <code>sc+wal://</code> and <code>sc+s3://</code>. Partial
+          over <code>sc+wal://</code>, <code>sc+s3://</code> and
+          <code>sc+git::&lt;git-url&gt;</code>, which stores opaque
+          <code>refs/sc/*</code> entries in any Git host so private branches,
+          protected files and committed secrets survive a plain Git host, with
+          store compaction and <code>sc serve --store</code> support. Partial
           clones fetch lazily, and merge, cherry-pick, rebase and agent
           sessions work on a partial clone.
         </dd>
@@ -298,6 +303,13 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
       <h3>November 2026</h3>
       <ul>
         <li>
+          Phase 39 (<a href={gitBucketAdr}>ADR-0060</a>, #369 to #374) added
+          <code>sc+git::</code> bucket remotes, carrying private branches,
+          protected files and committed secrets through any Git host
+          (validated against GitHub), with store compaction and
+          <code>sc serve --store</code> support.
+        </li>
+        <li>
           sc-forge (P38) runs in production as the Git host for Codento
           Engine's project repositories. Engine builds the sc-forge image from
           a pinned src-control commit and deploys it by digest. The design,
@@ -306,7 +318,8 @@ $ npm ci &amp;&amp; npm run tauri dev</code></pre>
         <li>
           On 20 November a security fix round merged (#360 to #368): fuzzing
           of untrusted decoders, serve hardening, and fixes for a checkout
-          escape, recipient sealing and secret environment injection.
+          escape, recipient sealing and secret environment injection; followed
+          on 22 November by dependency security updates (#378, #379).
         </li>
       </ul>
       <h3>Since July 2026</h3>

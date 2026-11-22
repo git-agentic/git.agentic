@@ -15,7 +15,7 @@ agent-auditable npm supply-chain security.
 
 - [git.agentic](https://git-agentic.com/git-agentic): Version control and rollback for AI agent behavior. Rollback restores prompts, memory and schema and records the code, tools and model to redeploy. Status: MVP complete, validation in progress. Not in production use yet.
 - [src-control](https://git-agentic.com/src-control): Version control and a Git forge for fleets of AI agents, with in-memory worktrees, encrypted paths and branches, signed provenance, Git sync, and a native read-only desktop browser. Status: pre-1.0, in production use for sc-forge only, as the project Git host at Codento Engine. The cryptography has had no independent audit.
-- [Sentinel](https://git-agentic.com/sentinel): An auditing security layer and registry for npm used by agents. Status: pre-1.0 alpha (0.1.0-alpha.2 on npm), in production use at Codento Engine as an auditing npm proxy in observe mode. It scores every tarball and blocks none yet. APIs may change.
+- [Sentinel](https://git-agentic.com/sentinel): An auditing security layer and registry for npm used by agents. Status: pre-1.0 alpha (0.1.0-alpha.3 on npm), in production use at Codento Engine as an auditing npm proxy in observe mode. It scores every tarball and blocks none yet. APIs may change.
 
 ## Technical guides
 
